@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -12,5 +13,6 @@ func AddToScheme(s *runtime.Scheme) error {
 		&TagUpdater{},
 		&TagUpdaterList{},
 	)
+	metav1.AddToGroupVersion(s, GroupVersion)
 	return nil
 }
