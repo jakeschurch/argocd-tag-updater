@@ -1,0 +1,90 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: tagupdaters.updater.argocd.io
+spec:
+  group: updater.argocd.io
+  names:
+    kind: TagUpdater
+    listKind: TagUpdaterList
+    plural: tagupdaters
+    singular: tagupdater
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Repo
+          type: string
+          jsonPath: .spec.source.repo
+        - name: Last Tag
+          type: string
+          jsonPath: .status.lastTag
+        - name: Updated
+          type: date
+          jsonPath: .status.lastUpdated
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [source, target, template]
+              properties:
+                source:
+                  type: object
+                  required: [type, repo, tagPattern]
+                  properties:
+                    type:
+                      type: string
+                      enum: [git, oci]
+                    repo:
+                      type: string
+                    tagPattern:
+                      type: string
+                      description: Named-group regex. Capture "n" is used as sort key.
+                interval:
+                  type: string
+                target:
+                  type: object
+                  required: [apiVersion, kind, name, field]
+                  properties:
+                    apiVersion:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    field:
+                      type: string
+                      description: Dot-notation path to patch. e.g. "spec.nixExpr"
+                template:
+                  type: string
+                  description: Go template rendered with named captures. e.g. "github:org/repo/{{ .sha }}#packages.x86_64-linux.platform"
+                argoCDApp:
+                  type: object
+                  required: [name]
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+            status:
+              type: object
+              properties:
+                lastTag:
+                  type: string
+                lastApplied:
+                  type: string
+                lastUpdated:
+                  type: string
+                  format: date-time
+                conditions:
+                  type: array
+                  items:
+                    type: object

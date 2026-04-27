@@ -1,0 +1,21 @@
+apiVersion: updater.argocd.io/v1alpha1
+kind: TagUpdater
+metadata:
+  name: example-flake-platform
+  namespace: argocd
+spec:
+  source:
+    type: git
+    repo: git@github.com:your-org/your-flake.git
+    tagPattern: 'platform\.(?P<branch>[^.]+)\.build-(?P<n>\d+)\.(?P<sha>[0-9a-f]{6,})'
+  target:
+    apiVersion: nix.csi.k8s.io/v1alpha1
+    kind: NixMount
+    name: example-flake-platform
+    namespace: example-flake
+    field: spec.flakeRef
+  template: 'github:your-org/your-flake/{{ .sha }}#packages.x86_64-linux.platform'
+  interval: 2m
+  argoCDApp:
+    name: example-flake
+    namespace: argocd
