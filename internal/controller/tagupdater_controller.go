@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -63,9 +64,12 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
-	// Add the full tag itself as a capture so templates can reference {{ .tag }}
+	// Merge tag captures, full tag, and repo-derived fields into template data.
 	data := latest.Captures
 	data["tag"] = latest.Tag
+	for k, v := range parseRepo(tu.Spec.Source.Repo) {
+		data[k] = v
+	}
 
 	p := patcher.Patcher{Client: r.Dynamic}
 	applied, err := p.Apply(ctx, patcher.Target{
@@ -137,6 +141,52 @@ func (r *TagUpdaterReconciler) triggerArgoCDSync(ctx context.Context, ref *v1alp
 		return fmt.Errorf("argocd sync returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// parseRepo extracts host, owner, and repo from common git remote formats:
+//   - git@github.com:owner/repo.git
+//   - https://github.com/owner/repo
+//   - github:owner/repo  (nix flake shorthand)
+func parseRepo(raw string) map[string]string {
+	out := map[string]string{"repoURL": raw}
+	raw = strings.TrimSuffix(raw, ".git")
+
+	// SCP-style: git@host:owner/repo
+	if strings.HasPrefix(raw, "git@") {
+		raw = strings.TrimPrefix(raw, "git@")
+		host, path, ok := strings.Cut(raw, ":")
+		if ok {
+			out["host"] = host
+			setOwnerRepo(out, path)
+		}
+		return out
+	}
+
+	// Nix flake shorthand: github:owner/repo or gitlab:owner/repo
+	if i := strings.Index(raw, ":"); i > 0 && !strings.Contains(raw[:i], "/") {
+		out["host"] = raw[:i] + ".com"
+		setOwnerRepo(out, raw[i+1:])
+		return out
+	}
+
+	// https://host/owner/repo
+	if strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "http://") {
+		raw = strings.SplitN(raw, "://", 2)[1]
+		slash := strings.Index(raw, "/")
+		if slash > 0 {
+			out["host"] = raw[:slash]
+			setOwnerRepo(out, raw[slash+1:])
+		}
+	}
+	return out
+}
+
+func setOwnerRepo(out map[string]string, path string) {
+	owner, repo, ok := strings.Cut(path, "/")
+	if ok {
+		out["owner"] = owner
+		out["repo"] = repo
+	}
 }
 
 func sourceFor(spec v1alpha1.SourceSpec) (source.Source, error) {
