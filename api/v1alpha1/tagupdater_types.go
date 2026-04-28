@@ -13,20 +13,33 @@ type SourceSpec struct {
 	Type SourceType `json:"type"`
 	// Repo is a git remote URL (git source) or OCI repository reference (oci source).
 	Repo string `json:"repo"`
-	// TagPattern is a named-group regex. Captures are available as
-	// .CaptureNames in Template. e.g.:
-	//   platform\.(?P<branch>[^.]+)\.build-(?P<n>\d+)\.(?P<sha>[0-9a-f]{6,})
+	// TagPattern is a named-group regex. Captures are available in Patch templates.
 	// The capture named "n" is used as the sort key to select the latest tag.
+	// e.g.: platform\.(?P<branch>[^.]+)\.build-(?P<n>\d+)\.(?P<sha>[0-9a-f]{6,})
 	TagPattern string `json:"tagPattern"`
+}
+
+type PatchSpec struct {
+	// Field is a dot-notation path into the target CR. e.g. "spec.flakeRef" or
+	// "spec.source.helm.valuesObject.image.tag".
+	Field string `json:"field"`
+	// Template is a Go template rendered with named captures from TagPattern plus
+	// repo-derived fields (owner, repo, host, repoURL) and "tag" (full tag string).
+	Template string `json:"template"`
 }
 
 type TargetSpec struct {
 	APIVersion string `json:"apiVersion"`
 	Kind       string `json:"kind"`
-	Name       string `json:"name"`
-	Namespace  string `json:"namespace,omitempty"`
-	// Field is a dot-notation path to the field to patch. e.g. "spec.nixExpr"
-	Field string `json:"field"`
+	// Name selects a specific CR by name. Mutually exclusive with Selector.
+	Name string `json:"name,omitempty"`
+	// Namespace scopes the lookup. Required for namespaced resources.
+	Namespace string `json:"namespace,omitempty"`
+	// Selector dynamically selects CRs by label. All matching CRs receive every patch.
+	// Mutually exclusive with Name.
+	Selector *metav1.LabelSelector `json:"selector,omitempty"`
+	// Patches is the list of field+template pairs to apply to each matched CR.
+	Patches []PatchSpec `json:"patches"`
 }
 
 type ArgoCDAppRef struct {
@@ -48,22 +61,17 @@ type TagUpdater struct {
 }
 
 type TagUpdaterSpec struct {
-	Source   SourceSpec      `json:"source"`
-	Target   TargetSpec      `json:"target"`
-	// Template is a Go template rendered with named captures from TagPattern.
-	// Use {{ .sha }}, {{ .branch }}, {{ .n }}, {{ .tag }} etc.
-	Template string          `json:"template"`
+	Source SourceSpec `json:"source"`
+	// Targets is the list of CR groups to patch when a new tag matches.
+	Targets []TargetSpec `json:"targets"`
 	// Interval between tag polls. Defaults to 2m.
 	Interval metav1.Duration `json:"interval,omitempty"`
-	// ArgoCDApp triggers a sync on the named Application after patching.
+	// ArgoCDApp triggers a sync on the named Application after all patches are applied.
 	ArgoCDApp *ArgoCDAppRef `json:"argoCDApp,omitempty"`
 }
 
 type TagUpdaterStatus struct {
-	// LastTag is the most recent matched tag.
 	LastTag     string             `json:"lastTag,omitempty"`
-	// LastApplied is the rendered template value last written to the target.
-	LastApplied string             `json:"lastApplied,omitempty"`
 	LastUpdated *metav1.Time       `json:"lastUpdated,omitempty"`
 	Conditions  []metav1.Condition `json:"conditions,omitempty"`
 }

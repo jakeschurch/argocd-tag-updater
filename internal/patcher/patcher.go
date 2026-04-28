@@ -9,6 +9,7 @@ import (
 	"text/template"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
@@ -21,63 +22,129 @@ type Patcher struct {
 type Target struct {
 	APIVersion string
 	Kind       string
-	Name       string
-	Namespace  string
-	Field      string // dot-notation: "spec.nixExpr"
+	// Name selects a specific CR. Mutually exclusive with Selector.
+	Name string
+	// Namespace scopes the lookup.
+	Namespace string
+	// Selector is a label selector string for dynamic CR discovery.
+	// Mutually exclusive with Name.
+	Selector string
 }
 
-// Apply renders tmpl with data, then JSON-patches the field on the target CR.
-// Returns the rendered value.
-func (p *Patcher) Apply(ctx context.Context, target Target, tmpl string, data map[string]string) (string, error) {
-	t, err := template.New("value").Parse(tmpl)
-	if err != nil {
-		return "", fmt.Errorf("parse template: %w", err)
-	}
-	var buf bytes.Buffer
-	if err := t.Execute(&buf, data); err != nil {
-		return "", fmt.Errorf("render template: %w", err)
-	}
-	value := buf.String()
+type Patch struct {
+	Field    string
+	Template string
+}
 
-	// Build a JSON merge patch from the dot-notation field path. Merge patch
-	// deep-merges at every level, so intermediate keys don't need to exist and
-	// sibling fields are preserved. This handles both simple scalar fields like
-	// spec.flakeRef and deeply nested paths like
-	// spec.source.helm.valuesObject.image.tag without any special-casing.
-	patch, err := buildMergePatch(target.Field, value)
+// ApplyAll resolves the target CRs (by name or label selector) and applies all
+// patches to each one via a single merged JSON merge patch per CR.
+// Returns the names of CRs that were patched.
+func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, data map[string]string) ([]string, error) {
+	gvr, err := gvrFor(target.APIVersion, target.Kind)
+	if err != nil {
+		return nil, err
+	}
+
+	names, err := p.resolveNames(ctx, gvr, target)
+	if err != nil {
+		return nil, err
+	}
+
+	mergePatch, err := buildMergePatch(patches, data)
+	if err != nil {
+		return nil, err
+	}
+
+	rc := p.Client.Resource(gvr)
+	var patched []string
+	for _, name := range names {
+		if target.Namespace != "" {
+			_, err = rc.Namespace(target.Namespace).Patch(ctx, name, types.MergePatchType, mergePatch, metav1.PatchOptions{})
+		} else {
+			_, err = rc.Patch(ctx, name, types.MergePatchType, mergePatch, metav1.PatchOptions{})
+		}
+		if err != nil {
+			return patched, fmt.Errorf("patch %s/%s: %w", target.Kind, name, err)
+		}
+		patched = append(patched, name)
+	}
+	return patched, nil
+}
+
+func (p *Patcher) resolveNames(ctx context.Context, gvr schema.GroupVersionResource, target Target) ([]string, error) {
+	if target.Name != "" {
+		return []string{target.Name}, nil
+	}
+
+	rc := p.Client.Resource(gvr)
+	opts := metav1.ListOptions{LabelSelector: target.Selector}
+
+	var ul *unstructured.UnstructuredList
+	var err error
+	if target.Namespace != "" {
+		ul, err = rc.Namespace(target.Namespace).List(ctx, opts)
+	} else {
+		ul, err = rc.List(ctx, opts)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list %s with selector %q: %w", target.Kind, target.Selector, err)
+	}
+
+	names := make([]string, 0, len(ul.Items))
+	for _, item := range ul.Items {
+		names = append(names, item.GetName())
+	}
+	return names, nil
+}
+
+// buildMergePatch renders all patch templates and merges them into a single
+// JSON merge patch document. Multiple patches targeting the same subtree are
+// merged — later entries in the slice overwrite earlier ones at the leaf level.
+func buildMergePatch(patches []Patch, data map[string]string) ([]byte, error) {
+	root := map[string]any{}
+	for _, p := range patches {
+		value, err := renderTemplate(p.Template, data)
+		if err != nil {
+			return nil, fmt.Errorf("render template for field %q: %w", p.Field, err)
+		}
+		setNested(root, strings.Split(p.Field, "."), value)
+	}
+	return json.Marshal(root)
+}
+
+// setNested sets a scalar value at keys[last] inside m, creating intermediate
+// maps along keys[:last]. Existing intermediate maps are reused so sibling
+// keys under the same parent are preserved.
+func setNested(m map[string]any, keys []string, value any) {
+	for _, k := range keys[:len(keys)-1] {
+		if next, ok := m[k].(map[string]any); ok {
+			m = next
+		} else {
+			next = map[string]any{}
+			m[k] = next
+			m = next
+		}
+	}
+	m[keys[len(keys)-1]] = value
+}
+
+func renderTemplate(tmpl string, data map[string]string) (string, error) {
+	t, err := template.New("").Parse(tmpl)
 	if err != nil {
 		return "", err
 	}
-
-	gv, err := schema.ParseGroupVersion(target.APIVersion)
-	if err != nil {
-		return "", fmt.Errorf("parse apiVersion %q: %w", target.APIVersion, err)
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, data); err != nil {
+		return "", err
 	}
-	// Naive plural: lowercase kind + "s". Sufficient for our known targets;
-	// extend with a REST mapper if needed for arbitrary CRDs.
-	resource := strings.ToLower(target.Kind) + "s"
-	gvr := schema.GroupVersionResource{Group: gv.Group, Version: gv.Version, Resource: resource}
-
-	rc := p.Client.Resource(gvr)
-	if target.Namespace != "" {
-		_, err = rc.Namespace(target.Namespace).Patch(ctx, target.Name, types.MergePatchType, patch, metav1.PatchOptions{})
-	} else {
-		_, err = rc.Patch(ctx, target.Name, types.MergePatchType, patch, metav1.PatchOptions{})
-	}
-	if err != nil {
-		return "", fmt.Errorf("patch %s/%s .%s: %w", target.Kind, target.Name, target.Field, err)
-	}
-	return value, nil
+	return buf.String(), nil
 }
 
-// buildMergePatch converts a dot-notation field path and value into a JSON
-// merge patch document. "spec.source.helm.valuesObject.image.tag" with value
-// "abc" produces {"spec":{"source":{"helm":{"valuesObject":{"image":{"tag":"abc"}}}}}}.
-func buildMergePatch(field string, value string) ([]byte, error) {
-	parts := strings.Split(field, ".")
-	var obj any = value
-	for i := len(parts) - 1; i >= 0; i-- {
-		obj = map[string]any{parts[i]: obj}
+func gvrFor(apiVersion, kind string) (schema.GroupVersionResource, error) {
+	gv, err := schema.ParseGroupVersion(apiVersion)
+	if err != nil {
+		return schema.GroupVersionResource{}, fmt.Errorf("parse apiVersion %q: %w", apiVersion, err)
 	}
-	return json.Marshal(obj)
+	resource := strings.ToLower(kind) + "s"
+	return schema.GroupVersionResource{Group: gv.Group, Version: gv.Version, Resource: resource}, nil
 }

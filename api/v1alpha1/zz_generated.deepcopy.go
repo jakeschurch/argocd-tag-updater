@@ -60,11 +60,53 @@ func (in *TagUpdaterList) DeepCopyObject() runtime.Object {
 	return nil
 }
 
+func (in *PatchSpec) DeepCopyInto(out *PatchSpec) {
+	*out = *in
+}
+
+func (in *PatchSpec) DeepCopy() *PatchSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(PatchSpec)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *TargetSpec) DeepCopyInto(out *TargetSpec) {
+	*out = *in
+	if in.Selector != nil {
+		in, out := &in.Selector, &out.Selector
+		*out = new(v1.LabelSelector)
+		(*in).DeepCopyInto(*out)
+	}
+	if in.Patches != nil {
+		in, out := &in.Patches, &out.Patches
+		*out = make([]PatchSpec, len(*in))
+		copy(*out, *in)
+	}
+}
+
+func (in *TargetSpec) DeepCopy() *TargetSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(TargetSpec)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *TagUpdaterSpec) DeepCopyInto(out *TagUpdaterSpec) {
 	*out = *in
 	out.Source = in.Source
-	out.Target = in.Target
 	out.Interval = in.Interval
+	if in.Targets != nil {
+		in, out := &in.Targets, &out.Targets
+		*out = make([]TargetSpec, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
 	if in.ArgoCDApp != nil {
 		in, out := &in.ArgoCDApp, &out.ArgoCDApp
 		*out = new(ArgoCDAppRef)
