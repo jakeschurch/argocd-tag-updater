@@ -39,11 +39,12 @@ func (p *Patcher) Apply(ctx context.Context, target Target, tmpl string, data ma
 	}
 	value := buf.String()
 
-	// dot-notation → JSON Pointer (RFC 6901)
-	path := "/" + strings.ReplaceAll(target.Field, ".", "/")
-	patch, err := json.Marshal([]map[string]any{
-		{"op": "replace", "path": path, "value": value},
-	})
+	// Build a JSON merge patch from the dot-notation field path. Merge patch
+	// deep-merges at every level, so intermediate keys don't need to exist and
+	// sibling fields are preserved. This handles both simple scalar fields like
+	// spec.flakeRef and deeply nested paths like
+	// spec.source.helm.valuesObject.image.tag without any special-casing.
+	patch, err := buildMergePatch(target.Field, value)
 	if err != nil {
 		return "", err
 	}
@@ -59,12 +60,24 @@ func (p *Patcher) Apply(ctx context.Context, target Target, tmpl string, data ma
 
 	rc := p.Client.Resource(gvr)
 	if target.Namespace != "" {
-		_, err = rc.Namespace(target.Namespace).Patch(ctx, target.Name, types.JSONPatchType, patch, metav1.PatchOptions{})
+		_, err = rc.Namespace(target.Namespace).Patch(ctx, target.Name, types.MergePatchType, patch, metav1.PatchOptions{})
 	} else {
-		_, err = rc.Patch(ctx, target.Name, types.JSONPatchType, patch, metav1.PatchOptions{})
+		_, err = rc.Patch(ctx, target.Name, types.MergePatchType, patch, metav1.PatchOptions{})
 	}
 	if err != nil {
 		return "", fmt.Errorf("patch %s/%s .%s: %w", target.Kind, target.Name, target.Field, err)
 	}
 	return value, nil
+}
+
+// buildMergePatch converts a dot-notation field path and value into a JSON
+// merge patch document. "spec.source.helm.valuesObject.image.tag" with value
+// "abc" produces {"spec":{"source":{"helm":{"valuesObject":{"image":{"tag":"abc"}}}}}}.
+func buildMergePatch(field string, value string) ([]byte, error) {
+	parts := strings.Split(field, ".")
+	var obj any = value
+	for i := len(parts) - 1; i >= 0; i-- {
+		obj = map[string]any{parts[i]: obj}
+	}
+	return json.Marshal(obj)
 }

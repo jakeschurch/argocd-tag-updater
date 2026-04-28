@@ -28,7 +28,7 @@ func main() {
 	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election")
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New())
+	ctrl.SetLogger(zap.New(zap.UseDevMode(true), zap.WriteTo(os.Stderr)))
 
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
