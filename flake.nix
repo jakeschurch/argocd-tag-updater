@@ -29,10 +29,17 @@
         # Git operations use go-git in-process (see internal/source/git.go),
         # so no external git binary is needed at runtime. The pod base
         # image can be scratch; SSL_CERT_FILE points into this mount.
-        argocd-tag-updater-bundle = pkgs.symlinkJoin {
-          name = "argocd-tag-updater-bundle";
-          paths = [ argocd-tag-updater pkgs.cacert ];
-        };
+        #
+        # Must be a self-contained tree of real files, not a symlinkJoin.
+        # nix-csi-go bind-mounts only this single store path into the pod,
+        # so symlinks pointing back to other /nix/store paths would dangle
+        # inside a scratch container.
+        argocd-tag-updater-bundle = pkgs.runCommand "argocd-tag-updater-bundle" { } ''
+          mkdir -p $out/bin $out/etc/ssl/certs
+          cp ${argocd-tag-updater}/bin/argocd-tag-updater $out/bin/argocd-tag-updater
+          chmod +x $out/bin/argocd-tag-updater
+          cp ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt $out/etc/ssl/certs/ca-bundle.crt
+        '';
 
         argocd-tag-updater-image = pkgs.dockerTools.buildLayeredImage {
           name = "argocd-tag-updater";
