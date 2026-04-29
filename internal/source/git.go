@@ -1,12 +1,12 @@
 package source
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"fmt"
-	"os/exec"
-	"strings"
+
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/storage/memory"
 )
 
 type Git struct {
@@ -14,24 +14,19 @@ type Git struct {
 }
 
 func (g *Git) Tags(ctx context.Context) ([]string, error) {
-	out, err := exec.CommandContext(ctx, "git", "ls-remote", "--tags", g.Repo).Output()
+	rem := git.NewRemote(memory.NewStorage(), &config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{g.Repo},
+	})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("git ls-remote %s: %w", g.Repo, err)
+		return nil, fmt.Errorf("ls-remote %s: %w", g.Repo, err)
 	}
 	var tags []string
-	sc := bufio.NewScanner(bytes.NewReader(out))
-	for sc.Scan() {
-		parts := strings.SplitN(sc.Text(), "\t", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		ref := parts[1]
-		if strings.HasSuffix(ref, "^{}") {
-			continue // skip peeled refs
-		}
-		if tag, ok := strings.CutPrefix(ref, "refs/tags/"); ok {
-			tags = append(tags, tag)
+	for _, ref := range refs {
+		if ref.Name().IsTag() {
+			tags = append(tags, ref.Name().Short())
 		}
 	}
-	return tags, sc.Err()
+	return tags, nil
 }

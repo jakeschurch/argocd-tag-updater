@@ -20,6 +20,18 @@
           ldflags = [ "-s" "-w" "-X main.version=0.1.0" ];
           doCheck = false;
           meta.mainProgram = "argocd-tag-updater";
+          postInstall = ''
+            mv $out/bin/cmd $out/bin/argocd-tag-updater
+          '';
+        };
+
+        # NixMount target — statically-linked binary plus a CA bundle.
+        # Git operations use go-git in-process (see internal/source/git.go),
+        # so no external git binary is needed at runtime. The pod base
+        # image can be scratch; SSL_CERT_FILE points into this mount.
+        argocd-tag-updater-bundle = pkgs.symlinkJoin {
+          name = "argocd-tag-updater-bundle";
+          paths = [ argocd-tag-updater pkgs.cacert ];
         };
 
         argocd-tag-updater-image = pkgs.dockerTools.buildLayeredImage {
@@ -28,7 +40,7 @@
           contents = [ pkgs.cacert pkgs.dockerTools.caCertificates pkgs.git ];
           extraCommands = ''
             mkdir -p bin
-            cp ${argocd-tag-updater}/bin/cmd bin/argocd-tag-updater
+            cp ${argocd-tag-updater}/bin/argocd-tag-updater bin/argocd-tag-updater
             chmod +x bin/argocd-tag-updater
           '';
           config = {
