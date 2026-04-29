@@ -62,6 +62,7 @@ func main() {
 	if err := (&controller.TagUpdaterReconciler{
 		Client:  mgr.GetClient(),
 		Dynamic: dynClient,
+		Mapper:  mgr.GetRESTMapper(),
 	}).SetupWithManager(mgr); err != nil {
 		fail("setup controller: %v", err)
 	}

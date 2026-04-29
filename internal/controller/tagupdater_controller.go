@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -24,6 +25,7 @@ const defaultInterval = 2 * time.Minute
 type TagUpdaterReconciler struct {
 	client.Client
 	Dynamic dynamic.Interface
+	Mapper  meta.RESTMapper
 }
 
 func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -70,7 +72,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		data[k] = v
 	}
 
-	p := patcher.Patcher{Client: r.Dynamic}
+	p := patcher.Patcher{Client: r.Dynamic, Mapper: r.Mapper}
 
 	var patchErrors []string
 	for _, target := range tu.Spec.Targets {

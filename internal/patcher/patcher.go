@@ -8,6 +8,7 @@ import (
 	"strings"
 	"text/template"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -17,6 +18,10 @@ import (
 
 type Patcher struct {
 	Client dynamic.Interface
+	// Mapper resolves a (group, kind) into a GVR. Required so the patcher
+	// works on any CR — naive pluralization (kind+"s") is wrong for kinds
+	// like Ingress or NetworkPolicy.
+	Mapper meta.RESTMapper
 }
 
 type Target struct {
@@ -40,7 +45,7 @@ type Patch struct {
 // patches to each one via a single merged JSON merge patch per CR.
 // Returns the names of CRs that were patched.
 func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, data map[string]string) ([]string, error) {
-	gvr, err := gvrFor(target.APIVersion, target.Kind)
+	gvr, err := p.gvrFor(target.APIVersion, target.Kind)
 	if err != nil {
 		return nil, err
 	}
@@ -140,11 +145,20 @@ func renderTemplate(tmpl string, data map[string]string) (string, error) {
 	return buf.String(), nil
 }
 
-func gvrFor(apiVersion, kind string) (schema.GroupVersionResource, error) {
+func (p *Patcher) gvrFor(apiVersion, kind string) (schema.GroupVersionResource, error) {
 	gv, err := schema.ParseGroupVersion(apiVersion)
 	if err != nil {
 		return schema.GroupVersionResource{}, fmt.Errorf("parse apiVersion %q: %w", apiVersion, err)
 	}
+	if p.Mapper != nil {
+		mapping, err := p.Mapper.RESTMapping(schema.GroupKind{Group: gv.Group, Kind: kind}, gv.Version)
+		if err != nil {
+			return schema.GroupVersionResource{}, fmt.Errorf("rest mapping %s/%s: %w", apiVersion, kind, err)
+		}
+		return mapping.Resource, nil
+	}
+	// Fallback for tests / no-mapper construction. Naive +s; correct for
+	// most CRDs but wrong for kinds with non-trivial English plurals.
 	resource := strings.ToLower(kind) + "s"
 	return schema.GroupVersionResource{Group: gv.Group, Version: gv.Version, Resource: resource}, nil
 }
