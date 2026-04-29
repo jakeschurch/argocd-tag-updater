@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -208,7 +209,7 @@ func setOwnerRepo(out map[string]string, path string) {
 func sourceFor(spec v1alpha1.SourceSpec) (source.Source, error) {
 	switch spec.Type {
 	case v1alpha1.SourceTypeGit:
-		return &source.Git{Repo: spec.Repo}, nil
+		return &source.Git{Repo: spec.Repo, SSHKeyFile: os.Getenv("GIT_SSH_KEY_FILE")}, nil
 	case v1alpha1.SourceTypeOCI:
 		return &source.OCI{Repo: spec.Repo}, nil
 	default:

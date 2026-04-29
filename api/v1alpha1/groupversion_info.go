@@ -1,3 +1,4 @@
+// +groupName=updater.argocd.io
 package v1alpha1
 
 import (
