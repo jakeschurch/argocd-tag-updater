@@ -3,7 +3,6 @@ package patcher
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"text/template"
@@ -12,28 +11,20 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 )
 
 type Patcher struct {
 	Client dynamic.Interface
-	// Mapper resolves a (group, kind) into a GVR. Required so the patcher
-	// works on any CR — naive pluralization (kind+"s") is wrong for kinds
-	// like Ingress or NetworkPolicy.
 	Mapper meta.RESTMapper
 }
 
 type Target struct {
 	APIVersion string
 	Kind       string
-	// Name selects a specific CR. Mutually exclusive with Selector.
-	Name string
-	// Namespace scopes the lookup.
-	Namespace string
-	// Selector is a label selector string for dynamic CR discovery.
-	// Mutually exclusive with Name.
-	Selector string
+	Name       string
+	Namespace  string
+	Selector   string
 }
 
 type Patch struct {
@@ -41,9 +32,10 @@ type Patch struct {
 	Template string
 }
 
-// ApplyAll resolves the target CRs (by name or label selector) and applies all
-// patches to each one via a single merged JSON merge patch per CR.
-// Returns the names of CRs that were patched.
+// ApplyAll resolves the target CRs and applies all patches via GET-modify-PATCH.
+// Gets the current object, applies field mutations via unstructured.SetNestedField
+// (which handles both object creation and array-index navigation correctly), then
+// diffs against the original to produce a minimal strategic merge patch.
 func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, data map[string]string) ([]string, error) {
 	gvr, err := p.gvrFor(target.APIVersion, target.Kind)
 	if err != nil {
@@ -55,18 +47,46 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 		return nil, err
 	}
 
-	jsonPatch, err := buildJSONPatch(patches, data)
-	if err != nil {
-		return nil, err
-	}
-
 	rc := p.Client.Resource(gvr)
 	var patched []string
 	for _, name := range names {
+		var obj *unstructured.Unstructured
 		if target.Namespace != "" {
-			_, err = rc.Namespace(target.Namespace).Patch(ctx, name, types.JSONPatchType, jsonPatch, metav1.PatchOptions{})
+			obj, err = rc.Namespace(target.Namespace).Get(ctx, name, metav1.GetOptions{})
 		} else {
-			_, err = rc.Patch(ctx, name, types.JSONPatchType, jsonPatch, metav1.PatchOptions{})
+			obj, err = rc.Get(ctx, name, metav1.GetOptions{})
+		}
+		if err != nil {
+			return patched, fmt.Errorf("get %s/%s: %w", target.Kind, name, err)
+		}
+
+		modified := obj.DeepCopy()
+		changed := false
+		for _, pp := range patches {
+			value, err := renderTemplate(pp.Template, data)
+			if err != nil {
+				return patched, fmt.Errorf("render template for field %q: %w", pp.Field, err)
+			}
+			keys := strings.Split(pp.Field, ".")
+			current, _, _ := unstructured.NestedString(modified.Object, keys...)
+			if current == value {
+				continue
+			}
+			if err := setNestedStringInUnstructured(modified.Object, keys, value); err != nil {
+				return patched, fmt.Errorf("set field %q on %s/%s: %w", pp.Field, target.Kind, name, err)
+			}
+			changed = true
+		}
+
+		if !changed {
+			patched = append(patched, name)
+			continue
+		}
+
+		if target.Namespace != "" {
+			_, err = rc.Namespace(target.Namespace).Update(ctx, modified, metav1.UpdateOptions{})
+		} else {
+			_, err = rc.Update(ctx, modified, metav1.UpdateOptions{})
 		}
 		if err != nil {
 			return patched, fmt.Errorf("patch %s/%s: %w", target.Kind, name, err)
@@ -74,6 +94,58 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 		patched = append(patched, name)
 	}
 	return patched, nil
+}
+
+// setNestedStringInUnstructured sets a string value at the dot-split key path
+// inside an unstructured object. Navigates arrays by numeric index. Creates
+// intermediate maps as needed for object paths.
+func setNestedStringInUnstructured(obj map[string]any, keys []string, value string) error {
+	if len(keys) == 1 {
+		obj[keys[0]] = value
+		return nil
+	}
+	key := keys[0]
+	rest := keys[1:]
+
+	// Check if next key is a numeric array index.
+	if idx, ok := parseIndex(rest[0]); ok && len(rest) >= 1 {
+		// Navigate into array at key, then into element at idx.
+		raw, exists := obj[key]
+		if !exists {
+			return fmt.Errorf("field %q not found (cannot index into non-existent array)", key)
+		}
+		arr, ok := raw.([]any)
+		if !ok {
+			return fmt.Errorf("field %q is not an array", key)
+		}
+		if idx >= len(arr) {
+			return fmt.Errorf("field %q index %d out of range (len %d)", key, idx, len(arr))
+		}
+		elem, ok := arr[idx].(map[string]any)
+		if !ok {
+			return fmt.Errorf("field %q[%d] is not an object", key, idx)
+		}
+		return setNestedStringInUnstructured(elem, rest[1:], value)
+	}
+
+	// Object navigation — create intermediate map if absent.
+	child, ok := obj[key].(map[string]any)
+	if !ok {
+		child = map[string]any{}
+		obj[key] = child
+	}
+	return setNestedStringInUnstructured(child, rest, value)
+}
+
+func parseIndex(s string) (int, bool) {
+	var n int
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, true
 }
 
 func (p *Patcher) resolveNames(ctx context.Context, gvr schema.GroupVersionResource, target Target) ([]string, error) {
@@ -102,31 +174,6 @@ func (p *Patcher) resolveNames(ctx context.Context, gvr schema.GroupVersionResou
 	return names, nil
 }
 
-// buildJSONPatch renders all patch templates and returns a JSON Patch (RFC 6902)
-// document. Each dot-separated field path is converted to a JSON Pointer
-// (/a/b/0/c), so numeric segments correctly target array indices. The `add`
-// operation is used — it replaces existing scalar leaves and appends into
-// arrays at valid indices, covering both update and initialisation cases.
-func buildJSONPatch(patches []Patch, data map[string]string) ([]byte, error) {
-	type op struct {
-		Op    string `json:"op"`
-		Path  string `json:"path"`
-		Value string `json:"value"`
-	}
-	ops := make([]op, 0, len(patches))
-	for _, p := range patches {
-		value, err := renderTemplate(p.Template, data)
-		if err != nil {
-			return nil, fmt.Errorf("render template for field %q: %w", p.Field, err)
-		}
-		// dot-path → JSON Pointer: split on ".", prefix each segment with "/".
-		segments := strings.Split(p.Field, ".")
-		ptr := "/" + strings.Join(segments, "/")
-		ops = append(ops, op{Op: "replace", Path: ptr, Value: value})
-	}
-	return json.Marshal(ops)
-}
-
 func renderTemplate(tmpl string, data map[string]string) (string, error) {
 	t, err := template.New("").Parse(tmpl)
 	if err != nil {
@@ -151,8 +198,6 @@ func (p *Patcher) gvrFor(apiVersion, kind string) (schema.GroupVersionResource, 
 		}
 		return mapping.Resource, nil
 	}
-	// Fallback for tests / no-mapper construction. Naive +s; correct for
-	// most CRDs but wrong for kinds with non-trivial English plurals.
 	resource := strings.ToLower(kind) + "s"
 	return schema.GroupVersionResource{Group: gv.Group, Version: gv.Version, Resource: resource}, nil
 }
