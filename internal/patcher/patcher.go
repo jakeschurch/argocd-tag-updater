@@ -55,7 +55,7 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 		return nil, err
 	}
 
-	mergePatch, err := buildMergePatch(patches, data)
+	jsonPatch, err := buildJSONPatch(patches, data)
 	if err != nil {
 		return nil, err
 	}
@@ -64,9 +64,9 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 	var patched []string
 	for _, name := range names {
 		if target.Namespace != "" {
-			_, err = rc.Namespace(target.Namespace).Patch(ctx, name, types.MergePatchType, mergePatch, metav1.PatchOptions{})
+			_, err = rc.Namespace(target.Namespace).Patch(ctx, name, types.JSONPatchType, jsonPatch, metav1.PatchOptions{})
 		} else {
-			_, err = rc.Patch(ctx, name, types.MergePatchType, mergePatch, metav1.PatchOptions{})
+			_, err = rc.Patch(ctx, name, types.JSONPatchType, jsonPatch, metav1.PatchOptions{})
 		}
 		if err != nil {
 			return patched, fmt.Errorf("patch %s/%s: %w", target.Kind, name, err)
@@ -102,35 +102,29 @@ func (p *Patcher) resolveNames(ctx context.Context, gvr schema.GroupVersionResou
 	return names, nil
 }
 
-// buildMergePatch renders all patch templates and merges them into a single
-// JSON merge patch document. Multiple patches targeting the same subtree are
-// merged — later entries in the slice overwrite earlier ones at the leaf level.
-func buildMergePatch(patches []Patch, data map[string]string) ([]byte, error) {
-	root := map[string]any{}
+// buildJSONPatch renders all patch templates and returns a JSON Patch (RFC 6902)
+// document. Each dot-separated field path is converted to a JSON Pointer
+// (/a/b/0/c), so numeric segments correctly target array indices. The `add`
+// operation is used — it replaces existing scalar leaves and appends into
+// arrays at valid indices, covering both update and initialisation cases.
+func buildJSONPatch(patches []Patch, data map[string]string) ([]byte, error) {
+	type op struct {
+		Op    string `json:"op"`
+		Path  string `json:"path"`
+		Value string `json:"value"`
+	}
+	ops := make([]op, 0, len(patches))
 	for _, p := range patches {
 		value, err := renderTemplate(p.Template, data)
 		if err != nil {
 			return nil, fmt.Errorf("render template for field %q: %w", p.Field, err)
 		}
-		setNested(root, strings.Split(p.Field, "."), value)
+		// dot-path → JSON Pointer: split on ".", prefix each segment with "/".
+		segments := strings.Split(p.Field, ".")
+		ptr := "/" + strings.Join(segments, "/")
+		ops = append(ops, op{Op: "replace", Path: ptr, Value: value})
 	}
-	return json.Marshal(root)
-}
-
-// setNested sets a scalar value at keys[last] inside m, creating intermediate
-// maps along keys[:last]. Existing intermediate maps are reused so sibling
-// keys under the same parent are preserved.
-func setNested(m map[string]any, keys []string, value any) {
-	for _, k := range keys[:len(keys)-1] {
-		if next, ok := m[k].(map[string]any); ok {
-			m = next
-		} else {
-			next = map[string]any{}
-			m[k] = next
-			m = next
-		}
-	}
-	m[keys[len(keys)-1]] = value
+	return json.Marshal(ops)
 }
 
 func renderTemplate(tmpl string, data map[string]string) (string, error) {
