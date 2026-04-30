@@ -63,10 +63,6 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
-	if latest.Tag == tu.Status.LastTag {
-		return ctrl.Result{RequeueAfter: interval}, nil
-	}
-
 	data := latest.Captures
 	data["tag"] = latest.Tag
 	for k, v := range parseRepo(tu.Spec.Source.Repo) {
@@ -110,24 +106,26 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: interval}, r.setFailed(ctx, &tu, fmt.Errorf("%s", strings.Join(patchErrors, "; ")))
 	}
 
-	if tu.Spec.ArgoCDApp != nil {
-		if err := r.triggerArgoCDSync(ctx, tu.Spec.ArgoCDApp); err != nil {
-			log.Error(err, "failed to trigger ArgoCD sync")
+	if latest.Tag != tu.Status.LastTag {
+		if tu.Spec.ArgoCDApp != nil {
+			if err := r.triggerArgoCDSync(ctx, tu.Spec.ArgoCDApp); err != nil {
+				log.Error(err, "failed to trigger ArgoCD sync")
+			}
 		}
-	}
 
-	now := metav1.Now()
-	tu.Status.LastTag = latest.Tag
-	tu.Status.LastUpdated = &now
-	tu.Status.Conditions = []metav1.Condition{{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		Reason:             "Updated",
-		Message:            fmt.Sprintf("patched %d target(s) to tag %s", len(tu.Spec.Targets), latest.Tag),
-		LastTransitionTime: now,
-	}}
-	if err := r.Status().Update(ctx, &tu); err != nil {
-		return ctrl.Result{}, err
+		now := metav1.Now()
+		tu.Status.LastTag = latest.Tag
+		tu.Status.LastUpdated = &now
+		tu.Status.Conditions = []metav1.Condition{{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			Reason:             "Updated",
+			Message:            fmt.Sprintf("patched %d target(s) to tag %s", len(tu.Spec.Targets), latest.Tag),
+			LastTransitionTime: now,
+		}}
+		if err := r.Status().Update(ctx, &tu); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{RequeueAfter: interval}, nil
