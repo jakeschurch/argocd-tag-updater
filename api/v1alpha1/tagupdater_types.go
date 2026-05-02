@@ -68,6 +68,10 @@ type TagUpdaterSpec struct {
 	Interval metav1.Duration `json:"interval,omitempty"`
 	// ArgoCDApp triggers a sync on the named Application after all patches are applied.
 	ArgoCDApp *ArgoCDAppRef `json:"argoCDApp,omitempty"`
+	// ManagingApp is the app-of-apps that syncs the target Applications from git.
+	// The controller ensures RespectIgnoreDifferences=true is in its syncOptions
+	// so TagUpdater patches on child Applications survive selfHeal cycles.
+	ManagingApp *ArgoCDAppRef `json:"managingApp,omitempty"`
 }
 
 type TagUpdaterStatus struct {

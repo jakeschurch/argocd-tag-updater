@@ -10,6 +10,8 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -106,6 +108,12 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: interval}, r.setFailed(ctx, &tu, fmt.Errorf("%s", strings.Join(patchErrors, "; ")))
 	}
 
+	if tu.Spec.ManagingApp != nil {
+		if err := r.ensureRespectIgnoreDifferences(ctx, tu.Spec.ManagingApp); err != nil {
+			log.Error(err, "failed to ensure RespectIgnoreDifferences on managing app")
+		}
+	}
+
 	if latest.Tag != tu.Status.LastTag {
 		if tu.Spec.ArgoCDApp != nil {
 			if err := r.triggerArgoCDSync(ctx, tu.Spec.ArgoCDApp); err != nil {
@@ -142,6 +150,32 @@ func (r *TagUpdaterReconciler) setFailed(ctx context.Context, tu *v1alpha1.TagUp
 	}}
 	_ = r.Status().Update(ctx, tu)
 	return cause
+}
+
+func (r *TagUpdaterReconciler) ensureRespectIgnoreDifferences(ctx context.Context, ref *v1alpha1.ArgoCDAppRef) error {
+	ns := ref.Namespace
+	if ns == "" {
+		ns = "argocd"
+	}
+	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+	obj, err := r.Dynamic.Resource(gvr).Namespace(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get application %s/%s: %w", ns, ref.Name, err)
+	}
+	opts, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "syncPolicy", "syncOptions")
+	const opt = "RespectIgnoreDifferences=true"
+	for _, o := range opts {
+		if o == opt {
+			return nil
+		}
+	}
+	modified := obj.DeepCopy()
+	opts = append(opts, opt)
+	if err := unstructured.SetNestedStringSlice(modified.Object, opts, "spec", "syncPolicy", "syncOptions"); err != nil {
+		return fmt.Errorf("set syncOptions: %w", err)
+	}
+	_, err = r.Dynamic.Resource(gvr).Namespace(ns).Update(ctx, modified, metav1.UpdateOptions{})
+	return err
 }
 
 func (r *TagUpdaterReconciler) triggerArgoCDSync(ctx context.Context, ref *v1alpha1.ArgoCDAppRef) error {
