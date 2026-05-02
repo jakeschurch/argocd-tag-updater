@@ -102,7 +102,3 @@ api/v1alpha1/ — TagUpdater CRD types
 kubectl apply -f config/crd/updater.argocd.io_tagupdaters.yaml
 # helm chart coming soon
 ```
-
-## License
-
-MIT
