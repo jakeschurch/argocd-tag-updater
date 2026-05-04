@@ -114,13 +114,13 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	if latest.Tag != tu.Status.LastTag {
-		if tu.Spec.ArgoCDApp != nil {
-			if err := r.triggerArgoCDSync(ctx, tu.Spec.ArgoCDApp); err != nil {
-				log.Error(err, "failed to trigger ArgoCD sync")
-			}
+	if tu.Spec.ArgoCDApp != nil {
+		if err := r.triggerArgoCDSync(ctx, tu.Spec.ArgoCDApp); err != nil {
+			log.Error(err, "failed to trigger ArgoCD sync")
 		}
+	}
 
+	if latest.Tag != tu.Status.LastTag {
 		now := metav1.Now()
 		tu.Status.LastTag = latest.Tag
 		tu.Status.LastUpdated = &now
