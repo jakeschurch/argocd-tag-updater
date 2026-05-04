@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -183,20 +182,20 @@ func (r *TagUpdaterReconciler) triggerArgoCDSync(ctx context.Context, ref *v1alp
 	if ns == "" {
 		ns = "argocd"
 	}
-	url := fmt.Sprintf("http://argocd-server.%s.svc.cluster.local/api/v1/applications/%s/sync", ns, ref.Name)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+	obj, err := r.Dynamic.Resource(gvr).Namespace(ns).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("get application %s/%s: %w", ns, ref.Name, err)
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
+	patch := obj.DeepCopy()
+	if err := unstructured.SetNestedMap(patch.Object, map[string]any{
+		"initiatedBy": map[string]any{"username": "argocd-tag-updater"},
+		"sync":        map[string]any{},
+	}, "operation"); err != nil {
+		return fmt.Errorf("set operation: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("argocd sync returned %d", resp.StatusCode)
-	}
-	return nil
+	_, err = r.Dynamic.Resource(gvr).Namespace(ns).Update(ctx, patch, metav1.UpdateOptions{})
+	return err
 }
 
 func parseRepo(raw string) map[string]string {
