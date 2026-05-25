@@ -5,29 +5,40 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/jakeschurch/argocd-tag-updater/api/v1alpha1"
 	"github.com/jakeschurch/argocd-tag-updater/internal/matcher"
 	"github.com/jakeschurch/argocd-tag-updater/internal/patcher"
-	"github.com/jakeschurch/argocd-tag-updater/internal/source"
+	intsource "github.com/jakeschurch/argocd-tag-updater/internal/source"
 )
 
 const defaultInterval = 2 * time.Minute
 
 type TagUpdaterReconciler struct {
 	client.Client
-	Dynamic dynamic.Interface
-	Mapper  meta.RESTMapper
+	Dynamic     dynamic.Interface
+	Mapper      meta.RESTMapper
+	Cache       cache.Cache
+	ctrl        controller.Controller
+	watchedGVKs sync.Map // map[schema.GroupVersionKind]struct{}
 }
 
 func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -135,6 +146,8 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
+	r.ensureWatches(ctx, &tu)
+
 	return ctrl.Result{RequeueAfter: interval}, nil
 }
 
@@ -237,19 +250,98 @@ func setOwnerRepo(out map[string]string, path string) {
 	}
 }
 
-func sourceFor(spec v1alpha1.SourceSpec) (source.Source, error) {
+func sourceFor(spec v1alpha1.SourceSpec) (intsource.Source, error) {
 	switch spec.Type {
 	case v1alpha1.SourceTypeGit:
-		return &source.Git{Repo: spec.Repo, SSHKeyFile: os.Getenv("GIT_SSH_KEY_FILE")}, nil
+		return &intsource.Git{Repo: spec.Repo, SSHKeyFile: os.Getenv("GIT_SSH_KEY_FILE")}, nil
 	case v1alpha1.SourceTypeOCI:
-		return &source.OCI{Repo: spec.Repo}, nil
+		return &intsource.OCI{Repo: spec.Repo}, nil
 	default:
 		return nil, fmt.Errorf("unknown source type %q", spec.Type)
 	}
 }
 
 func (r *TagUpdaterReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	r.Cache = mgr.GetCache()
+	c, err := ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.TagUpdater{}).
-		Complete(r)
+		Build(r)
+	if err != nil {
+		return err
+	}
+	r.ctrl = c
+	return nil
+}
+
+func parseGVK(apiVersion, kind string) schema.GroupVersionKind {
+	gv, _ := schema.ParseGroupVersion(apiVersion)
+	return gv.WithKind(kind)
+}
+
+func (r *TagUpdaterReconciler) ensureWatches(ctx context.Context, tu *v1alpha1.TagUpdater) {
+	log := log.FromContext(ctx)
+	for _, target := range tu.Spec.Targets {
+		gvk := parseGVK(target.APIVersion, target.Kind)
+		if _, loaded := r.watchedGVKs.LoadOrStore(gvk, struct{}{}); loaded {
+			continue
+		}
+		log.Info("adding watch", "gvk", gvk)
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		if err := r.ctrl.Watch(source.Kind(r.Cache, obj,
+			handler.TypedEnqueueRequestsFromMapFunc(r.mapTargetToTagUpdater),
+		)); err != nil {
+			log.Error(err, "failed to add watch", "gvk", gvk)
+			// remove from map so next reconcile retries
+			r.watchedGVKs.Delete(gvk)
+		}
+	}
+}
+
+func (r *TagUpdaterReconciler) mapTargetToTagUpdater(ctx context.Context, obj *unstructured.Unstructured) []reconcile.Request {
+	var tuList v1alpha1.TagUpdaterList
+	if err := r.List(ctx, &tuList); err != nil {
+		return nil
+	}
+
+	objGVK := obj.GroupVersionKind()
+	seen := map[types.NamespacedName]struct{}{}
+	var requests []reconcile.Request
+
+	for _, tu := range tuList.Items {
+		for _, target := range tu.Spec.Targets {
+			gvk := parseGVK(target.APIVersion, target.Kind)
+			if gvk != objGVK {
+				continue
+			}
+
+			matched := false
+			if target.Name != "" {
+				ns := target.Namespace
+				if ns == "" {
+					ns = obj.GetNamespace()
+				}
+				matched = target.Name == obj.GetName() && ns == obj.GetNamespace()
+			} else if target.Selector != nil {
+				sel, err := metav1.LabelSelectorAsSelector(target.Selector)
+				if err != nil {
+					continue
+				}
+				matched = sel.Matches(labels.Set(obj.GetLabels()))
+			} else {
+				// no name or selector — match all objects of this GVK
+				matched = true
+			}
+
+			if matched {
+				key := types.NamespacedName{Namespace: tu.Namespace, Name: tu.Name}
+				if _, ok := seen[key]; !ok {
+					seen[key] = struct{}{}
+					requests = append(requests, reconcile.Request{NamespacedName: key})
+				}
+				break
+			}
+		}
+	}
+	return requests
 }
