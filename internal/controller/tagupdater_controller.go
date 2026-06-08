@@ -253,7 +253,11 @@ func setOwnerRepo(out map[string]string, path string) {
 func sourceFor(spec v1alpha1.SourceSpec) (intsource.Source, error) {
 	switch spec.Type {
 	case v1alpha1.SourceTypeGit:
-		return &intsource.Git{Repo: spec.Repo, SSHKeyFile: os.Getenv("GIT_SSH_KEY_FILE")}, nil
+		return &intsource.Git{
+			Repo:       spec.Repo,
+			SSHKeyFile: os.Getenv("GIT_SSH_KEY_FILE"),
+			Token:      os.Getenv("GIT_TOKEN"),
+		}, nil
 	case v1alpha1.SourceTypeOCI:
 		return &intsource.OCI{Repo: spec.Repo}, nil
 	default:
