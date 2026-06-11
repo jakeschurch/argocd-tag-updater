@@ -74,7 +74,12 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 				return patched, changedNames, fmt.Errorf("render template for field %q: %w", pp.Field, err)
 			}
 			keys := strings.Split(pp.Field, ".")
-			current, _, _ := unstructured.NestedString(modified.Object, keys...)
+			// unstructured.NestedString cannot navigate array indexes, so
+			// for paths like builders.0.image it always returned "" and the
+			// no-op check never fired — every reconcile Updated and
+			// sync-triggered (foundrybox-cmk). Mirror the setter's
+			// navigation instead.
+			current, _ := getNestedStringInUnstructured(modified.Object, keys)
 			if current == value {
 				continue
 			}
@@ -142,6 +147,43 @@ func setNestedStringInUnstructured(obj map[string]any, keys []string, value stri
 		obj[key] = child
 	}
 	return setNestedStringInUnstructured(child, rest, value)
+}
+
+// getNestedStringInUnstructured reads a string at the dot-split key path,
+// navigating arrays by numeric index — the read-side mirror of
+// setNestedStringInUnstructured. Returns ("", false) when any path
+// segment is missing or mistyped.
+func getNestedStringInUnstructured(obj map[string]any, keys []string) (string, bool) {
+	if len(keys) == 0 {
+		return "", false
+	}
+	if len(keys) == 1 {
+		v, ok := obj[keys[0]].(string)
+		return v, ok
+	}
+	key := keys[0]
+	rest := keys[1:]
+
+	if idx, ok := parseIndex(rest[0]); ok {
+		arr, ok := obj[key].([]any)
+		if !ok || idx >= len(arr) {
+			return "", false
+		}
+		elem, ok := arr[idx].(map[string]any)
+		if !ok {
+			return "", false
+		}
+		if len(rest) == 1 {
+			return "", false
+		}
+		return getNestedStringInUnstructured(elem, rest[1:])
+	}
+
+	child, ok := obj[key].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	return getNestedStringInUnstructured(child, rest)
 }
 
 func parseIndex(s string) (int, bool) {
