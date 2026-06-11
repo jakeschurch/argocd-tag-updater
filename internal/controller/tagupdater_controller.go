@@ -30,6 +30,8 @@ import (
 	intsource "github.com/jakeschurch/argocd-tag-updater/internal/source"
 )
 
+const defaultRollbackTimeout = 10 * time.Minute
+
 const defaultInterval = 2 * time.Minute
 
 type TagUpdaterReconciler struct {
@@ -54,6 +56,18 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		interval = tu.Spec.Interval.Duration
 	}
 
+	// If rollback is enabled and we're mid-watch, check ArgoCD health before polling tags.
+	if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Status.WatchingTag != "" {
+		requeue, err := r.checkHealthAndMaybeRollback(ctx, &tu, interval)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: interval}, err
+		}
+		if requeue > 0 {
+			return ctrl.Result{RequeueAfter: requeue}, nil
+		}
+		// health confirmed OK — fall through to normal tag poll
+	}
+
 	src, err := sourceFor(tu.Spec.Source)
 	if err != nil {
 		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
@@ -69,7 +83,10 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
 	}
 
-	latest, ok := m.Latest(tags)
+	// Filter skipped tags so they are never re-applied.
+	filteredTags := filterSkipped(tags, tu.Status.SkippedTags)
+
+	latest, ok := m.Latest(filteredTags)
 	if !ok {
 		log.Info("no tags matched pattern", "pattern", tu.Spec.Source.TagPattern)
 		return ctrl.Result{RequeueAfter: interval}, nil
@@ -128,10 +145,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	// Only nudge ArgoCD when a target actually changed: the sync trigger
-	// writes .operation on the Application, and doing it every reconcile
-	// (~15s) drove metadata.generation into the 100k+ range while masking
-	// real churn (foundrybox-cmk).
+	// Only nudge ArgoCD when a target actually changed.
 	if tu.Spec.ArgoCDApp != nil && anyChanged {
 		if err := r.triggerArgoCDSync(ctx, tu.Spec.ArgoCDApp); err != nil {
 			log.Error(err, "failed to trigger ArgoCD sync")
@@ -140,6 +154,9 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	if latest.Tag != tu.Status.LastTag {
 		now := metav1.Now()
+		// Preserve the previous tag before overwriting so rollback can revert to it.
+		prevTag := tu.Status.LastTag
+		tu.Status.PreviousTag = prevTag
 		tu.Status.LastTag = latest.Tag
 		tu.Status.LastUpdated = &now
 		tu.Status.Conditions = []metav1.Condition{{
@@ -149,14 +166,210 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			Message:            fmt.Sprintf("patched %d target(s) to tag %s", len(tu.Spec.Targets), latest.Tag),
 			LastTransitionTime: now,
 		}}
+
+		// Start health watch if rollback is enabled and we have an ArgoCD app to watch.
+		if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Spec.ArgoCDApp != nil {
+			tu.Status.WatchingTag = latest.Tag
+			tu.Status.WatchingSince = &now
+		}
+
 		if err := r.Status().Update(ctx, &tu); err != nil {
 			return ctrl.Result{}, err
+		}
+
+		// Requeue quickly to start health polling.
+		if tu.Status.WatchingTag != "" {
+			r.ensureWatches(ctx, &tu)
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 	}
 
 	r.ensureWatches(ctx, &tu)
 
 	return ctrl.Result{RequeueAfter: interval}, nil
+}
+
+// checkHealthAndMaybeRollback checks the ArgoCD app health while WatchingTag is set.
+// Returns (requeue duration, error): requeue>0 means come back later; 0 means health watch complete.
+func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, tu *v1alpha1.TagUpdater, interval time.Duration) (time.Duration, error) {
+	log := log.FromContext(ctx)
+
+	timeout := defaultRollbackTimeout
+	if tu.Spec.Rollback.Timeout.Duration > 0 {
+		timeout = tu.Spec.Rollback.Timeout.Duration
+	}
+
+	watching := tu.Status.WatchingTag
+	since := tu.Status.WatchingSince
+
+	elapsed := time.Duration(0)
+	if since != nil {
+		elapsed = time.Since(since.Time)
+	}
+
+	health, degradeReason, err := r.argoCDAppHealth(ctx, tu.Spec.ArgoCDApp)
+	if err != nil {
+		log.Error(err, "failed to read ArgoCD app health during rollback watch", "watchingTag", watching)
+		if elapsed > timeout {
+			log.Info("rollback timeout: health unreadable, reverting", "watchingTag", watching, "elapsed", elapsed)
+			return 0, r.doRollback(ctx, tu, watching)
+		}
+		return 15 * time.Second, nil
+	}
+
+	switch health {
+	case "Healthy":
+		log.Info("deployment healthy, rollback watch complete", "tag", watching)
+		tu.Status.WatchingTag = ""
+		tu.Status.WatchingSince = nil
+		// Clear skipped tags — a successful new deployment means previous skips are stale.
+		tu.Status.SkippedTags = nil
+		if err := r.Status().Update(ctx, tu); err != nil {
+			return 0, err
+		}
+		return 0, nil
+
+	case "Degraded":
+		log.Info("deployment degraded, rolling back", "watchingTag", watching, "reason", degradeReason)
+		return 0, r.doRollback(ctx, tu, watching)
+
+	default:
+		if elapsed > timeout {
+			log.Info("rollback timeout waiting for healthy, reverting", "watchingTag", watching, "elapsed", elapsed, "health", health)
+			return 0, r.doRollback(ctx, tu, watching)
+		}
+		log.Info("waiting for deployment health", "watchingTag", watching, "health", health, "elapsed", elapsed)
+		return 15 * time.Second, nil
+	}
+}
+
+// doRollback reverts all targets to previousTag and records badTag in skippedTags.
+func (r *TagUpdaterReconciler) doRollback(ctx context.Context, tu *v1alpha1.TagUpdater, badTag string) error {
+	log := log.FromContext(ctx)
+
+	prevTag := tu.Status.PreviousTag
+	if prevTag == "" || prevTag == badTag {
+		log.Info("no previous tag to roll back to, skipping rollback", "badTag", badTag, "previousTag", prevTag)
+		tu.Status.WatchingTag = ""
+		tu.Status.WatchingSince = nil
+		tu.Status.SkippedTags = appendUnique(tu.Status.SkippedTags, badTag)
+		return r.Status().Update(ctx, tu)
+	}
+
+	log.Info("rolling back to previous tag", "badTag", badTag, "previousTag", prevTag)
+
+	m, err := matcher.New(tu.Spec.Source.TagPattern)
+	if err != nil {
+		return err
+	}
+
+	match, ok := m.Latest([]string{prevTag})
+	if !ok {
+		log.Info("previous tag does not match pattern, cannot roll back", "previousTag", prevTag)
+		tu.Status.WatchingTag = ""
+		tu.Status.WatchingSince = nil
+		tu.Status.SkippedTags = appendUnique(tu.Status.SkippedTags, badTag)
+		return r.Status().Update(ctx, tu)
+	}
+
+	data := match.Captures
+	data["tag"] = match.Tag
+	for k, v := range parseRepo(tu.Spec.Source.Repo) {
+		data[k] = v
+	}
+
+	p := patcher.Patcher{Client: r.Dynamic, Mapper: r.Mapper}
+	for _, target := range tu.Spec.Targets {
+		patches := make([]patcher.Patch, len(target.Patches))
+		for i, patch := range target.Patches {
+			patches[i] = patcher.Patch{Field: patch.Field, Template: patch.Template}
+		}
+		_, changed, err := p.ApplyAll(ctx, patcher.Target{
+			APIVersion: target.APIVersion,
+			Kind:       target.Kind,
+			Name:       target.Name,
+			Namespace:  target.Namespace,
+		}, patches, data)
+		if err != nil {
+			log.Error(err, "rollback patch failed", "kind", target.Kind)
+			continue
+		}
+		if len(changed) > 0 {
+			log.Info("rolled back", "kind", target.Kind, "names", changed, "tag", prevTag)
+		}
+	}
+
+	if tu.Spec.ArgoCDApp != nil {
+		if err := r.triggerArgoCDSync(ctx, tu.Spec.ArgoCDApp); err != nil {
+			log.Error(err, "failed to trigger ArgoCD sync after rollback")
+		}
+	}
+
+	now := metav1.Now()
+	tu.Status.LastTag = prevTag
+	tu.Status.LastUpdated = &now
+	tu.Status.WatchingTag = ""
+	tu.Status.WatchingSince = nil
+	tu.Status.SkippedTags = appendUnique(tu.Status.SkippedTags, badTag)
+	tu.Status.Conditions = []metav1.Condition{{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             "RolledBack",
+		Message:            fmt.Sprintf("tag %s failed, reverted to %s", badTag, prevTag),
+		LastTransitionTime: now,
+	}}
+	return r.Status().Update(ctx, tu)
+}
+
+// argoCDAppHealth returns the ArgoCD Application health.status and a description
+// of any degraded reason (for logging). Returns ("", "", err) on read failure.
+func (r *TagUpdaterReconciler) argoCDAppHealth(ctx context.Context, ref *v1alpha1.ArgoCDAppRef) (string, string, error) {
+	ns := ref.Namespace
+	if ns == "" {
+		ns = "argocd"
+	}
+	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+	obj, err := r.Dynamic.Resource(gvr).Namespace(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		return "", "", fmt.Errorf("get application %s/%s: %w", ns, ref.Name, err)
+	}
+
+	health, _, _ := unstructured.NestedString(obj.Object, "status", "health", "status")
+	opMsg, _, _ := unstructured.NestedString(obj.Object, "status", "operationState", "message")
+
+	// Treat ProgressDeadlineExceeded in the operation message as Degraded.
+	if health != "Degraded" && strings.Contains(opMsg, "ProgressDeadlineExceeded") {
+		health = "Degraded"
+	}
+
+	return health, opMsg, nil
+}
+
+// filterSkipped removes any tags that appear in the skipped list.
+func filterSkipped(tags []string, skipped []string) []string {
+	if len(skipped) == 0 {
+		return tags
+	}
+	skip := make(map[string]struct{}, len(skipped))
+	for _, s := range skipped {
+		skip[s] = struct{}{}
+	}
+	out := tags[:0:0]
+	for _, t := range tags {
+		if _, bad := skip[t]; !bad {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func appendUnique(slice []string, s string) []string {
+	for _, v := range slice {
+		if v == s {
+			return slice
+		}
+	}
+	return append(slice, s)
 }
 
 func (r *TagUpdaterReconciler) setFailed(ctx context.Context, tu *v1alpha1.TagUpdater, cause error) error {

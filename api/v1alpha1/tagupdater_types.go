@@ -47,6 +47,14 @@ type ArgoCDAppRef struct {
 	Namespace string `json:"namespace,omitempty"` // defaults to "argocd"
 }
 
+// RollbackSpec configures automatic rollback when a tag deployment is unhealthy.
+type RollbackSpec struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// Timeout is how long to wait for ArgoCD health before rolling back.
+	// Defaults to 10m. Should be >= the target Deployment's progressDeadlineSeconds.
+	Timeout metav1.Duration `json:"timeout,omitempty"`
+}
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Repo",type=string,JSONPath=`.spec.source.repo`
@@ -72,12 +80,26 @@ type TagUpdaterSpec struct {
 	// The controller ensures RespectIgnoreDifferences=true is in its syncOptions
 	// so TagUpdater patches on child Applications survive selfHeal cycles.
 	ManagingApp *ArgoCDAppRef `json:"managingApp,omitempty"`
+	// Rollback configures automatic rollback when a newly-applied tag fails to
+	// deploy successfully. Requires ArgoCDApp to be set.
+	Rollback *RollbackSpec `json:"rollback,omitempty"`
 }
 
 type TagUpdaterStatus struct {
 	LastTag     string             `json:"lastTag,omitempty"`
 	LastUpdated *metav1.Time       `json:"lastUpdated,omitempty"`
 	Conditions  []metav1.Condition `json:"conditions,omitempty"`
+	// PreviousTag is the tag that was applied before LastTag.
+	PreviousTag string `json:"previousTag,omitempty"`
+	// SkippedTags is the list of tags that failed to deploy and were rolled back.
+	// These tags are excluded from future Latest() selection until a newer tag
+	// deploys successfully, at which point the list is cleared.
+	SkippedTags []string `json:"skippedTags,omitempty"`
+	// WatchingTag is the tag whose ArgoCD health is currently being monitored.
+	// Set after a patch is applied; cleared once the app is healthy or rolled back.
+	WatchingTag string `json:"watchingTag,omitempty"`
+	// WatchingSince is when health monitoring for WatchingTag started.
+	WatchingSince *metav1.Time `json:"watchingSince,omitempty"`
 }
 
 // +kubebuilder:object:root=true

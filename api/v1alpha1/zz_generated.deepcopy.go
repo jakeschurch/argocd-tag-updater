@@ -96,6 +96,19 @@ func (in *TargetSpec) DeepCopy() *TargetSpec {
 	return out
 }
 
+func (in *RollbackSpec) DeepCopyInto(out *RollbackSpec) {
+	*out = *in
+}
+
+func (in *RollbackSpec) DeepCopy() *RollbackSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(RollbackSpec)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *TagUpdaterSpec) DeepCopyInto(out *TagUpdaterSpec) {
 	*out = *in
 	out.Source = in.Source
@@ -112,6 +125,16 @@ func (in *TagUpdaterSpec) DeepCopyInto(out *TagUpdaterSpec) {
 		*out = new(ArgoCDAppRef)
 		**out = **in
 	}
+	if in.ManagingApp != nil {
+		in, out := &in.ManagingApp, &out.ManagingApp
+		*out = new(ArgoCDAppRef)
+		**out = **in
+	}
+	if in.Rollback != nil {
+		in, out := &in.Rollback, &out.Rollback
+		*out = new(RollbackSpec)
+		**out = **in
+	}
 }
 
 func (in *TagUpdaterStatus) DeepCopyInto(out *TagUpdaterStatus) {
@@ -126,5 +149,14 @@ func (in *TagUpdaterStatus) DeepCopyInto(out *TagUpdaterStatus) {
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
+	}
+	if in.SkippedTags != nil {
+		in, out := &in.SkippedTags, &out.SkippedTags
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
+	if in.WatchingSince != nil {
+		in, out := &in.WatchingSince, &out.WatchingSince
+		*out = (*in).DeepCopy()
 	}
 }
