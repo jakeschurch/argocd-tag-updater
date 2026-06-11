@@ -84,6 +84,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	p := patcher.Patcher{Client: r.Dynamic, Mapper: r.Mapper}
 
 	var patchErrors []string
+	anyChanged := false
 	for _, target := range tu.Spec.Targets {
 		selector := ""
 		if target.Selector != nil {
@@ -100,7 +101,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			patches[i] = patcher.Patch{Field: patch.Field, Template: patch.Template}
 		}
 
-		patched, err := p.ApplyAll(ctx, patcher.Target{
+		_, changed, err := p.ApplyAll(ctx, patcher.Target{
 			APIVersion: target.APIVersion,
 			Kind:       target.Kind,
 			Name:       target.Name,
@@ -111,7 +112,10 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			patchErrors = append(patchErrors, err.Error())
 			continue
 		}
-		log.Info("patched", "kind", target.Kind, "names", patched, "tag", latest.Tag)
+		if len(changed) > 0 {
+			log.Info("patched", "kind", target.Kind, "names", changed, "tag", latest.Tag)
+			anyChanged = true
+		}
 	}
 
 	if len(patchErrors) > 0 {
@@ -124,7 +128,11 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	if tu.Spec.ArgoCDApp != nil {
+	// Only nudge ArgoCD when a target actually changed: the sync trigger
+	// writes .operation on the Application, and doing it every reconcile
+	// (~15s) drove metadata.generation into the 100k+ range while masking
+	// real churn (foundrybox-cmk).
+	if tu.Spec.ArgoCDApp != nil && anyChanged {
 		if err := r.triggerArgoCDSync(ctx, tu.Spec.ArgoCDApp); err != nil {
 			log.Error(err, "failed to trigger ArgoCD sync")
 		}

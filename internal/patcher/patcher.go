@@ -36,19 +36,25 @@ type Patch struct {
 // Gets the current object, applies field mutations via unstructured.SetNestedField
 // (which handles both object creation and array-index navigation correctly), then
 // diffs against the original to produce a minimal strategic merge patch.
-func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, data map[string]string) ([]string, error) {
+//
+// Returns (allTargets, changedTargets): names whose desired state matched
+// (no Update issued) appear only in the first list, so callers can skip
+// follow-up side effects (logging, ArgoCD sync triggers) on no-op
+// reconciles — those side effects were driving Application
+// metadata.generation into the 100k+ range (foundrybox-cmk).
+func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, data map[string]string) ([]string, []string, error) {
 	gvr, err := p.gvrFor(target.APIVersion, target.Kind)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	names, err := p.resolveNames(ctx, gvr, target)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	rc := p.Client.Resource(gvr)
-	var patched []string
+	var patched, changedNames []string
 	for _, name := range names {
 		var obj *unstructured.Unstructured
 		if target.Namespace != "" {
@@ -57,7 +63,7 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 			obj, err = rc.Get(ctx, name, metav1.GetOptions{})
 		}
 		if err != nil {
-			return patched, fmt.Errorf("get %s/%s: %w", target.Kind, name, err)
+			return patched, changedNames, fmt.Errorf("get %s/%s: %w", target.Kind, name, err)
 		}
 
 		modified := obj.DeepCopy()
@@ -65,7 +71,7 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 		for _, pp := range patches {
 			value, err := renderTemplate(pp.Template, data)
 			if err != nil {
-				return patched, fmt.Errorf("render template for field %q: %w", pp.Field, err)
+				return patched, changedNames, fmt.Errorf("render template for field %q: %w", pp.Field, err)
 			}
 			keys := strings.Split(pp.Field, ".")
 			current, _, _ := unstructured.NestedString(modified.Object, keys...)
@@ -73,7 +79,7 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 				continue
 			}
 			if err := setNestedStringInUnstructured(modified.Object, keys, value); err != nil {
-				return patched, fmt.Errorf("set field %q on %s/%s: %w", pp.Field, target.Kind, name, err)
+				return patched, changedNames, fmt.Errorf("set field %q on %s/%s: %w", pp.Field, target.Kind, name, err)
 			}
 			changed = true
 		}
@@ -89,11 +95,12 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 			_, err = rc.Update(ctx, modified, metav1.UpdateOptions{})
 		}
 		if err != nil {
-			return patched, fmt.Errorf("patch %s/%s: %w", target.Kind, name, err)
+			return patched, changedNames, fmt.Errorf("patch %s/%s: %w", target.Kind, name, err)
 		}
 		patched = append(patched, name)
+		changedNames = append(changedNames, name)
 	}
-	return patched, nil
+	return patched, changedNames, nil
 }
 
 // setNestedStringInUnstructured sets a string value at the dot-split key path
