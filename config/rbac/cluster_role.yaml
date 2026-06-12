@@ -1,0 +1,29 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argocd-tag-updater
+rules:
+  # Own CRD — full CRUD + status
+  - apiGroups: ["updater.argocd.io"]
+    resources: ["tagupdaters", "tagupdaters/status"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+  # ArgoCD resources — watch Sensors, get/update Applications for sync trigger
+  - apiGroups: ["argoproj.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+  # Common workload target types
+  - apiGroups: ["apps"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+  # Core resources (Pods, Services, ConfigMaps, etc.) as potential targets
+  - apiGroups: [""]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+  # Batch resources as potential targets
+  - apiGroups: ["batch"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "update", "patch"]
