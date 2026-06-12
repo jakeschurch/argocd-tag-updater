@@ -481,6 +481,11 @@ func sourceFor(spec v1alpha1.SourceSpec) (intsource.Source, error) {
 		}, nil
 	case v1alpha1.SourceTypeOCI:
 		return &intsource.OCI{Repo: spec.Repo}, nil
+	case v1alpha1.SourceTypeNix:
+		return &intsource.Nix{
+			Repo:  spec.Repo,
+			Token: os.Getenv("NIX_CACHE_TOKEN"),
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown source type %q", spec.Type)
 	}

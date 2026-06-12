@@ -7,11 +7,13 @@ type SourceType string
 const (
 	SourceTypeGit SourceType = "git"
 	SourceTypeOCI SourceType = "oci"
+	SourceTypeNix SourceType = "nix"
 )
 
 type SourceSpec struct {
 	Type SourceType `json:"type"`
-	// Repo is a git remote URL (git source) or OCI repository reference (oci source).
+	// Repo is a git remote URL (git source), OCI repository reference (oci source),
+	// or nix cache tag namespace "<host>/<name>" (nix source).
 	Repo string `json:"repo"`
 	// TagPattern is a named-group regex. Captures are available in Patch templates.
 	// The capture named "n" is used as the sort key to select the latest tag.
