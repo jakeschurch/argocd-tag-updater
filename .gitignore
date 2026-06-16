@@ -1,0 +1,4 @@
+
+# Nix build output (out-of-bounds symlink — ArgoCD rejects it)
+result
+result-*
