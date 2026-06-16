@@ -1,0 +1,61 @@
+# Default values for argocd-tag-updater.
+
+# Two replicas with leader election (single active reconciler, warm standby).
+replicaCount: 2
+
+image:
+  repository: registry.jakeschurch.com/scratch
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Path to the controller binary inside the mounted nix bundle.
+command: /nix-dynamic/argocd-tag-updater/bundle/bin/argocd-tag-updater
+
+# Enable controller-runtime leader election. Required when replicaCount > 1.
+leaderElect: true
+
+# Nix CSI bundle mount. flakeRef is the field the self-updating TagUpdater
+# patches on every new argocd-tag-updater build (see homelab tag-updater CR).
+nixMount:
+  flakeRef: github:jakeschurch/argocd-tag-updater#packages.x86_64-linux.argocd-tag-updater-bundle
+  mountPath: /nix-dynamic/argocd-tag-updater
+
+# Mounts an SSH deploy key + a classic PAT for git access. The controller
+# prefers GIT_TOKEN over the SSH key when set (internal/source/git.go).
+git:
+  sshKey:
+    enabled: true
+    secretName: argocd-tag-updater-github-deploy-key
+    mountPath: /etc/git
+    keyFile: /etc/git/id_ed25519
+  token:
+    enabled: true
+    secretName: argocd-tag-updater-git-token
+    secretKey: token
+
+# CA bundle path inside the nix bundle (for HTTPS git/registry calls).
+sslCertFile: /nix-dynamic/argocd-tag-updater/bundle/etc/ssl/certs/ca-bundle.crt
+
+ports:
+  metrics: 8080
+  probe: 8081
+
+serviceAccount:
+  create: true
+  name: argocd-tag-updater
+
+# Ship the TagUpdater CRD with the chart.
+crd:
+  install: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

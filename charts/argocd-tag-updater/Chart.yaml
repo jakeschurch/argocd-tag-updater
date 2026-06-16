@@ -1,0 +1,6 @@
+apiVersion: v2
+name: argocd-tag-updater
+description: Kubernetes controller that watches git/OCI tag streams and patches ArgoCD Applications (and other resources) to the latest matching tag
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

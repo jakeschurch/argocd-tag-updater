@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "argocd-tag-updater.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "argocd-tag-updater.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "argocd-tag-updater.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "argocd-tag-updater.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "argocd-tag-updater.serviceAccountName" . }}
+      volumes:
+        - name: nix-bundle
+          csi:
+            driver: nix.csi.store
+            volumeAttributes:
+              flakeRef: {{ .Values.nixMount.flakeRef | quote }}
+        {{- if .Values.git.sshKey.enabled }}
+        - name: github-deploy-key
+          secret:
+            secretName: {{ .Values.git.sshKey.secretName }}
+            defaultMode: 384
+        {{- end }}
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - {{ .Values.command }}
+          args:
+            - --leader-elect={{ .Values.leaderElect }}
+            - --metrics-addr=:{{ .Values.ports.metrics }}
+            - --probe-addr=:{{ .Values.ports.probe }}
+          env:
+            - name: SSL_CERT_FILE
+              value: {{ .Values.sslCertFile | quote }}
+            {{- if .Values.git.sshKey.enabled }}
+            - name: GIT_SSH_KEY_FILE
+              value: {{ .Values.git.sshKey.keyFile | quote }}
+            {{- end }}
+            {{- if .Values.git.token.enabled }}
+            # A single classic PAT (repo scope) reads every targeted repo over
+            # HTTPS; the controller prefers GIT_TOKEN over the SSH key when set.
+            - name: GIT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.git.token.secretName }}
+                  key: {{ .Values.git.token.secretKey }}
+            {{- end }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.ports.metrics }}
+            - name: healthz
+              containerPort: {{ .Values.ports.probe }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.ports.probe }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.ports.probe }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: nix-bundle
+              mountPath: {{ .Values.nixMount.mountPath }}
+            {{- if .Values.git.sshKey.enabled }}
+            - name: github-deploy-key
+              mountPath: {{ .Values.git.sshKey.mountPath }}
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
