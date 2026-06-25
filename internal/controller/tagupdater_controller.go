@@ -98,6 +98,20 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		data[k] = v
 	}
 
+	// If the source can resolve extra per-release fields (the nix source
+	// surfacing the content-addressed store_path a tag can't encode), merge
+	// them so a target can template `{{ .store_path }}`. Best-effort: a
+	// resolver fault degrades to tag-only templating, never fails the update.
+	if resolver, ok := src.(intsource.TagResolver); ok {
+		if extra, rerr := resolver.Resolve(ctx); rerr != nil {
+			log.Info("tag resolver failed; templating with tag captures only", "err", rerr)
+		} else {
+			for k, v := range extra {
+				data[k] = v
+			}
+		}
+	}
+
 	p := patcher.Patcher{Client: r.Dynamic, Mapper: r.Mapper}
 
 	var patchErrors []string

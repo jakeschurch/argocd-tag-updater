@@ -87,3 +87,46 @@ func TestNixTags_BadRepo(t *testing.T) {
 		t.Fatal("expected error for repo without name segment")
 	}
 }
+
+func TestNixResolve(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/tags/nix-cache/latest" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer sekrit" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"store_path":"/nix/store/abc-foundry-nix-cache-0.1.0","root":"abc123","rev":"deadbeef"}`))
+	}))
+	defer srv.Close()
+
+	n := &Nix{Repo: srv.URL + "/nix-cache", Token: "sekrit"}
+	out, err := n.Resolve(context.Background())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if out["store_path"] != "/nix/store/abc-foundry-nix-cache-0.1.0" {
+		t.Fatalf("store_path: %q", out["store_path"])
+	}
+	if out["root"] != "abc123" || out["rev"] != "deadbeef" {
+		t.Fatalf("root/rev: %v", out)
+	}
+}
+
+func TestNixResolve_ImplementsInterface(t *testing.T) {
+	var _ TagResolver = (*Nix)(nil)
+}
+
+func TestNixResolve_404(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no tags", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	n := &Nix{Repo: srv.URL + "/nix-cache"}
+	if _, err := n.Resolve(context.Background()); err == nil || !strings.Contains(err.Error(), "status 404") {
+		t.Fatalf("expected 404 error, got %v", err)
+	}
+}
