@@ -3,6 +3,7 @@ package patcher
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"text/template"
@@ -11,8 +12,40 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 )
+
+// fieldManager scopes the managedFields ownership of the JSON-patched fields.
+// CRITICAL: a full-object Update (the old behaviour) claimed ownership of the
+// ENTIRE target spec — including fields this controller never touches, like an
+// Application's helm.valuesObject. A server-side-applying owner (e.g. ArgoCD's
+// app-of-apps) then loses a field-ownership conflict and its changes silently
+// never land (the builder-resources-stuck-at-stale-snapshot incident,
+// 2026-06-25). A JSON Patch claims ownership of ONLY the listed paths, so other
+// managers keep theirs.
+const fieldManager = "argocd-tag-updater"
+
+type jsonPatchOp struct {
+	Op    string `json:"op"`
+	Path  string `json:"path"`
+	Value string `json:"value"`
+}
+
+// fieldToJSONPointer converts a dot-split field path (e.g.
+// "spec.sources.0.helm.valuesObject.image.tag") to an RFC6901 JSON Pointer
+// ("/spec/sources/0/helm/valuesObject/image/tag"), escaping "~" and "/" within
+// segments per the spec.
+func fieldToJSONPointer(keys []string) string {
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteByte('/')
+		k = strings.ReplaceAll(k, "~", "~0")
+		k = strings.ReplaceAll(k, "/", "~1")
+		b.WriteString(k)
+	}
+	return b.String()
+}
 
 type Patcher struct {
 	Client dynamic.Interface
@@ -68,6 +101,7 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 
 		modified := obj.DeepCopy()
 		changed := false
+		var ops []jsonPatchOp
 		for _, pp := range patches {
 			value, err := renderTemplate(pp.Template, data)
 			if err != nil {
@@ -96,6 +130,12 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 			if err := setNestedStringInUnstructured(modified.Object, keys, value); err != nil {
 				return patched, changedNames, fmt.Errorf("set field %q on %s/%s: %w", pp.Field, target.Kind, name, err)
 			}
+			// "add" upserts an object member (RFC6902: replaces if present), so it
+			// works whether or not the tag field already exists. setNested above
+			// validated the path navigates real arrays/objects, so the parent
+			// exists. Only these paths are owned by this controller — never the
+			// whole object.
+			ops = append(ops, jsonPatchOp{Op: "add", Path: fieldToJSONPointer(keys), Value: value})
 			changed = true
 		}
 
@@ -104,10 +144,15 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 			continue
 		}
 
+		patchBytes, err := json.Marshal(ops)
+		if err != nil {
+			return patched, changedNames, fmt.Errorf("marshal json patch for %s/%s: %w", target.Kind, name, err)
+		}
+		opts := metav1.PatchOptions{FieldManager: fieldManager}
 		if target.Namespace != "" {
-			_, err = rc.Namespace(target.Namespace).Update(ctx, modified, metav1.UpdateOptions{})
+			_, err = rc.Namespace(target.Namespace).Patch(ctx, name, types.JSONPatchType, patchBytes, opts)
 		} else {
-			_, err = rc.Update(ctx, modified, metav1.UpdateOptions{})
+			_, err = rc.Patch(ctx, name, types.JSONPatchType, patchBytes, opts)
 		}
 		if err != nil {
 			return patched, changedNames, fmt.Errorf("patch %s/%s: %w", target.Kind, name, err)

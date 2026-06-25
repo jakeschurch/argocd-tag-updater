@@ -1,6 +1,9 @@
 package patcher
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestGetNestedStringInUnstructured(t *testing.T) {
 	obj := map[string]any{
@@ -72,3 +75,19 @@ func splitPath(p string) []string {
 	}
 	return append(out, cur)
 }
+
+func TestFieldToJSONPointer(t *testing.T) {
+	cases := map[string]string{
+		"spec.sources.0.helm.valuesObject.image.tag": "/spec/sources/0/helm/valuesObject/image/tag",
+		"spec.source.helm.parameters.0.value":        "/spec/source/helm/parameters/0/value",
+		"a/b":                                         "/a~1b",
+		"a~b":                                         "/a~0b",
+	}
+	for field, want := range cases {
+		if got := fieldToJSONPointer(splitField(field)); got != want {
+			t.Errorf("fieldToJSONPointer(%q) = %q, want %q", field, got, want)
+		}
+	}
+}
+
+func splitField(f string) []string { return strings.Split(f, ".") }
