@@ -12,10 +12,13 @@ import (
 // OCI lists tags from a container registry via the Docker Registry V2 API
 // (GET /v2/<repo>/tags/list). Repo is a registry reference without a tag,
 // e.g. "registry.example.com/foundry/scratch". An http:// prefix forces
-// plaintext (for in-cluster registries); otherwise https is used. Read is
-// assumed anonymous — zot and most internal registries allow it.
+// plaintext (for in-cluster registries); otherwise https is used.
+// BasicAuth is the base64-encoded "user:password" string from a
+// kubernetes.io/dockerconfigjson secret's auths[host].auth field. When set,
+// it is sent as the Authorization: Basic header on every request.
 type OCI struct {
-	Repo string
+	Repo      string
+	BasicAuth string
 }
 
 type tagsList struct {
@@ -46,6 +49,9 @@ func (o *OCI) Tags(ctx context.Context) ([]string, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, next, nil)
 		if err != nil {
 			return nil, fmt.Errorf("oci tags request: %w", err)
+		}
+		if o.BasicAuth != "" {
+			req.Header.Set("Authorization", "Basic "+o.BasicAuth)
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {

@@ -2,12 +2,15 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -68,7 +71,17 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// health confirmed OK — fall through to normal tag poll
 	}
 
-	src, err := sourceFor(tu.Spec.Source)
+	var ociBasicAuth string
+	if tu.Spec.Source.Type == v1alpha1.SourceTypeOCI && tu.Spec.Source.ImagePullSecretRef != nil {
+		auth, aerr := r.resolveDockerAuth(ctx, tu.Namespace, tu.Spec.Source.ImagePullSecretRef.Name, tu.Spec.Source.Repo)
+		if aerr != nil {
+			log.Info("could not resolve imagePullSecret for OCI source; proceeding unauthenticated", "err", aerr)
+		} else {
+			ociBasicAuth = auth
+		}
+	}
+
+	src, err := sourceFor(tu.Spec.Source, ociBasicAuth)
 	if err != nil {
 		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
 	}
@@ -485,7 +498,7 @@ func setOwnerRepo(out map[string]string, path string) {
 	}
 }
 
-func sourceFor(spec v1alpha1.SourceSpec) (intsource.Source, error) {
+func sourceFor(spec v1alpha1.SourceSpec, ociBasicAuth string) (intsource.Source, error) {
 	switch spec.Type {
 	case v1alpha1.SourceTypeGit:
 		return &intsource.Git{
@@ -494,7 +507,7 @@ func sourceFor(spec v1alpha1.SourceSpec) (intsource.Source, error) {
 			Token:      os.Getenv("GIT_TOKEN"),
 		}, nil
 	case v1alpha1.SourceTypeOCI:
-		return &intsource.OCI{Repo: spec.Repo}, nil
+		return &intsource.OCI{Repo: spec.Repo, BasicAuth: ociBasicAuth}, nil
 	case v1alpha1.SourceTypeNix:
 		return &intsource.Nix{
 			Repo:  spec.Repo,
@@ -503,6 +516,49 @@ func sourceFor(spec v1alpha1.SourceSpec) (intsource.Source, error) {
 	default:
 		return nil, fmt.Errorf("unknown source type %q", spec.Type)
 	}
+}
+
+// resolveDockerAuth reads a kubernetes.io/dockerconfigjson Secret and returns
+// the base64-encoded "user:pass" auth string for the registry host derived from
+// repo. Returns an error if the secret is missing or contains no matching entry.
+func (r *TagUpdaterReconciler) resolveDockerAuth(ctx context.Context, ns, secretName, repo string) (string, error) {
+	var secret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: secretName}, &secret); err != nil {
+		return "", fmt.Errorf("get secret %s/%s: %w", ns, secretName, err)
+	}
+
+	raw, ok := secret.Data[".dockerconfigjson"]
+	if !ok {
+		return "", fmt.Errorf("secret %s/%s missing .dockerconfigjson key", ns, secretName)
+	}
+
+	var cfg struct {
+		Auths map[string]struct {
+			Auth     string `json:"auth"`
+			Username string `json:"username"`
+			Password string `json:"password"`
+		} `json:"auths"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return "", fmt.Errorf("parse dockerconfigjson in %s/%s: %w", ns, secretName, err)
+	}
+
+	// Strip scheme prefix and extract the registry host from repo.
+	ref := strings.TrimPrefix(strings.TrimPrefix(repo, "https://"), "http://")
+	host, _, _ := strings.Cut(ref, "/")
+
+	for registryHost, entry := range cfg.Auths {
+		if registryHost != host {
+			continue
+		}
+		if entry.Auth != "" {
+			return entry.Auth, nil
+		}
+		if entry.Username != "" && entry.Password != "" {
+			return base64.StdEncoding.EncodeToString([]byte(entry.Username + ":" + entry.Password)), nil
+		}
+	}
+	return "", fmt.Errorf("no auth entry for host %q in secret %s/%s", host, ns, secretName)
 }
 
 func (r *TagUpdaterReconciler) SetupWithManager(mgr ctrl.Manager) error {

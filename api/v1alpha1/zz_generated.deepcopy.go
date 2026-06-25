@@ -109,9 +109,40 @@ func (in *RollbackSpec) DeepCopy() *RollbackSpec {
 	return out
 }
 
+func (in *LocalObjectReference) DeepCopyInto(out *LocalObjectReference) {
+	*out = *in
+}
+
+func (in *LocalObjectReference) DeepCopy() *LocalObjectReference {
+	if in == nil {
+		return nil
+	}
+	out := new(LocalObjectReference)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *SourceSpec) DeepCopyInto(out *SourceSpec) {
+	*out = *in
+	if in.ImagePullSecretRef != nil {
+		in, out := &in.ImagePullSecretRef, &out.ImagePullSecretRef
+		*out = new(LocalObjectReference)
+		**out = **in
+	}
+}
+
+func (in *SourceSpec) DeepCopy() *SourceSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(SourceSpec)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *TagUpdaterSpec) DeepCopyInto(out *TagUpdaterSpec) {
 	*out = *in
-	out.Source = in.Source
+	in.Source.DeepCopyInto(&out.Source)
 	out.Interval = in.Interval
 	if in.Targets != nil {
 		in, out := &in.Targets, &out.Targets

@@ -10,6 +10,11 @@ const (
 	SourceTypeNix SourceType = "nix"
 )
 
+// LocalObjectReference names a secret in the same namespace as the TagUpdater.
+type LocalObjectReference struct {
+	Name string `json:"name"`
+}
+
 type SourceSpec struct {
 	Type SourceType `json:"type"`
 	// Repo is a git remote URL (git source), OCI repository reference (oci source),
@@ -19,6 +24,10 @@ type SourceSpec struct {
 	// The capture named "n" is used as the sort key to select the latest tag.
 	// e.g.: platform\.(?P<branch>[^.]+)\.build-(?P<n>\d+)\.(?P<sha>[0-9a-f]{6,})
 	TagPattern string `json:"tagPattern"`
+	// ImagePullSecretRef names a kubernetes.io/dockerconfigjson Secret in the same
+	// namespace as the TagUpdater. When set on an oci source, the controller reads
+	// the secret and uses its credentials to authenticate against the registry.
+	ImagePullSecretRef *LocalObjectReference `json:"imagePullSecretRef,omitempty"`
 }
 
 type PatchSpec struct {
