@@ -73,6 +73,16 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 			if err != nil {
 				return patched, changedNames, fmt.Errorf("render template for field %q: %w", pp.Field, err)
 			}
+			// A template that renders empty must NEVER blank out a target field.
+			// text/template returns "" for a missing map key (no missingkey=error),
+			// so a patch like `{{ .store_path }}` against a source that hasn't
+			// populated it yet (TagResolver not deployed, or no store_path tag
+			// published) would otherwise pin the field to "" — which, for
+			// nix-cache's nixMount.storePath, breaks the critical cache. Skip;
+			// a later reconcile applies it once the value is present.
+			if strings.TrimSpace(value) == "" {
+				continue
+			}
 			keys := strings.Split(pp.Field, ".")
 			// unstructured.NestedString cannot navigate array indexes, so
 			// for paths like builders.0.image it always returned "" and the
