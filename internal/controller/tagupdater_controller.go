@@ -125,6 +125,11 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
+	// If the source can map a tag to its immutable commit sha (the git source),
+	// expose the matched tag's sha as `{{ .rev }}` so a target can pin an
+	// immutable flake ref `github:owner/repo/{{ .tag }}?rev={{ .rev }}#attr`.
+	r.addRev(ctx, src, latest.Tag, data)
+
 	p := patcher.Patcher{Client: r.Dynamic, Mapper: r.Mapper}
 
 	var patchErrors []string
@@ -305,6 +310,12 @@ func (r *TagUpdaterReconciler) doRollback(ctx context.Context, tu *v1alpha1.TagU
 		data[k] = v
 	}
 
+	// Re-resolve the previous tag's immutable sha so a `?rev={{ .rev }}` template
+	// reverts to a valid pinned ref instead of rendering `?rev=` (empty).
+	if src, serr := sourceFor(tu.Spec.Source, ""); serr == nil {
+		r.addRev(ctx, src, prevTag, data)
+	}
+
 	p := patcher.Patcher{Client: r.Dynamic, Mapper: r.Mapper}
 	for _, target := range tu.Spec.Targets {
 		patches := make([]patcher.Patch, len(target.Patches))
@@ -370,6 +381,25 @@ func (r *TagUpdaterReconciler) argoCDAppHealth(ctx context.Context, ref *v1alpha
 	}
 
 	return health, opMsg, nil
+}
+
+// addRev enriches the template data with `rev` — the immutable full commit sha
+// of tag — when the source implements TagRevResolver (the git source). Best
+// effort: a resolver fault or an absent sha leaves data untouched, degrading to
+// tag-only templating rather than failing the update.
+func (r *TagUpdaterReconciler) addRev(ctx context.Context, src intsource.Source, tag string, data map[string]string) {
+	resolver, ok := src.(intsource.TagRevResolver)
+	if !ok {
+		return
+	}
+	revs, err := resolver.TagRevs(ctx)
+	if err != nil {
+		log.FromContext(ctx).Info("tag rev resolver failed; templating without .rev", "err", err)
+		return
+	}
+	if sha := revs[tag]; sha != "" {
+		data["rev"] = sha
+	}
 }
 
 // filterSkipped removes any tags that appear in the skipped list.

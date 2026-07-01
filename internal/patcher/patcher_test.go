@@ -80,8 +80,8 @@ func TestFieldToJSONPointer(t *testing.T) {
 	cases := map[string]string{
 		"spec.sources.0.helm.valuesObject.image.tag": "/spec/sources/0/helm/valuesObject/image/tag",
 		"spec.source.helm.parameters.0.value":        "/spec/source/helm/parameters/0/value",
-		"a/b":                                         "/a~1b",
-		"a~b":                                         "/a~0b",
+		"a/b":                                        "/a~1b",
+		"a~b":                                        "/a~0b",
 	}
 	for field, want := range cases {
 		if got := fieldToJSONPointer(splitField(field)); got != want {
@@ -91,3 +91,35 @@ func TestFieldToJSONPointer(t *testing.T) {
 }
 
 func splitField(f string) []string { return strings.Split(f, ".") }
+
+func TestRenderTemplateExposesRev(t *testing.T) {
+	data := map[string]string{
+		"owner": "acme",
+		"repo":  "flake",
+		"tag":   "platform.main.build-42.abc123",
+		"rev":   "0123456789abcdef0123456789abcdef01234567",
+	}
+	tmpl := "github:{{ .owner }}/{{ .repo }}/{{ .tag }}?rev={{ .rev }}#packages.x86_64-linux.platform"
+	got, err := renderTemplate(tmpl, data)
+	if err != nil {
+		t.Fatalf("renderTemplate: %v", err)
+	}
+	want := "github:acme/flake/platform.main.build-42.abc123?rev=0123456789abcdef0123456789abcdef01234567#packages.x86_64-linux.platform"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// A template referencing .rev against data that never populated it renders the
+// key as the empty string (text/template default). ApplyAll then skips the
+// whole field rather than blanking it, so a rev-less reconcile is safe.
+func TestRenderTemplateRevAbsentIsEmpty(t *testing.T) {
+	data := map[string]string{"tag": "v1"}
+	got, err := renderTemplate("{{ .rev }}", data)
+	if err != nil {
+		t.Fatalf("renderTemplate: %v", err)
+	}
+	if got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}

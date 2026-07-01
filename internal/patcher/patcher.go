@@ -279,7 +279,13 @@ func (p *Patcher) resolveNames(ctx context.Context, gvr schema.GroupVersionResou
 }
 
 func renderTemplate(tmpl string, data map[string]string) (string, error) {
-	t, err := template.New("").Parse(tmpl)
+	// missingkey=zero renders an absent map key as the empty string instead of
+	// the literal "<no value>". ApplyAll's skip-empty guard (see the store_path
+	// note above) depends on this: a template like
+	// `github:o/r/{{ .tag }}?rev={{ .rev }}` whose .rev is unresolved must
+	// render empty so the whole field is skipped — never applied as a broken
+	// "<no value>" ref that would blank or corrupt the target.
+	t, err := template.New("").Option("missingkey=zero").Parse(tmpl)
 	if err != nil {
 		return "", err
 	}
