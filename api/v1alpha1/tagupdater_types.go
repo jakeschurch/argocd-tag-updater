@@ -35,7 +35,11 @@ type PatchSpec struct {
 	// "spec.source.helm.valuesObject.image.tag".
 	Field string `json:"field"`
 	// Template is a Go template rendered with named captures from TagPattern plus
-	// repo-derived fields (owner, repo, host, repoURL) and "tag" (full tag string).
+	// repo-derived fields (owner, repo, host, repoURL), "tag" (full tag string),
+	// and — for the git source — "rev", the matched tag's immutable full commit
+	// sha, enabling an immutable flake ref like
+	// "github:{{ .owner }}/{{ .repo }}/{{ .tag }}?rev={{ .rev }}#attr".
+	// An absent key renders empty and the whole field is skipped (never blanked).
 	Template string `json:"template"`
 }
 
