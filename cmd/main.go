@@ -59,15 +59,20 @@ func main() {
 		fail("dynamic client: %v", err)
 	}
 
-	if err := (&controller.TagUpdaterReconciler{
+	reconciler := &controller.TagUpdaterReconciler{
 		Client:  mgr.GetClient(),
 		Dynamic: dynClient,
 		Mapper:  mgr.GetRESTMapper(),
-	}).SetupWithManager(mgr); err != nil {
+	}
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		fail("setup controller: %v", err)
 	}
 
 	_ = mgr.AddHealthzCheck("healthz", healthz.Ping)
+	// Liveness also fails when git tag->rev resolution has been broken past its
+	// staleness window, so a sustained resolver outage restarts the pod and
+	// migrates leadership instead of silently pinning targets at a stale tag.
+	_ = mgr.AddHealthzCheck("tag-resolution", reconciler.RevResolutionHealthz())
 	_ = mgr.AddReadyzCheck("readyz", healthz.Ping)
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {

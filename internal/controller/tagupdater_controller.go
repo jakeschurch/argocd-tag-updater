@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -23,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -44,7 +47,22 @@ type TagUpdaterReconciler struct {
 	Cache       cache.Cache
 	ctrl        controller.Controller
 	watchedGVKs sync.Map // map[schema.GroupVersionKind]struct{}
+
+	// revAttempted flips true the first time a git source is asked to resolve a
+	// tag to its immutable commit sha; lastRevSuccess records the unix-nano of
+	// the most recent success. Together they drive RevResolutionHealthz — while
+	// no git source has ever been reconciled the check is inert, so a nix-only
+	// deployment never trips it.
+	revAttempted   atomic.Bool
+	lastRevSuccess atomic.Int64
 }
+
+// revStaleAfter is how long git tag->rev resolution may keep failing before
+// RevResolutionHealthz reports unhealthy. Longer than a couple reconcile
+// intervals so a transient ls-remote blip does not restart the pod, short
+// enough that a sustained resolver outage (the failure mode that silently
+// froze all deploys) migrates leadership off the broken replica.
+const revStaleAfter = 5 * time.Minute
 
 func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -127,8 +145,11 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// If the source can map a tag to its immutable commit sha (the git source),
 	// expose the matched tag's sha as `{{ .rev }}` so a target can pin an
-	// immutable flake ref `github:owner/repo/{{ .tag }}?rev={{ .rev }}#attr`.
-	r.addRev(ctx, src, latest.Tag, data)
+	// immutable flake ref `github:owner/repo/{{ .rev }}#attr`. Fail-closed: an
+	// unresolvable rev aborts the update rather than patching an impure ref.
+	if err := r.addRev(ctx, src, latest.Tag, data); err != nil {
+		return ctrl.Result{RequeueAfter: interval}, r.setFailed(ctx, &tu, err)
+	}
 
 	p := patcher.Patcher{Client: r.Dynamic, Mapper: r.Mapper}
 
@@ -310,10 +331,14 @@ func (r *TagUpdaterReconciler) doRollback(ctx context.Context, tu *v1alpha1.TagU
 		data[k] = v
 	}
 
-	// Re-resolve the previous tag's immutable sha so a `?rev={{ .rev }}` template
-	// reverts to a valid pinned ref instead of rendering `?rev=` (empty).
+	// Re-resolve the previous tag's immutable sha so a `{{ .rev }}` template
+	// reverts to a valid pinned ref instead of an empty one. Fail-closed: if the
+	// rev cannot be resolved, abort the rollback rather than patch an impure ref.
 	if src, serr := sourceFor(tu.Spec.Source, ""); serr == nil {
-		r.addRev(ctx, src, prevTag, data)
+		if err := r.addRev(ctx, src, prevTag, data); err != nil {
+			log.Error(err, "cannot resolve previous tag to sha; skipping rollback patch", "previousTag", prevTag)
+			return err
+		}
 	}
 
 	p := patcher.Patcher{Client: r.Dynamic, Mapper: r.Mapper}
@@ -384,21 +409,49 @@ func (r *TagUpdaterReconciler) argoCDAppHealth(ctx context.Context, ref *v1alpha
 }
 
 // addRev enriches the template data with `rev` — the immutable full commit sha
-// of tag — when the source implements TagRevResolver (the git source). Best
-// effort: a resolver fault or an absent sha leaves data untouched, degrading to
-// tag-only templating rather than failing the update.
-func (r *TagUpdaterReconciler) addRev(ctx context.Context, src intsource.Source, tag string, data map[string]string) {
+// of tag — when the source implements TagRevResolver (the git source). It is
+// fail-closed: for a git source, a resolver fault or an absent sha returns an
+// error so the caller aborts the update rather than rendering an impure
+// tag-only (or empty `?rev=`) flakeRef. A source that cannot resolve revs at
+// all (the nix source) is not a TagRevResolver and returns nil unchanged.
+func (r *TagUpdaterReconciler) addRev(ctx context.Context, src intsource.Source, tag string, data map[string]string) error {
 	resolver, ok := src.(intsource.TagRevResolver)
 	if !ok {
-		return
+		return nil
 	}
+	r.revAttempted.Store(true)
 	revs, err := resolver.TagRevs(ctx)
 	if err != nil {
-		log.FromContext(ctx).Info("tag rev resolver failed; templating without .rev", "err", err)
-		return
+		return fmt.Errorf("resolve tag %q to commit sha: %w", tag, err)
 	}
-	if sha := revs[tag]; sha != "" {
-		data["rev"] = sha
+	sha := revs[tag]
+	if sha == "" {
+		return fmt.Errorf("tag %q resolved to no commit sha; refusing impure tag-only flakeRef", tag)
+	}
+	data["rev"] = sha
+	r.lastRevSuccess.Store(time.Now().UnixNano())
+	return nil
+}
+
+// RevResolutionHealthz reports unhealthy once a git source has been reconciled
+// but tag->rev resolution has not succeeded within revStaleAfter. Wired as a
+// liveness check so a sustained resolver outage — the class of failure that
+// silently pinned every target at a stale tag — restarts the pod and, under
+// leader election, hands off to a replica that can reach the git remote. Inert
+// until the first git-source reconcile so nix-only deployments never trip it.
+func (r *TagUpdaterReconciler) RevResolutionHealthz() healthz.Checker {
+	return func(*http.Request) error {
+		if !r.revAttempted.Load() {
+			return nil
+		}
+		last := r.lastRevSuccess.Load()
+		if last == 0 {
+			return fmt.Errorf("git tag->rev resolution has never succeeded")
+		}
+		if age := time.Since(time.Unix(0, last)); age > revStaleAfter {
+			return fmt.Errorf("git tag->rev resolution stale: last success %s ago (>%s)", age.Round(time.Second), revStaleAfter)
+		}
+		return nil
 	}
 }
 
