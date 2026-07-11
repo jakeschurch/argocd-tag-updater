@@ -89,6 +89,17 @@ spec:
                 type: object
               source:
                 properties:
+                  imagePullSecretRef:
+                    description: |-
+                      ImagePullSecretRef names a kubernetes.io/dockerconfigjson Secret in the same
+                      namespace as the TagUpdater. When set on an oci source, the controller reads
+                      the secret and uses its credentials to authenticate against the registry.
+                    properties:
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
                   repo:
                     description: |-
                       Repo is a git remote URL (git source), OCI repository reference (oci source),
@@ -137,7 +148,11 @@ spec:
                           template:
                             description: |-
                               Template is a Go template rendered with named captures from TagPattern plus
-                              repo-derived fields (owner, repo, host, repoURL) and "tag" (full tag string).
+                              repo-derived fields (owner, repo, host, repoURL), "tag" (full tag string),
+                              and — for the git source — "rev", the matched tag's immutable full commit
+                              sha, enabling an immutable flake ref like
+                              "github:{{ .owner }}/{{ .repo }}/{{ .tag }}?rev={{ .rev }}#attr".
+                              An absent key renders empty and the whole field is skipped (never blanked).
                             type: string
                         required:
                         - field
