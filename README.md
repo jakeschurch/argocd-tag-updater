@@ -96,6 +96,39 @@ internal/
 api/v1alpha1/ — TagUpdater CRD types
 ```
 
+## Failure detection
+
+The controller's historical failure mode is *silent*: the reconcile loop (or
+ArgoCD convergence) breaks, nothing errors loudly, and deploys freeze until a
+human notices. Three layers detect this:
+
+1. **Per-updater reconcile-progress staleness.** Each TagUpdater's last
+   successful reconcile (resolve+patch pipeline completed, whether or not a new
+   tag existed) is tracked in memory. An updater with no success within
+   `max(multiplier × interval, floor)` — flags `--reconcile-stale-multiplier`
+   (default `10`) and `--reconcile-stale-floor` (default `15m`) — is *stale*:
+   - metric `tagupdater_reconcile_stale{updater="<ns>/<name>"}` reports `1`
+     (computed at scrape time, so it stays accurate even if the loop is wedged);
+   - the CR gets a `Stalled=True` condition (reason `ReconcileStale`).
+
+2. **Aggregate liveness (`/healthz` check `reconcile-progress`).** Unhealthy
+   only when *every* tracked TagUpdater is stale — a systemic freeze — so the
+   pod restarts and leadership migrates. A single stale updater (one broken
+   repo) never restarts the shared controller; use layer 1 to alert on it.
+   The `tag-resolution` healthz check similarly restarts the pod when git
+   tag→rev resolution has been failing past its staleness window.
+
+3. **Target-Application error guard.** During reconcile the controller inspects
+   the target ArgoCD Application's conditions; any `*Error` condition
+   (`ComparisonError` after a CRD/manifest schema skew, `InvalidSpecError`, …)
+   means ArgoCD is not converging even though patching succeeds. It emits an
+   error-level log and increments
+   `tagupdater_target_app_error{app=..., type=...}` — best-effort, never fails
+   the reconcile.
+
+Suggested alerts: `tagupdater_reconcile_stale == 1` and
+`rate(tagupdater_target_app_error[15m]) > 0`.
+
 ## Installation
 
 ```sh
