@@ -4,6 +4,7 @@ go 1.26.1
 
 require (
 	github.com/go-git/go-git/v5 v5.18.0
+	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/crypto v0.45.0
 	k8s.io/api v0.35.4
 	k8s.io/apimachinery v0.35.4
@@ -47,7 +48,6 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pjbgf/sha1cd v0.3.2 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect

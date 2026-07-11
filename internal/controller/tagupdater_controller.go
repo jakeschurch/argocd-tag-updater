@@ -13,6 +13,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -27,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
@@ -55,6 +57,19 @@ type TagUpdaterReconciler struct {
 	// deployment never trips it.
 	revAttempted   atomic.Bool
 	lastRevSuccess atomic.Int64
+
+	// progress tracks per-updater reconcile attempts/successes (the per-updater
+	// analogue of revAttempted/lastRevSuccess) and drives the
+	// tagupdater_reconcile_stale metric, the Stalled condition, and
+	// ReconcileProgressHealthz.
+	progress progressTracker
+
+	// StaleMultiplier and StaleFloor configure the reconcile-progress staleness
+	// window: an updater is stale when no reconcile has succeeded within
+	// max(StaleMultiplier*interval, StaleFloor). Zero values use the defaults
+	// (10x interval, 15m).
+	StaleMultiplier int
+	StaleFloor      time.Duration
 }
 
 // revStaleAfter is how long git tag->rev resolution may keep failing before
@@ -69,6 +84,11 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	var tu v1alpha1.TagUpdater
 	if err := r.Get(ctx, req.NamespacedName, &tu); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Deleted updaters must stop counting toward staleness metrics and
+			// the aggregate healthz.
+			r.progress.forget(req.NamespacedName.String())
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -77,6 +97,9 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		interval = tu.Spec.Interval.Duration
 	}
 
+	progressKey := req.NamespacedName.String()
+	r.progress.attempt(progressKey, interval, time.Now())
+
 	// If rollback is enabled and we're mid-watch, check ArgoCD health before polling tags.
 	if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Status.WatchingTag != "" {
 		requeue, err := r.checkHealthAndMaybeRollback(ctx, &tu, interval)
@@ -84,9 +107,20 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{RequeueAfter: interval}, err
 		}
 		if requeue > 0 {
+			// A completed health poll is a successful reconcile — the pipeline
+			// is alive even though no new tag work happened.
+			r.markReconcileSucceeded(ctx, &tu, progressKey)
 			return ctrl.Result{RequeueAfter: requeue}, nil
 		}
 		// health confirmed OK — fall through to normal tag poll
+	}
+
+	// Best-effort guard: an error condition on the target Application
+	// (ComparisonError after a CRD/manifest skew, InvalidSpecError, ...) means
+	// ArgoCD is not converging even though patching succeeds — deploys freeze
+	// silently. Surface it loudly, but never fail the reconcile on it.
+	if tu.Spec.ArgoCDApp != nil {
+		r.checkTargetAppConditions(ctx, tu.Spec.ArgoCDApp)
 	}
 
 	var ociBasicAuth string
@@ -120,6 +154,9 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	latest, ok := m.Latest(filteredTags)
 	if !ok {
 		log.Info("no tags matched pattern", "pattern", tu.Spec.Source.TagPattern)
+		// The pipeline completed — there was simply nothing to apply. Counts as
+		// a successful reconcile for staleness purposes.
+		r.markReconcileSucceeded(ctx, &tu, progressKey)
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
@@ -212,13 +249,12 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		tu.Status.PreviousTag = prevTag
 		tu.Status.LastTag = latest.Tag
 		tu.Status.LastUpdated = &now
-		tu.Status.Conditions = []metav1.Condition{{
-			Type:               "Ready",
-			Status:             metav1.ConditionTrue,
-			Reason:             "Updated",
-			Message:            fmt.Sprintf("patched %d target(s) to tag %s", len(tu.Spec.Targets), latest.Tag),
-			LastTransitionTime: now,
-		}}
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
+			Type:    "Ready",
+			Status:  metav1.ConditionTrue,
+			Reason:  "Updated",
+			Message: fmt.Sprintf("patched %d target(s) to tag %s", len(tu.Spec.Targets), latest.Tag),
+		})
 
 		// Start health watch if rollback is enabled and we have an ArgoCD app to watch.
 		if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Spec.ArgoCDApp != nil {
@@ -233,13 +269,81 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// Requeue quickly to start health polling.
 		if tu.Status.WatchingTag != "" {
 			r.ensureWatches(ctx, &tu)
+			r.markReconcileSucceeded(ctx, &tu, progressKey)
 			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 	}
 
 	r.ensureWatches(ctx, &tu)
+	r.markReconcileSucceeded(ctx, &tu, progressKey)
 
 	return ctrl.Result{RequeueAfter: interval}, nil
+}
+
+// markReconcileSucceeded records that the resolve+patch pipeline for tu
+// completed (whether or not a new tag existed) and clears the Stalled
+// condition, status-updating only when the condition actually flips.
+func (r *TagUpdaterReconciler) markReconcileSucceeded(ctx context.Context, tu *v1alpha1.TagUpdater, key string) {
+	r.progress.success(key, time.Now())
+	if meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(key)) {
+		if err := r.Status().Update(ctx, tu); err != nil {
+			log.FromContext(ctx).Error(err, "failed to update Stalled condition")
+		}
+	}
+}
+
+// stalledCondition renders the Stalled condition for key from the progress
+// tracker. Stalled=True means reconciles have not succeeded within the
+// staleness window — the per-updater "deploys are silently frozen" signal.
+func (r *TagUpdaterReconciler) stalledCondition(key string) metav1.Condition {
+	if r.progress.isStale(key, time.Now()) {
+		return metav1.Condition{
+			Type:    "Stalled",
+			Status:  metav1.ConditionTrue,
+			Reason:  "ReconcileStale",
+			Message: "no successful reconcile within the staleness window; deploys for this updater may be frozen",
+		}
+	}
+	return metav1.Condition{
+		Type:    "Stalled",
+		Status:  metav1.ConditionFalse,
+		Reason:  "Progressing",
+		Message: "reconciles are completing within the staleness window",
+	}
+}
+
+// checkTargetAppConditions best-effort inspects the target ArgoCD Application
+// for error conditions (ComparisonError, InvalidSpecError, ...). ArgoCD parks
+// an App in ComparisonError on CRD/manifest schema skew and simply stops
+// converging — patches still apply but nothing deploys. Emits an error-level
+// log and increments tagupdater_target_app_error; never fails the reconcile.
+func (r *TagUpdaterReconciler) checkTargetAppConditions(ctx context.Context, ref *v1alpha1.ArgoCDAppRef) {
+	log := log.FromContext(ctx)
+	ns := ref.Namespace
+	if ns == "" {
+		ns = "argocd"
+	}
+	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+	obj, err := r.Dynamic.Resource(gvr).Namespace(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		return
+	}
+	conditions, _, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	for _, raw := range conditions {
+		condition, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		conditionType, _ := condition["type"].(string)
+		if !strings.HasSuffix(conditionType, "Error") {
+			continue
+		}
+		message, _ := condition["message"].(string)
+		log.Error(fmt.Errorf("%s: %s", conditionType, message),
+			"target ArgoCD Application has an error condition; syncs may be silently frozen",
+			"app", ns+"/"+ref.Name, "conditionType", conditionType)
+		targetAppErrorTotal.WithLabelValues(ref.Name, conditionType).Inc()
+	}
 }
 
 // checkHealthAndMaybeRollback checks the ArgoCD app health while WatchingTag is set.
@@ -374,13 +478,12 @@ func (r *TagUpdaterReconciler) doRollback(ctx context.Context, tu *v1alpha1.TagU
 	tu.Status.WatchingTag = ""
 	tu.Status.WatchingSince = nil
 	tu.Status.SkippedTags = appendUnique(tu.Status.SkippedTags, badTag)
-	tu.Status.Conditions = []metav1.Condition{{
-		Type:               "Ready",
-		Status:             metav1.ConditionFalse,
-		Reason:             "RolledBack",
-		Message:            fmt.Sprintf("tag %s failed, reverted to %s", badTag, prevTag),
-		LastTransitionTime: now,
-	}}
+	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
+		Type:    "Ready",
+		Status:  metav1.ConditionFalse,
+		Reason:  "RolledBack",
+		Message: fmt.Sprintf("tag %s failed, reverted to %s", badTag, prevTag),
+	})
 	return r.Status().Update(ctx, tu)
 }
 
@@ -483,14 +586,16 @@ func appendUnique(slice []string, s string) []string {
 }
 
 func (r *TagUpdaterReconciler) setFailed(ctx context.Context, tu *v1alpha1.TagUpdater, cause error) error {
-	now := metav1.Now()
-	tu.Status.Conditions = []metav1.Condition{{
-		Type:               "Ready",
-		Status:             metav1.ConditionFalse,
-		Reason:             "Error",
-		Message:            cause.Error(),
-		LastTransitionTime: now,
-	}}
+	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
+		Type:    "Ready",
+		Status:  metav1.ConditionFalse,
+		Reason:  "Error",
+		Message: cause.Error(),
+	})
+	// Also surface reconcile-progress staleness on the CR itself: sustained
+	// failures flip Stalled=True so `kubectl get tagupdater -o yaml` shows the
+	// silent-freeze state, not just the latest error.
+	meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(client.ObjectKeyFromObject(tu).String()))
 	_ = r.Status().Update(ctx, tu)
 	return cause
 }
@@ -646,6 +751,9 @@ func (r *TagUpdaterReconciler) resolveDockerAuth(ctx context.Context, ns, secret
 
 func (r *TagUpdaterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Cache = mgr.GetCache()
+	r.progress.multiplier = r.StaleMultiplier
+	r.progress.floor = r.StaleFloor
+	metrics.Registry.MustRegister(progressCollector{tracker: &r.progress})
 	c, err := ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.TagUpdater{}).
 		Build(r)
