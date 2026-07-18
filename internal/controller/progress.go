@@ -30,8 +30,20 @@ var targetAppErrorTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Times an error condition (ComparisonError, InvalidSpecError, ...) was observed on a target ArgoCD Application.",
 }, []string{"app", "type"})
 
+// configErrorTotal counts reconciles that failed with only PERMANENT patch
+// errors (bad field-path index, unmatched name selector, server-rejected
+// Invalid/BadRequest patch). These are deterministic — retrying cannot fix
+// them — so the reconciler stops the error backoff and requeues on the slow
+// interval; this counter is the alertable "a TagUpdater is misconfigured"
+// signal that would otherwise be buried in log spam.
+var configErrorTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "tagupdater_config_error",
+	Help: "Times a TagUpdater reconcile failed with only permanent (non-retryable) patch errors.",
+}, []string{"name"})
+
 func init() {
 	metrics.Registry.MustRegister(targetAppErrorTotal)
+	metrics.Registry.MustRegister(configErrorTotal)
 }
 
 // progressTracker records, per TagUpdater, when a reconcile was first

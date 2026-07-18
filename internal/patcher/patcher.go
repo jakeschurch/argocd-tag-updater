@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"text/template"
 
@@ -25,6 +26,20 @@ import (
 // 2026-06-25). A JSON Patch claims ownership of ONLY the listed paths, so other
 // managers keep theirs.
 const fieldManager = "argocd-tag-updater"
+
+// PathError marks a field-path failure that is deterministic — a bad index,
+// an unmatched name selector, or a type mismatch in the target object. These
+// never succeed on retry (unlike a transient API/network error), so the
+// reconciler classifies them as config errors and requeues on the slow
+// interval instead of hammering the error backoff. Callers detect it with
+// errors.As.
+type PathError struct{ msg string }
+
+func (e *PathError) Error() string { return e.msg }
+
+func pathErrf(format string, a ...any) *PathError {
+	return &PathError{msg: fmt.Sprintf(format, a...)}
+}
 
 type jsonPatchOp struct {
 	Op    string `json:"op"`
@@ -118,16 +133,26 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 				continue
 			}
 			keys := strings.Split(pp.Field, ".")
+			// Resolve any `[name=value]` selector segments to concrete numeric
+			// indices against the live object BEFORE navigating/patching. RFC6901
+			// JSON Pointers have no name selectors, so the pointer sent to the API
+			// server must carry the real index — keying array elements by name (vs
+			// a positional index) keeps a field-path valid across target-list
+			// reorders, the whole class of "index N out of range" breakage.
+			resolved, rerr := resolvePath(modified.Object, keys)
+			if rerr != nil {
+				return patched, changedNames, fmt.Errorf("resolve field %q on %s/%s: %w", pp.Field, target.Kind, name, rerr)
+			}
 			// unstructured.NestedString cannot navigate array indexes, so
 			// for paths like builders.0.image it always returned "" and the
 			// no-op check never fired — every reconcile Updated and
 			// sync-triggered (foundrybox-cmk). Mirror the setter's
 			// navigation instead.
-			current, _ := getNestedStringInUnstructured(modified.Object, keys)
+			current, _ := getNestedStringInUnstructured(modified.Object, resolved)
 			if current == value {
 				continue
 			}
-			if err := setNestedStringInUnstructured(modified.Object, keys, value); err != nil {
+			if err := setNestedStringInUnstructured(modified.Object, resolved, value); err != nil {
 				return patched, changedNames, fmt.Errorf("set field %q on %s/%s: %w", pp.Field, target.Kind, name, err)
 			}
 			// "add" upserts an object member (RFC6902: replaces if present), so it
@@ -135,7 +160,7 @@ func (p *Patcher) ApplyAll(ctx context.Context, target Target, patches []Patch, 
 			// validated the path navigates real arrays/objects, so the parent
 			// exists. Only these paths are owned by this controller — never the
 			// whole object.
-			ops = append(ops, jsonPatchOp{Op: "add", Path: fieldToJSONPointer(keys), Value: value})
+			ops = append(ops, jsonPatchOp{Op: "add", Path: fieldToJSONPointer(resolved), Value: value})
 			changed = true
 		}
 
@@ -179,18 +204,18 @@ func setNestedStringInUnstructured(obj map[string]any, keys []string, value stri
 		// Navigate into array at key, then into element at idx.
 		raw, exists := obj[key]
 		if !exists {
-			return fmt.Errorf("field %q not found (cannot index into non-existent array)", key)
+			return pathErrf("field %q not found (cannot index into non-existent array)", key)
 		}
 		arr, ok := raw.([]any)
 		if !ok {
-			return fmt.Errorf("field %q is not an array", key)
+			return pathErrf("field %q is not an array", key)
 		}
 		if idx >= len(arr) {
-			return fmt.Errorf("field %q index %d out of range (len %d)", key, idx, len(arr))
+			return pathErrf("field %q index %d out of range (len %d)", key, idx, len(arr))
 		}
 		elem, ok := arr[idx].(map[string]any)
 		if !ok {
-			return fmt.Errorf("field %q[%d] is not an object", key, idx)
+			return pathErrf("field %q[%d] is not an object", key, idx)
 		}
 		return setNestedStringInUnstructured(elem, rest[1:], value)
 	}
@@ -242,6 +267,9 @@ func getNestedStringInUnstructured(obj map[string]any, keys []string) (string, b
 }
 
 func parseIndex(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
 	var n int
 	for _, c := range s {
 		if c < '0' || c > '9' {
@@ -250,6 +278,70 @@ func parseIndex(s string) (int, bool) {
 		n = n*10 + int(c-'0')
 	}
 	return n, true
+}
+
+// parseSelector recognises a name-selector segment of the form `[key=value]`
+// (e.g. `[name=build-image]`). value must not contain a `.` since the outer
+// path is dot-split; `=` splits on the first occurrence so values may contain
+// further `=`.
+func parseSelector(seg string) (key, val string, ok bool) {
+	if len(seg) < 3 || seg[0] != '[' || seg[len(seg)-1] != ']' {
+		return "", "", false
+	}
+	inner := seg[1 : len(seg)-1]
+	eq := strings.IndexByte(inner, '=')
+	if eq <= 0 {
+		return "", "", false
+	}
+	return inner[:eq], inner[eq+1:], true
+}
+
+// resolvePath walks obj and rewrites every `[key=value]` selector segment to the
+// concrete numeric index of the matching array element, returning an all-numeric
+// key path that setNested/getNested/fieldToJSONPointer consume unchanged. Numeric
+// and map segments pass through untouched; navigation of those is best-effort
+// (a dead end sets the cursor nil and later selectors error) — non-selector
+// index/type faults are left for the setter to report. Selector misses return a
+// PathError (deterministic; not retried on backoff).
+func resolvePath(obj map[string]any, keys []string) ([]string, error) {
+	resolved := make([]string, 0, len(keys))
+	var cur any = obj
+	for i, k := range keys {
+		if selKey, selVal, ok := parseSelector(k); ok {
+			arr, ok := cur.([]any)
+			if !ok {
+				return nil, pathErrf("field %q: selector [%s=%s] applied to non-array", strings.Join(keys[:i], "."), selKey, selVal)
+			}
+			idx := -1
+			for j, el := range arr {
+				if m, ok := el.(map[string]any); ok {
+					if s, ok := m[selKey].(string); ok && s == selVal {
+						idx = j
+						break
+					}
+				}
+			}
+			if idx < 0 {
+				return nil, pathErrf("field %q: no array element with %s=%q", strings.Join(keys[:i], "."), selKey, selVal)
+			}
+			resolved = append(resolved, strconv.Itoa(idx))
+			cur = arr[idx]
+			continue
+		}
+		resolved = append(resolved, k)
+		if idx, ok := parseIndex(k); ok {
+			if arr, ok := cur.([]any); ok && idx < len(arr) {
+				cur = arr[idx]
+			} else {
+				cur = nil
+			}
+		} else if m, ok := cur.(map[string]any); ok {
+			cur = m[k]
+		} else {
+			cur = nil
+		}
+	}
+	return resolved, nil
 }
 
 func (p *Patcher) resolveNames(ctx context.Context, gvr schema.GroupVersionResource, target Target) ([]string, error) {
