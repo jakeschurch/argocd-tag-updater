@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -104,7 +105,10 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Status.WatchingTag != "" {
 		requeue, err := r.checkHealthAndMaybeRollback(ctx, &tu, interval)
 		if err != nil {
-			return ctrl.Result{RequeueAfter: interval}, err
+			// RequeueAfter is ignored by controller-runtime when err != nil (it
+			// uses the error backoff), so pass a bare Result to avoid the
+			// "returned both a result ... and a non-nil error" warning.
+			return ctrl.Result{}, err
 		}
 		if requeue > 0 {
 			// A completed health poll is a successful reconcile — the pipeline
@@ -140,7 +144,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	tags, err := src.Tags(ctx)
 	if err != nil {
-		return ctrl.Result{RequeueAfter: interval}, r.setFailed(ctx, &tu, err)
+		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
 	}
 
 	m, err := matcher.New(tu.Spec.Source.TagPattern)
@@ -185,19 +189,19 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// immutable flake ref `github:owner/repo/{{ .rev }}#attr`. Fail-closed: an
 	// unresolvable rev aborts the update rather than patching an impure ref.
 	if err := r.addRev(ctx, src, latest.Tag, data); err != nil {
-		return ctrl.Result{RequeueAfter: interval}, r.setFailed(ctx, &tu, err)
+		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
 	}
 
 	p := patcher.Patcher{Client: r.Dynamic, Mapper: r.Mapper}
 
-	var patchErrors []string
+	var patchErrors []error
 	anyChanged := false
 	for _, target := range tu.Spec.Targets {
 		selector := ""
 		if target.Selector != nil {
 			sel, err := metav1.LabelSelectorAsSelector(target.Selector)
 			if err != nil {
-				patchErrors = append(patchErrors, fmt.Sprintf("%s/%s selector: %v", target.Kind, target.Name, err))
+				patchErrors = append(patchErrors, fmt.Errorf("%s/%s selector: %w", target.Kind, target.Name, err))
 				continue
 			}
 			selector = sel.String()
@@ -216,7 +220,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			Selector:   selector,
 		}, patches, data)
 		if err != nil {
-			patchErrors = append(patchErrors, err.Error())
+			patchErrors = append(patchErrors, err)
 			continue
 		}
 		if len(changed) > 0 {
@@ -226,7 +230,28 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	if len(patchErrors) > 0 {
-		return ctrl.Result{RequeueAfter: interval}, r.setFailed(ctx, &tu, fmt.Errorf("%s", strings.Join(patchErrors, "; ")))
+		msgs := make([]string, len(patchErrors))
+		allPermanent := true
+		for i, e := range patchErrors {
+			msgs[i] = e.Error()
+			if !isPermanentPatchError(e) {
+				allPermanent = false
+			}
+		}
+		joined := fmt.Errorf("%s", strings.Join(msgs, "; "))
+		if allPermanent {
+			// Deterministic misconfiguration (bad index / unmatched selector /
+			// server-rejected Invalid patch) — retrying on the error backoff just
+			// floods logs and API calls. Record a ConfigError, count it, and
+			// requeue on the slow interval with a nil error so controller-runtime
+			// does NOT back off. markReconcileSucceeded is intentionally NOT called,
+			// so Stalled still trips and the freeze stays visible.
+			configErrorTotal.WithLabelValues(tu.Name).Inc()
+			log.Error(joined, "permanent patch error; requeuing on interval without backoff", "interval", interval)
+			r.setConfigError(ctx, &tu, joined)
+			return ctrl.Result{RequeueAfter: interval}, nil
+		}
+		return ctrl.Result{}, r.setFailed(ctx, &tu, joined)
 	}
 
 	if tu.Spec.ManagingApp != nil {
@@ -285,9 +310,20 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 // condition, status-updating only when the condition actually flips.
 func (r *TagUpdaterReconciler) markReconcileSucceeded(ctx context.Context, tu *v1alpha1.TagUpdater, key string) {
 	r.progress.success(key, time.Now())
-	if meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(key)) {
+	changed := meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(key))
+	// A clean reconcile clears any prior permanent-config error so a fixed
+	// field-path doesn't leave ConfigError=True lingering on the CR.
+	if meta.FindStatusCondition(tu.Status.Conditions, "ConfigError") != nil {
+		changed = meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
+			Type:    "ConfigError",
+			Status:  metav1.ConditionFalse,
+			Reason:  "Resolved",
+			Message: "patches applied without a permanent error",
+		}) || changed
+	}
+	if changed {
 		if err := r.Status().Update(ctx, tu); err != nil {
-			log.FromContext(ctx).Error(err, "failed to update Stalled condition")
+			log.FromContext(ctx).Error(err, "failed to update Stalled/ConfigError conditions")
 		}
 	}
 }
@@ -598,6 +634,42 @@ func (r *TagUpdaterReconciler) setFailed(ctx context.Context, tu *v1alpha1.TagUp
 	meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(client.ObjectKeyFromObject(tu).String()))
 	_ = r.Status().Update(ctx, tu)
 	return cause
+}
+
+// isPermanentPatchError reports whether a patch failure is deterministic and
+// cannot be fixed by retrying: a structural field-path fault (patcher.PathError
+// — bad index, unmatched name selector, type mismatch) or the API server
+// rejecting the patch as Invalid/BadRequest (422/400). Transient faults
+// (network, conflict, 5xx, not-found) return false and keep the error backoff.
+func isPermanentPatchError(err error) bool {
+	var pe *patcher.PathError
+	if errors.As(err, &pe) {
+		return true
+	}
+	return apierrors.IsInvalid(err) || apierrors.IsBadRequest(err)
+}
+
+// setConfigError marks the CR as failing on a permanent misconfiguration:
+// Ready=False/ConfigError plus a distinct ConfigError=True condition, so
+// `kubectl get tagupdater -o yaml` names the misconfigured path. Stalled is
+// refreshed too. The caller returns a nil error (slow-interval requeue, no
+// backoff); the ConfigError condition is cleared on the next successful
+// reconcile (see markReconcileSucceeded).
+func (r *TagUpdaterReconciler) setConfigError(ctx context.Context, tu *v1alpha1.TagUpdater, cause error) {
+	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
+		Type:    "Ready",
+		Status:  metav1.ConditionFalse,
+		Reason:  "ConfigError",
+		Message: cause.Error(),
+	})
+	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
+		Type:    "ConfigError",
+		Status:  metav1.ConditionTrue,
+		Reason:  "InvalidPatchPath",
+		Message: cause.Error(),
+	})
+	meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(client.ObjectKeyFromObject(tu).String()))
+	_ = r.Status().Update(ctx, tu)
 }
 
 func (r *TagUpdaterReconciler) ensureRespectIgnoreDifferences(ctx context.Context, ref *v1alpha1.ArgoCDAppRef) error {

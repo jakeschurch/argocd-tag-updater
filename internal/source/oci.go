@@ -53,7 +53,7 @@ func (o *OCI) Tags(ctx context.Context) ([]string, error) {
 		if o.BasicAuth != "" {
 			req.Header.Set("Authorization", "Basic "+o.BasicAuth)
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("ls-tags %s: %w", o.Repo, err)
 		}

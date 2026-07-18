@@ -6,7 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
+
+// httpClient bounds every tag-list call so a hung nix-cache/registry
+// connection cannot pin a reconcile worker until ctx expiry. Shared by the
+// nix and oci listers.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // Nix lists release tags from a foundrybox nix cache via its tags API
 // (GET /v1/tags/<name>/list). Repo is "<host>[/prefix]/<name>" where the
@@ -53,7 +59,7 @@ func (n *Nix) Tags(ctx context.Context) ([]string, error) {
 		req.Header.Set("Authorization", "Bearer "+n.Token)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("ls-tags %s: %w", n.Repo, err)
 	}

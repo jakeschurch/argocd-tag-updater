@@ -1,6 +1,7 @@
 package patcher
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -91,6 +92,109 @@ func TestFieldToJSONPointer(t *testing.T) {
 }
 
 func splitField(f string) []string { return strings.Split(f, ".") }
+
+// wfLike mimics an argo WorkflowTemplate: named templates, one carrying named
+// input parameters — the exact shape whose positional indices rot on reorder.
+func wfLike() map[string]any {
+	return map[string]any{
+		"spec": map[string]any{
+			"arguments": map[string]any{
+				"parameters": []any{
+					map[string]any{"name": "revision", "value": "abc"},
+					map[string]any{"name": "build-image", "value": "old:1"},
+				},
+			},
+			"templates": []any{
+				map[string]any{"name": "cancel-stale"},
+				map[string]any{"name": "build-and-push", "inputs": map[string]any{
+					"parameters": []any{
+						map[string]any{"name": "package"},
+						map[string]any{"name": "build-image", "value": "old:1"},
+					},
+				}},
+			},
+		},
+	}
+}
+
+func TestResolvePathNameSelector(t *testing.T) {
+	obj := wfLike()
+	cases := []struct {
+		path string
+		want string // dot-joined resolved (numeric) path
+	}{
+		{"spec.arguments.parameters.[name=build-image].value", "spec.arguments.parameters.1.value"},
+		{"spec.templates.[name=build-and-push].inputs.parameters.[name=build-image].value", "spec.templates.1.inputs.parameters.1.value"},
+		{"spec.arguments.parameters.[name=revision].value", "spec.arguments.parameters.0.value"},
+		{"spec.templates.0.name", "spec.templates.0.name"}, // numeric passthrough
+	}
+	for _, c := range cases {
+		resolved, err := resolvePath(obj, splitField(c.path))
+		if err != nil {
+			t.Errorf("%s: unexpected err %v", c.path, err)
+			continue
+		}
+		if got := strings.Join(resolved, "."); got != c.want {
+			t.Errorf("%s: resolved %q want %q", c.path, got, c.want)
+		}
+	}
+}
+
+func TestResolvePathSelectorMissIsPathError(t *testing.T) {
+	obj := wfLike()
+	cases := []string{
+		"spec.arguments.parameters.[name=nonexistent].value",
+		"spec.templates.[name=missing].inputs.parameters.[name=build-image].value",
+		"spec.arguments.[name=x].value", // selector on a non-array (map)
+	}
+	for _, path := range cases {
+		_, err := resolvePath(obj, splitField(path))
+		if err == nil {
+			t.Errorf("%s: want error, got nil", path)
+			continue
+		}
+		var pe *PathError
+		if !errors.As(err, &pe) {
+			t.Errorf("%s: want *PathError, got %T", path, err)
+		}
+	}
+}
+
+// End-to-end through the setter: a name-keyed path resolves and writes to the
+// correct element even though the template order would break a positional index.
+func TestResolveThenSetNameKeyed(t *testing.T) {
+	obj := wfLike()
+	keys := splitField("spec.templates.[name=build-and-push].inputs.parameters.[name=build-image].value")
+	resolved, err := resolvePath(obj, keys)
+	if err != nil {
+		t.Fatalf("resolvePath: %v", err)
+	}
+	if err := setNestedStringInUnstructured(obj, resolved, "new:2"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if got, ok := getNestedStringInUnstructured(obj, resolved); !ok || got != "new:2" {
+		t.Errorf("got (%q,%v) want (new:2,true)", got, ok)
+	}
+	// The JSON Pointer sent to the API server carries the resolved numeric index.
+	if got := fieldToJSONPointer(resolved); got != "/spec/templates/1/inputs/parameters/1/value" {
+		t.Errorf("pointer %q", got)
+	}
+}
+
+// A raw positional index that overshoots the array still returns a PathError
+// from the setter (permanent classification), as the ci-tools breakage did.
+func TestSetOutOfRangeIsPathError(t *testing.T) {
+	obj := wfLike()
+	keys := splitField("spec.templates.1.inputs.parameters.5.value")
+	err := setNestedStringInUnstructured(obj, keys, "x")
+	if err == nil {
+		t.Fatal("want out-of-range error")
+	}
+	var pe *PathError
+	if !errors.As(err, &pe) {
+		t.Errorf("want *PathError, got %T: %v", err, err)
+	}
+}
 
 func TestRenderTemplateExposesRev(t *testing.T) {
 	data := map[string]string{
