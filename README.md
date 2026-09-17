@@ -53,8 +53,6 @@ spec:
     repo: git@github.com:your-org/cluster-manifests.git
     branch: main
     path: apps/example-flake-platform.yaml
-    credentialsSecretRef:
-      name: manifest-git-credentials
   argoCDApp:
     name: example-flake
     namespace: argocd
@@ -95,11 +93,12 @@ spec:
       name: manifest-git-credentials
 ```
 
-The Secret must be in the TagUpdater namespace and contain `token`, `username`
-plus `password`, or `sshPrivateKey`. SSH credentials must also contain a
-`knownHosts` entry; `insecureIgnoreHostKey: "true"` is available only as an
-explicit opt-in. Git tag-source SSH uses `GIT_KNOWN_HOSTS_FILE`, or the explicit
-`GIT_INSECURE_IGNORE_HOST_KEY=true` fallback. The manifest may contain
+By default, write-back uses the controller's mounted `GIT_SSH_KEY_FILE` and
+`GIT_KNOWN_HOSTS_FILE` credentials. To override them per updater, set
+`credentialsSecretRef`; the Secret must be in the TagUpdater namespace and
+contain `token`, `username` plus `password`, or `sshPrivateKey`. SSH credentials
+must also contain a `knownHosts` entry; `insecureIgnoreHostKey: "true"` is
+available only as an explicit opt-in. The manifest may contain
 multiple YAML documents; each target is selected by apiVersion, kind,
 name/namespace or label selector. Only configured scalar field tokens are
 replaced, preserving comments and unrelated formatting. No commit is created

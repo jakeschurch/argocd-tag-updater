@@ -224,7 +224,8 @@ spec:
                     type: string
                   credentialsSecretRef:
                     description: |-
-                      CredentialsSecretRef names a Secret in the TagUpdater namespace. Supported
+                      CredentialsSecretRef optionally names a Secret in the TagUpdater namespace.
+                      It takes precedence over the controller's mounted Git credentials. Supported
                       authentication keys are token, username/password, and sshPrivateKey. SSH
                       additionally requires knownHosts, or insecureIgnoreHostKey=true as an
                       explicit opt-in.
@@ -246,7 +247,6 @@ spec:
                     type: string
                 required:
                 - branch
-                - credentialsSecretRef
                 - path
                 - repo
                 type: object

@@ -81,11 +81,12 @@ type WriteBackSpec struct {
 	// Path is the repository-relative path to a YAML manifest. Multi-document YAML
 	// is supported; target identity selects the document to edit.
 	Path string `json:"path"`
-	// CredentialsSecretRef names a Secret in the TagUpdater namespace. Supported
+	// CredentialsSecretRef optionally names a Secret in the TagUpdater namespace.
+	// It takes precedence over the controller's mounted Git credentials. Supported
 	// authentication keys are token, username/password, and sshPrivateKey. SSH
 	// additionally requires knownHosts, or insecureIgnoreHostKey=true as an
 	// explicit opt-in.
-	CredentialsSecretRef LocalObjectReference `json:"credentialsSecretRef"`
+	CredentialsSecretRef LocalObjectReference `json:"credentialsSecretRef,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -108,6 +109,8 @@ type TagUpdaterSpec struct {
 	// Interval between tag polls. Defaults to 2m.
 	Interval metav1.Duration `json:"interval,omitempty"`
 	// WriteBack is the required git destination for rendered target patches.
+	// Its credentialsSecretRef is optional when the controller has mounted Git
+	// credentials configured through GIT_SSH_KEY_FILE.
 	WriteBack WriteBackSpec `json:"writeBack"`
 	// ArgoCDApp is a read-only reference used to observe sync revision and health.
 	// The controller never patches or triggers this Application.

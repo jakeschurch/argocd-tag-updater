@@ -20,8 +20,6 @@ spec:
     repo: git@github.com:your-org/cluster-manifests.git
     branch: main
     path: apps/example-flake-platform.yaml
-    credentialsSecretRef:
-      name: manifest-git-credentials
   argoCDApp:
     name: example-flake
     namespace: argocd

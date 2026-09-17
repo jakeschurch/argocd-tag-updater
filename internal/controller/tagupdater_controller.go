@@ -490,31 +490,45 @@ func validateWriteBack(spec v1alpha1.WriteBackSpec) error {
 	if strings.TrimSpace(spec.Path) == "" {
 		missing = append(missing, "path")
 	}
-	if strings.TrimSpace(spec.CredentialsSecretRef.Name) == "" {
-		missing = append(missing, "credentialsSecretRef.name")
-	}
 	if len(missing) > 0 {
-		return fmt.Errorf("spec.writeBack is required with non-empty repo, branch, path, and credentialsSecretRef.name; add missing field(s): %s", strings.Join(missing, ", "))
+		return fmt.Errorf("spec.writeBack is required with non-empty repo, branch, and path; add missing field(s): %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
 
 func (r *TagUpdaterReconciler) resolveWriteBackCredentials(ctx context.Context, tu *v1alpha1.TagUpdater) (writeback.Credentials, error) {
 	ref := tu.Spec.WriteBack.CredentialsSecretRef
-	var secret corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Namespace: tu.Namespace, Name: ref.Name}, &secret); err != nil {
-		return writeback.Credentials{}, fmt.Errorf("get write-back credentials secret %s/%s: %w", tu.Namespace, ref.Name, err)
+	if ref.Name != "" {
+		var secret corev1.Secret
+		if err := r.Get(ctx, types.NamespacedName{Namespace: tu.Namespace, Name: ref.Name}, &secret); err != nil {
+			return writeback.Credentials{}, fmt.Errorf("get write-back credentials secret %s/%s: %w", tu.Namespace, ref.Name, err)
+		}
+		credentials := writeback.Credentials{
+			Token: string(secret.Data["token"]), Username: string(secret.Data["username"]),
+			Password: string(secret.Data["password"]), SSHPrivateKey: secret.Data["sshPrivateKey"],
+			KnownHosts:            secret.Data["knownHosts"],
+			InsecureIgnoreHostKey: strings.EqualFold(strings.TrimSpace(string(secret.Data["insecureIgnoreHostKey"])), "true"),
+		}
+		if credentials.Token == "" && len(credentials.SSHPrivateKey) == 0 && (credentials.Username == "" || credentials.Password == "") {
+			return writeback.Credentials{}, fmt.Errorf("write-back credentials secret %s/%s must contain token, sshPrivateKey, or both username and password", tu.Namespace, ref.Name)
+		}
+		return credentials, nil
 	}
-	credentials := writeback.Credentials{
-		Token: string(secret.Data["token"]), Username: string(secret.Data["username"]),
-		Password: string(secret.Data["password"]), SSHPrivateKey: secret.Data["sshPrivateKey"],
-		KnownHosts:            secret.Data["knownHosts"],
-		InsecureIgnoreHostKey: strings.EqualFold(strings.TrimSpace(string(secret.Data["insecureIgnoreHostKey"])), "true"),
+
+	keyFile := strings.TrimSpace(os.Getenv("GIT_SSH_KEY_FILE"))
+	knownHostsFile := strings.TrimSpace(os.Getenv("GIT_KNOWN_HOSTS_FILE"))
+	if keyFile == "" || knownHostsFile == "" {
+		return writeback.Credentials{}, fmt.Errorf("write-back requires credentialsSecretRef or both GIT_SSH_KEY_FILE and GIT_KNOWN_HOSTS_FILE")
 	}
-	if credentials.Token == "" && len(credentials.SSHPrivateKey) == 0 && (credentials.Username == "" || credentials.Password == "") {
-		return writeback.Credentials{}, fmt.Errorf("write-back credentials secret %s/%s must contain token, sshPrivateKey, or both username and password", tu.Namespace, ref.Name)
+	key, err := os.ReadFile(keyFile)
+	if err != nil {
+		return writeback.Credentials{}, fmt.Errorf("read mounted write-back SSH key %s: %w", keyFile, err)
 	}
-	return credentials, nil
+	knownHosts, err := os.ReadFile(knownHostsFile)
+	if err != nil {
+		return writeback.Credentials{}, fmt.Errorf("read mounted write-back known_hosts %s: %w", knownHostsFile, err)
+	}
+	return writeback.Credentials{SSHPrivateKey: key, KnownHosts: knownHosts}, nil
 }
 
 func (r *TagUpdaterReconciler) markReconcileSucceeded(ctx context.Context, tu *v1alpha1.TagUpdater, key string) {

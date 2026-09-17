@@ -48,6 +48,8 @@ spec:
             {{- if .Values.git.sshKey.enabled }}
             - name: GIT_SSH_KEY_FILE
               value: {{ .Values.git.sshKey.keyFile | quote }}
+            - name: GIT_KNOWN_HOSTS_FILE
+              value: {{ .Values.git.sshKey.knownHostsFile | quote }}
             {{- end }}
             {{- if .Values.git.token.enabled }}
             # A single classic PAT (repo scope) reads every targeted repo over

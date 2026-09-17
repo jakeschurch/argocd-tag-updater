@@ -1,6 +1,9 @@
 package controller
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,10 +15,41 @@ func TestValidateWriteBackRequiresDestination(t *testing.T) {
 	if err == nil {
 		t.Fatal("empty write-back config was accepted")
 	}
-	for _, field := range []string{"spec.writeBack", "repo", "branch", "path", "credentialsSecretRef.name"} {
+	for _, field := range []string{"spec.writeBack", "repo", "branch", "path"} {
 		if !strings.Contains(err.Error(), field) {
 			t.Errorf("error %q does not mention %q", err, field)
 		}
+	}
+}
+
+func TestResolveWriteBackCredentialsUsesMountedSSHKey(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "id_ed25519")
+	knownHostsPath := filepath.Join(dir, "known_hosts")
+	if err := os.WriteFile(keyPath, []byte("private-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(knownHostsPath, []byte("github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_SSH_KEY_FILE", keyPath)
+	t.Setenv("GIT_KNOWN_HOSTS_FILE", knownHostsPath)
+
+	credentials, err := (&TagUpdaterReconciler{}).resolveWriteBackCredentials(context.Background(), &v1alpha1.TagUpdater{})
+	if err != nil {
+		t.Fatalf("resolve mounted credentials: %v", err)
+	}
+	if string(credentials.SSHPrivateKey) != "private-key" || string(credentials.KnownHosts) != "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI" {
+		t.Fatalf("mounted credentials not loaded: %#v", credentials)
+	}
+}
+
+func TestValidateWriteBackAllowsMountedCredentials(t *testing.T) {
+	err := validateWriteBack(v1alpha1.WriteBackSpec{
+		Repo: "git@example.com:org/manifests.git", Branch: "main", Path: "apps/example.yaml",
+	})
+	if err != nil {
+		t.Fatalf("write-back destination using mounted credentials rejected: %v", err)
 	}
 }
 

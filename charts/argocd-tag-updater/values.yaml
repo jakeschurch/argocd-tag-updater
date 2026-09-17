@@ -28,6 +28,8 @@ git:
     secretName: argocd-tag-updater-github-deploy-key
     mountPath: /etc/git
     keyFile: /etc/git/id_ed25519
+    # SSH host keys for Git hosts. This must be another key in the same Secret.
+    knownHostsFile: /etc/git/known_hosts
   token:
     enabled: true
     secretName: argocd-tag-updater-git-token
