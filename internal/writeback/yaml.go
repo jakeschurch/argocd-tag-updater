@@ -86,7 +86,7 @@ func UpdateManifest(input []byte, targets []v1alpha1.TargetSpec, data map[string
 }
 
 func renderTemplate(text string, data map[string]string) (string, error) {
-	tmpl, err := template.New("value").Parse(text)
+	tmpl, err := template.New("value").Option("missingkey=error").Parse(text)
 	if err != nil {
 		return "", err
 	}

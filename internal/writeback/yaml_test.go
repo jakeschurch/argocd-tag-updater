@@ -149,3 +149,20 @@ spec:
 		t.Fatalf("numeric-looking no-op changed manifest:\n%s", out)
 	}
 }
+
+func TestUpdateManifestRejectsMissingReleaseField(t *testing.T) {
+	input := []byte(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: release
+data:
+  image: old
+`)
+	target := []v1alpha1.TargetSpec{{
+		APIVersion: "v1", Kind: "ConfigMap", Name: "release",
+		Patches: []v1alpha1.PatchSpec{{Field: "data.image", Template: "{{ .image_tag }}"}},
+	}}
+	if _, _, err := UpdateManifest(input, target, map[string]string{}); err == nil || !strings.Contains(err.Error(), "map has no entry") {
+		t.Fatalf("missing release field was accepted: %v", err)
+	}
+}

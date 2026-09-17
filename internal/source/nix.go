@@ -86,6 +86,7 @@ type nixTagEntry struct {
 	StorePath string `json:"store_path"`
 	Root      string `json:"root"`
 	Rev       string `json:"rev"`
+	ImageTag  string `json:"image_tag"`
 }
 
 // Resolve implements TagResolver. It fetches the record for exactly tag, rather
@@ -146,6 +147,9 @@ func (n *Nix) Resolve(ctx context.Context, tag string) (map[string]string, error
 		out["root"] = entry.Root
 	}
 	out["rev"] = entry.Rev
+	if entry.ImageTag != "" {
+		out["image_tag"] = entry.ImageTag
+	}
 	return out, nil
 }
 
