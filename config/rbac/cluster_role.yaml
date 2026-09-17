@@ -8,22 +8,23 @@ rules:
     resources: ["tagupdaters", "tagupdaters/status"]
     verbs: ["get", "list", "watch", "update", "patch"]
 
-  # ArgoCD resources — watch Sensors, get/update Applications for sync trigger
-  - apiGroups: ["argoproj.io"]
-    resources: ["*"]
-    verbs: ["get", "list", "watch", "update", "patch"]
-
-  # Common workload target types
-  - apiGroups: ["apps"]
-    resources: ["*"]
-    verbs: ["get", "list", "watch", "update", "patch"]
-
-  # Core resources (Pods, Services, ConfigMaps, etc.) as potential targets
+  # Source and write-back credential secrets
   - apiGroups: [""]
-    resources: ["*"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+    resources: ["secrets"]
+    verbs: ["get"]
 
-  # Batch resources as potential targets
-  - apiGroups: ["batch"]
-    resources: ["*"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+  # Rollback health observation (read-only)
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get"]
+
+  # Reconcile and write-back outcome events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+
+  # Leader election lease
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

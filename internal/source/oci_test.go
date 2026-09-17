@@ -30,8 +30,7 @@ func TestOCITags_SinglePage(t *testing.T) {
 }
 
 func TestOCITags_Paginated(t *testing.T) {
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("last") == "" {
 			w.Header().Set("Link", `</v2/x/tags/list?n=1000&last=a>; rel="next"`)
 			_, _ = w.Write([]byte(`{"tags":["a"]}`))

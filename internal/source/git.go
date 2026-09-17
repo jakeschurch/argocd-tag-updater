@@ -12,12 +12,15 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/go-git/go-git/v5/storage/memory"
 	gossh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 type Git struct {
-	Repo       string
-	SSHKeyFile string // optional path to SSH private key PEM; if empty, unauthenticated
-	Token      string // optional GitHub token; when set, auth over HTTPS instead of SSH
+	Repo                  string
+	SSHKeyFile            string // optional path to SSH private key PEM; if empty, unauthenticated
+	Token                 string // optional GitHub token; when set, auth over HTTPS instead of SSH
+	KnownHostsFile        string // required for SSH unless InsecureIgnoreHostKey is explicitly true
+	InsecureIgnoreHostKey bool
 }
 
 // TagRevs returns each tag mapped to its full 40-hex commit sha, resolved from
@@ -88,7 +91,18 @@ func (g *Git) listRefs(ctx context.Context) ([]*plumbing.Reference, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load SSH key %s: %w", g.SSHKeyFile, err)
 		}
-		auth.HostKeyCallback = gossh.InsecureIgnoreHostKey() //nolint:gosec
+		switch {
+		case g.KnownHostsFile != "":
+			callback, err := knownhosts.New(g.KnownHostsFile)
+			if err != nil {
+				return nil, fmt.Errorf("load known_hosts %s: %w", g.KnownHostsFile, err)
+			}
+			auth.HostKeyCallback = callback
+		case g.InsecureIgnoreHostKey:
+			auth.HostKeyCallback = gossh.InsecureIgnoreHostKey() //nolint:gosec // explicit operator opt-in
+		default:
+			return nil, fmt.Errorf("SSH source requires GIT_KNOWN_HOSTS_FILE or GIT_INSECURE_IGNORE_HOST_KEY=true")
+		}
 		opts.Auth = auth
 	}
 

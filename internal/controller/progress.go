@@ -8,43 +8,16 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // Defaults for the per-updater reconcile-progress staleness window. An updater
-// is stale when its reconciles have not *succeeded* (resolve+patch pipeline
+// is stale when its reconciles have not *succeeded* (resolve+write-back pipeline
 // completed, whether or not a new tag existed) within
 // max(multiplier*interval, floor). Overridable via flags in main.go.
 const (
 	defaultStaleMultiplier = 10
 	defaultStaleFloor      = 15 * time.Minute
 )
-
-// targetAppErrorTotal counts observations of an error condition
-// (ComparisonError, InvalidSpecError, ...) on a TagUpdater's target ArgoCD
-// Application. The App sitting in ComparisonError after a CRD/manifest skew is
-// the failure mode that silently froze all deploys — the controller kept
-// patching but ArgoCD never converged, and nothing alerted.
-var targetAppErrorTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-	Name: "tagupdater_target_app_error",
-	Help: "Times an error condition (ComparisonError, InvalidSpecError, ...) was observed on a target ArgoCD Application.",
-}, []string{"app", "type"})
-
-// configErrorTotal counts reconciles that failed with only PERMANENT patch
-// errors (bad field-path index, unmatched name selector, server-rejected
-// Invalid/BadRequest patch). These are deterministic — retrying cannot fix
-// them — so the reconciler stops the error backoff and requeues on the slow
-// interval; this counter is the alertable "a TagUpdater is misconfigured"
-// signal that would otherwise be buried in log spam.
-var configErrorTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-	Name: "tagupdater_config_error",
-	Help: "Times a TagUpdater reconcile failed with only permanent (non-retryable) patch errors.",
-}, []string{"name"})
-
-func init() {
-	metrics.Registry.MustRegister(targetAppErrorTotal)
-	metrics.Registry.MustRegister(configErrorTotal)
-}
 
 // progressTracker records, per TagUpdater, when a reconcile was first
 // attempted and when one last completed successfully — the in-memory analogue
@@ -97,7 +70,7 @@ func (t *progressTracker) attempt(key string, interval time.Duration, now time.T
 	entry.interval = interval
 }
 
-// success records that the resolve+patch pipeline for key completed.
+// success records that the resolve+write-back pipeline for key completed.
 func (t *progressTracker) success(key string, now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

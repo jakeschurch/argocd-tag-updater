@@ -31,7 +31,7 @@ type SourceSpec struct {
 }
 
 type PatchSpec struct {
-	// Field is a dot-notation path into the target CR. e.g. "spec.flakeRef" or
+	// Field is a dot-notation path into the target manifest. e.g. "spec.flakeRef" or
 	// "spec.source.helm.valuesObject.image.tag".
 	Field string `json:"field"`
 	// Template is a Go template rendered with named captures from TagPattern plus
@@ -62,12 +62,30 @@ type ArgoCDAppRef struct {
 	Namespace string `json:"namespace,omitempty"` // defaults to "argocd"
 }
 
-// RollbackSpec configures automatic rollback when a tag deployment is unhealthy.
+// RollbackSpec configures a git write-back rollback when a deployed tag is unhealthy.
 type RollbackSpec struct {
 	Enabled bool `json:"enabled,omitempty"`
-	// Timeout is how long to wait for ArgoCD health before rolling back.
-	// Defaults to 10m. Should be >= the target Deployment's progressDeadlineSeconds.
+	// Timeout is how long to wait for the workload to become Healthy after ArgoCD
+	// observes the pushed manifest commit. It does not include repository polling
+	// latency. Defaults to 20m.
 	Timeout metav1.Duration `json:"timeout,omitempty"`
+}
+
+// WriteBackSpec identifies the git manifest that is the sole update target.
+type WriteBackSpec struct {
+	// Repo is the git repository containing the target manifest. It is independent
+	// of source.repo, which is only the tag source.
+	Repo string `json:"repo"`
+	// Branch is the branch cloned and pushed by the controller.
+	Branch string `json:"branch"`
+	// Path is the repository-relative path to a YAML manifest. Multi-document YAML
+	// is supported; target identity selects the document to edit.
+	Path string `json:"path"`
+	// CredentialsSecretRef names a Secret in the TagUpdater namespace. Supported
+	// authentication keys are token, username/password, and sshPrivateKey. SSH
+	// additionally requires knownHosts, or insecureIgnoreHostKey=true as an
+	// explicit opt-in.
+	CredentialsSecretRef LocalObjectReference `json:"credentialsSecretRef"`
 }
 
 // +kubebuilder:object:root=true
@@ -85,18 +103,21 @@ type TagUpdater struct {
 
 type TagUpdaterSpec struct {
 	Source SourceSpec `json:"source"`
-	// Targets is the list of CR groups to patch when a new tag matches.
+	// Targets identifies manifest documents and fields to update when a new tag matches.
 	Targets []TargetSpec `json:"targets"`
 	// Interval between tag polls. Defaults to 2m.
 	Interval metav1.Duration `json:"interval,omitempty"`
-	// ArgoCDApp triggers a sync on the named Application after all patches are applied.
+	// WriteBack is the required git destination for rendered target patches.
+	WriteBack WriteBackSpec `json:"writeBack"`
+	// ArgoCDApp is a read-only reference used to observe sync revision and health.
+	// The controller never patches or triggers this Application.
 	ArgoCDApp *ArgoCDAppRef `json:"argoCDApp,omitempty"`
-	// ManagingApp is the app-of-apps that syncs the target Applications from git.
-	// The controller ensures RespectIgnoreDifferences=true is in its syncOptions
-	// so TagUpdater patches on child Applications survive selfHeal cycles.
+	// ManagingApp optionally identifies the read-only app-of-apps Application whose
+	// sync revision must observe the pushed manifest commit. When omitted,
+	// ArgoCDApp is used for both revision and health observation.
 	ManagingApp *ArgoCDAppRef `json:"managingApp,omitempty"`
-	// Rollback configures automatic rollback when a newly-applied tag fails to
-	// deploy successfully. Requires ArgoCDApp to be set.
+	// Rollback commits the previous tag's rendered values when ArgoCD reports a
+	// terminal deployment failure. Requires ArgoCDApp to be set.
 	Rollback *RollbackSpec `json:"rollback,omitempty"`
 }
 
@@ -104,16 +125,30 @@ type TagUpdaterStatus struct {
 	LastTag     string             `json:"lastTag,omitempty"`
 	LastUpdated *metav1.Time       `json:"lastUpdated,omitempty"`
 	Conditions  []metav1.Condition `json:"conditions,omitempty"`
-	// PreviousTag is the tag that was applied before LastTag.
+	// LastWriteCommit is the manifest branch commit verified by the last
+	// successful write-back. It enables a cheap remote-head guard before cloning.
+	LastWriteCommit string `json:"lastWriteCommit,omitempty"`
+	// PreviousTag is the tag applied before LastTag.
 	PreviousTag string `json:"previousTag,omitempty"`
-	// SkippedTags is the list of tags that failed to deploy and were rolled back.
-	// These tags are excluded from future Latest() selection until a newer tag
-	// deploys successfully, at which point the list is cleared.
+	// SkippedTags contains failed tags excluded from Latest() until a newer tag
+	// deploys successfully.
 	SkippedTags []string `json:"skippedTags,omitempty"`
-	// WatchingTag is the tag whose ArgoCD health is currently being monitored.
-	// Set after a patch is applied; cleared once the app is healthy or rolled back.
+	// WatchingTag is the deployed tag currently under health observation.
 	WatchingTag string `json:"watchingTag,omitempty"`
-	// WatchingSince is when health monitoring for WatchingTag started.
+	// WatchingCommit is the pushed manifest commit ArgoCD must observe before the
+	// health timeout clock starts.
+	WatchingCommit string `json:"watchingCommit,omitempty"`
+	// WatchingArmedAt is when the watch was armed, i.e. when WatchingCommit was
+	// written. It bounds the phase BEFORE ArgoCD observes the commit.
+	//
+	// Without it that phase is unbounded: WatchingSince only starts once ArgoCD
+	// reports the commit, the rollback timeout is measured from WatchingSince,
+	// and Reconcile short-circuits all tag work while WatchingTag is set. An
+	// ArgoCD that never picks the commit up (app renamed or deleted, repo
+	// credentials broken, branch mismatch, controller down) would therefore
+	// freeze the updater permanently while still reporting success.
+	WatchingArmedAt *metav1.Time `json:"watchingArmedAt,omitempty"`
+	// WatchingSince is set when ArgoCD status.sync.revision equals WatchingCommit.
 	WatchingSince *metav1.Time `json:"watchingSince,omitempty"`
 }
 

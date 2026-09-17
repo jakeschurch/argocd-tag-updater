@@ -13,12 +13,15 @@ rules:
     resources: ["tagupdaters/status"]
     verbs: ["get", "update", "patch"]
 
-  # Target resources: ArgoCD Applications, Sensors, WorkflowTemplates, Deployments,
-  # and any other patch target. Broad get/list/watch + patch/update across all groups —
-  # the controller patches arbitrary user-declared target kinds.
-  - apiGroups: ["*"]
-    resources: ["*"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+  # Source and write-back credential secrets.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+
+  # Rollback health observation (read-only).
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get"]
 
   # Leader election lease.
   - apiGroups: ["coordination.k8s.io"]

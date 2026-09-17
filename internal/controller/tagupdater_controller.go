@@ -4,12 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,77 +16,46 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/jakeschurch/argocd-tag-updater/api/v1alpha1"
 	"github.com/jakeschurch/argocd-tag-updater/internal/matcher"
-	"github.com/jakeschurch/argocd-tag-updater/internal/patcher"
 	intsource "github.com/jakeschurch/argocd-tag-updater/internal/source"
+	"github.com/jakeschurch/argocd-tag-updater/internal/writeback"
 )
 
-const defaultRollbackTimeout = 10 * time.Minute
-
 const defaultInterval = 2 * time.Minute
+const revStaleAfter = 5 * time.Minute
 
 type TagUpdaterReconciler struct {
 	client.Client
-	Dynamic     dynamic.Interface
-	Mapper      meta.RESTMapper
-	Cache       cache.Cache
-	ctrl        controller.Controller
-	watchedGVKs sync.Map // map[schema.GroupVersionKind]struct{}
+	Recorder record.EventRecorder
+	Dynamic  dynamic.Interface
 
-	// revAttempted flips true the first time a git source is asked to resolve a
-	// tag to its immutable commit sha; lastRevSuccess records the unix-nano of
-	// the most recent success. Together they drive RevResolutionHealthz — while
-	// no git source has ever been reconciled the check is inert, so a nix-only
-	// deployment never trips it.
 	revAttempted   atomic.Bool
 	lastRevSuccess atomic.Int64
+	progress       progressTracker
 
-	// progress tracks per-updater reconcile attempts/successes (the per-updater
-	// analogue of revAttempted/lastRevSuccess) and drives the
-	// tagupdater_reconcile_stale metric, the Stalled condition, and
-	// ReconcileProgressHealthz.
-	progress progressTracker
-
-	// StaleMultiplier and StaleFloor configure the reconcile-progress staleness
-	// window: an updater is stale when no reconcile has succeeded within
-	// max(StaleMultiplier*interval, StaleFloor). Zero values use the defaults
-	// (10x interval, 15m).
 	StaleMultiplier int
 	StaleFloor      time.Duration
 }
 
-// revStaleAfter is how long git tag->rev resolution may keep failing before
-// RevResolutionHealthz reports unhealthy. Longer than a couple reconcile
-// intervals so a transient ls-remote blip does not restart the pod, short
-// enough that a sustained resolver outage (the failure mode that silently
-// froze all deploys) migrates leadership off the broken replica.
-const revStaleAfter = 5 * time.Minute
+const defaultRollbackTimeout = 20 * time.Minute
 
 func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := log.FromContext(ctx)
-
+	logger := log.FromContext(ctx)
 	var tu v1alpha1.TagUpdater
 	if err := r.Get(ctx, req.NamespacedName, &tu); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Deleted updaters must stop counting toward staleness metrics and
-			// the aggregate healthz.
-			r.progress.forget(req.NamespacedName.String())
+			r.progress.forget(req.String())
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -97,462 +64,475 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if tu.Spec.Interval.Duration > 0 {
 		interval = tu.Spec.Interval.Duration
 	}
-
-	progressKey := req.NamespacedName.String()
+	progressKey := req.String()
 	r.progress.attempt(progressKey, interval, time.Now())
-
-	// If rollback is enabled and we're mid-watch, check ArgoCD health before polling tags.
+	if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Spec.ArgoCDApp == nil {
+		message := "spec.rollback.enabled requires spec.argoCDApp for read-only sync revision and health observation"
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "MissingArgoCDApp", Message: message})
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "MissingArgoCDApp", Message: message})
+		_ = r.Status().Update(ctx, &tu)
+		if r.Recorder != nil {
+			r.Recorder.Event(&tu, corev1.EventTypeWarning, "MissingArgoCDApp", message)
+		}
+		return ctrl.Result{RequeueAfter: interval}, nil
+	}
 	if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Status.WatchingTag != "" {
-		requeue, err := r.checkHealthAndMaybeRollback(ctx, &tu, interval)
+		requeue, err := r.checkHealthAndMaybeRollback(ctx, &tu)
 		if err != nil {
-			// RequeueAfter is ignored by controller-runtime when err != nil (it
-			// uses the error backoff), so pass a bare Result to avoid the
-			// "returned both a result ... and a non-nil error" warning.
 			return ctrl.Result{}, err
 		}
 		if requeue > 0 {
-			// A completed health poll is a successful reconcile — the pipeline
-			// is alive even though no new tag work happened.
-			r.markReconcileSucceeded(ctx, &tu, progressKey)
+			// Only count waiting-for-health as progress. Waiting for ArgoCD to
+			// even observe the commit (WatchingSince still nil) is a blocked
+			// state, not a healthy one — marking it successful would hide the
+			// freeze from the staleness detector, which is exactly the silent
+			// reconcile freeze this controller already tracks elsewhere.
+			if tu.Status.WatchingSince != nil {
+				r.markReconcileSucceeded(ctx, &tu, progressKey)
+			}
 			return ctrl.Result{RequeueAfter: requeue}, nil
 		}
-		// health confirmed OK — fall through to normal tag poll
 	}
 
-	// Best-effort guard: an error condition on the target Application
-	// (ComparisonError after a CRD/manifest skew, InvalidSpecError, ...) means
-	// ArgoCD is not converging even though patching succeeds — deploys freeze
-	// silently. Surface it loudly, but never fail the reconcile on it.
-	if tu.Spec.ArgoCDApp != nil {
-		r.checkTargetAppConditions(ctx, tu.Spec.ArgoCDApp)
+	if err := validateWriteBack(tu.Spec.WriteBack); err != nil {
+		message := err.Error()
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "WriteBackReady", Status: metav1.ConditionFalse, Reason: "MissingWriteBackConfig", Message: message})
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "MissingWriteBackConfig", Message: message})
+		meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(progressKey))
+		_ = r.Status().Update(ctx, &tu)
+		if r.Recorder != nil {
+			r.Recorder.Event(&tu, corev1.EventTypeWarning, "MissingWriteBackConfig", message)
+		}
+		logger.Error(err, "required git write-back configuration is missing")
+		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
 	var ociBasicAuth string
 	if tu.Spec.Source.Type == v1alpha1.SourceTypeOCI && tu.Spec.Source.ImagePullSecretRef != nil {
-		auth, aerr := r.resolveDockerAuth(ctx, tu.Namespace, tu.Spec.Source.ImagePullSecretRef.Name, tu.Spec.Source.Repo)
-		if aerr != nil {
-			log.Info("could not resolve imagePullSecret for OCI source; proceeding unauthenticated", "err", aerr)
+		auth, err := r.resolveDockerAuth(ctx, tu.Namespace, tu.Spec.Source.ImagePullSecretRef.Name, tu.Spec.Source.Repo)
+		if err != nil {
+			logger.Info("could not resolve imagePullSecret for OCI source; proceeding unauthenticated", "err", err)
 		} else {
 			ociBasicAuth = auth
 		}
 	}
-
 	src, err := sourceFor(tu.Spec.Source, ociBasicAuth)
 	if err != nil {
 		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
 	}
-
 	tags, err := src.Tags(ctx)
 	if err != nil {
 		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
 	}
-
 	m, err := matcher.New(tu.Spec.Source.TagPattern)
 	if err != nil {
 		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
 	}
-
-	// Filter skipped tags so they are never re-applied.
-	filteredTags := filterSkipped(tags, tu.Status.SkippedTags)
-
-	latest, ok := m.Latest(filteredTags)
+	latest, ok := m.Latest(filterSkipped(tags, tu.Status.SkippedTags))
 	if !ok {
-		log.Info("no tags matched pattern", "pattern", tu.Spec.Source.TagPattern)
-		// The pipeline completed — there was simply nothing to apply. Counts as
-		// a successful reconcile for staleness purposes.
+		logger.Info("no tags matched pattern", "pattern", tu.Spec.Source.TagPattern)
 		r.markReconcileSucceeded(ctx, &tu, progressKey)
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
 	data := latest.Captures
 	data["tag"] = latest.Tag
-	for k, v := range parseRepo(tu.Spec.Source.Repo) {
-		data[k] = v
+	for key, value := range parseRepo(tu.Spec.Source.Repo) {
+		data[key] = value
 	}
-
-	// If the source can resolve extra per-release fields (the nix source
-	// surfacing the content-addressed store_path a tag can't encode), merge
-	// them so a target can template `{{ .store_path }}`. Best-effort: a
-	// resolver fault degrades to tag-only templating, never fails the update.
 	if resolver, ok := src.(intsource.TagResolver); ok {
-		if extra, rerr := resolver.Resolve(ctx); rerr != nil {
-			log.Info("tag resolver failed; templating with tag captures only", "err", rerr)
+		if extra, resolveErr := resolver.Resolve(ctx); resolveErr != nil {
+			logger.Info("tag resolver failed; templating with tag captures only", "err", resolveErr)
 		} else {
-			for k, v := range extra {
-				data[k] = v
+			for key, value := range extra {
+				data[key] = value
 			}
 		}
 	}
-
-	// If the source can map a tag to its immutable commit sha (the git source),
-	// expose the matched tag's sha as `{{ .rev }}` so a target can pin an
-	// immutable flake ref `github:owner/repo/{{ .rev }}#attr`. Fail-closed: an
-	// unresolvable rev aborts the update rather than patching an impure ref.
 	if err := r.addRev(ctx, src, latest.Tag, data); err != nil {
 		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
 	}
 
-	p := patcher.Patcher{Client: r.Dynamic, Mapper: r.Mapper}
-
-	var patchErrors []error
-	anyChanged := false
-	for _, target := range tu.Spec.Targets {
-		selector := ""
-		if target.Selector != nil {
-			sel, err := metav1.LabelSelectorAsSelector(target.Selector)
-			if err != nil {
-				patchErrors = append(patchErrors, fmt.Errorf("%s/%s selector: %w", target.Kind, target.Name, err))
-				continue
-			}
-			selector = sel.String()
-		}
-
-		patches := make([]patcher.Patch, len(target.Patches))
-		for i, patch := range target.Patches {
-			patches[i] = patcher.Patch{Field: patch.Field, Template: patch.Template}
-		}
-
-		_, changed, err := p.ApplyAll(ctx, patcher.Target{
-			APIVersion: target.APIVersion,
-			Kind:       target.Kind,
-			Name:       target.Name,
-			Namespace:  target.Namespace,
-			Selector:   selector,
-		}, patches, data)
-		if err != nil {
-			patchErrors = append(patchErrors, err)
-			continue
-		}
-		if len(changed) > 0 {
-			log.Info("patched", "kind", target.Kind, "names", changed, "tag", latest.Tag)
-			anyChanged = true
-		}
-	}
-
-	if len(patchErrors) > 0 {
-		msgs := make([]string, len(patchErrors))
-		allPermanent := true
-		for i, e := range patchErrors {
-			msgs[i] = e.Error()
-			if !isPermanentPatchError(e) {
-				allPermanent = false
+	var writeResult writeback.Result
+	credentials, err := r.resolveWriteBackCredentials(ctx, &tu)
+	if err == nil {
+		writer := writeback.Writer{Spec: tu.Spec.WriteBack, Credentials: credentials, Targets: tu.Spec.Targets, Data: data}
+		if latest.Tag == tu.Status.LastTag && tu.Status.LastWriteCommit != "" {
+			remoteHead, headErr := writer.RemoteHead(ctx)
+			if headErr == nil && writeBackCurrent(latest.Tag, tu.Status, remoteHead) {
+				meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "WriteBackReady", Status: metav1.ConditionTrue, Reason: "RemoteUnchanged", Message: "tag and manifest branch head are unchanged; clone skipped"})
+				meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "WrittenToGit", Message: fmt.Sprintf("manifest values for tag %s are present in git", latest.Tag)})
+				if err := r.Status().Update(ctx, &tu); err != nil {
+					return ctrl.Result{}, err
+				}
+				r.markReconcileSucceeded(ctx, &tu, progressKey)
+				return ctrl.Result{RequeueAfter: interval}, nil
 			}
 		}
-		joined := fmt.Errorf("%s", strings.Join(msgs, "; "))
-		if allPermanent {
-			// Deterministic misconfiguration (bad index / unmatched selector /
-			// server-rejected Invalid patch) — retrying on the error backoff just
-			// floods logs and API calls. Record a ConfigError, count it, and
-			// requeue on the slow interval with a nil error so controller-runtime
-			// does NOT back off. markReconcileSucceeded is intentionally NOT called,
-			// so Stalled still trips and the freeze stays visible.
-			configErrorTotal.WithLabelValues(tu.Name).Inc()
-			log.Error(joined, "permanent patch error; requeuing on interval without backoff", "interval", interval)
-			r.setConfigError(ctx, &tu, joined)
-			return ctrl.Result{RequeueAfter: interval}, nil
-		}
-		return ctrl.Result{}, r.setFailed(ctx, &tu, joined)
-	}
-
-	if tu.Spec.ManagingApp != nil {
-		if err := r.ensureRespectIgnoreDifferences(ctx, tu.Spec.ManagingApp); err != nil {
-			log.Error(err, "failed to ensure RespectIgnoreDifferences on managing app")
+		writeResult, err = writer.Apply(ctx)
+		if err == nil {
+			reason, message := "UpToDate", "manifest already contains the rendered values; no commit created"
+			if writeResult.Committed {
+				reason = "Committed"
+				message = fmt.Sprintf("committed tag %s to %s on branch %s", latest.Tag, tu.Spec.WriteBack.Path, tu.Spec.WriteBack.Branch)
+				if r.Recorder != nil {
+					r.Recorder.Event(&tu, corev1.EventTypeNormal, "WriteBackCommitted", message)
+				}
+			}
+			meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "WriteBackReady", Status: metav1.ConditionTrue, Reason: reason, Message: message})
 		}
 	}
-
-	// Only nudge ArgoCD when a target actually changed.
-	if tu.Spec.ArgoCDApp != nil && anyChanged {
-		if err := r.triggerArgoCDSync(ctx, tu.Spec.ArgoCDApp); err != nil {
-			log.Error(err, "failed to trigger ArgoCD sync")
+	if err != nil {
+		message := err.Error()
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "WriteBackReady", Status: metav1.ConditionFalse, Reason: "WriteBackFailed", Message: message})
+		if r.Recorder != nil {
+			r.Recorder.Event(&tu, corev1.EventTypeWarning, "WriteBackFailed", message)
 		}
+		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
 	}
 
 	if latest.Tag != tu.Status.LastTag {
 		now := metav1.Now()
-		// Preserve the previous tag before overwriting so rollback can revert to it.
-		prevTag := tu.Status.LastTag
-		tu.Status.PreviousTag = prevTag
+		tu.Status.PreviousTag = tu.Status.LastTag
 		tu.Status.LastTag = latest.Tag
 		tu.Status.LastUpdated = &now
-		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
-			Type:    "Ready",
-			Status:  metav1.ConditionTrue,
-			Reason:  "Updated",
-			Message: fmt.Sprintf("patched %d target(s) to tag %s", len(tu.Spec.Targets), latest.Tag),
-		})
-
-		// Start health watch if rollback is enabled and we have an ArgoCD app to watch.
 		if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Spec.ArgoCDApp != nil {
 			tu.Status.WatchingTag = latest.Tag
-			tu.Status.WatchingSince = &now
-		}
-
-		if err := r.Status().Update(ctx, &tu); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Requeue quickly to start health polling.
-		if tu.Status.WatchingTag != "" {
-			r.ensureWatches(ctx, &tu)
-			r.markReconcileSucceeded(ctx, &tu, progressKey)
-			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+			tu.Status.WatchingCommit = writeResult.CommitSHA
+			tu.Status.WatchingSince = nil
+			// Bounds the wait for ArgoCD to observe WatchingCommit; without it
+			// that phase never times out. See WatchingArmedAt.
+			tu.Status.WatchingArmedAt = &now
 		}
 	}
-
-	r.ensureWatches(ctx, &tu)
+	tu.Status.LastWriteCommit = writeResult.CommitSHA
+	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "WrittenToGit", Message: fmt.Sprintf("manifest values for tag %s are present in git", latest.Tag)})
+	if err := r.Status().Update(ctx, &tu); err != nil {
+		return ctrl.Result{}, err
+	}
 	r.markReconcileSucceeded(ctx, &tu, progressKey)
-
 	return ctrl.Result{RequeueAfter: interval}, nil
 }
 
-// markReconcileSucceeded records that the resolve+patch pipeline for tu
-// completed (whether or not a new tag existed) and clears the Stalled
-// condition, status-updating only when the condition actually flips.
-func (r *TagUpdaterReconciler) markReconcileSucceeded(ctx context.Context, tu *v1alpha1.TagUpdater, key string) {
-	r.progress.success(key, time.Now())
-	changed := meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(key))
-	// A clean reconcile clears any prior permanent-config error so a fixed
-	// field-path doesn't leave ConfigError=True lingering on the CR.
-	if meta.FindStatusCondition(tu.Status.Conditions, "ConfigError") != nil {
-		changed = meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
-			Type:    "ConfigError",
-			Status:  metav1.ConditionFalse,
-			Reason:  "Resolved",
-			Message: "patches applied without a permanent error",
-		}) || changed
-	}
-	if changed {
-		if err := r.Status().Update(ctx, tu); err != nil {
-			log.FromContext(ctx).Error(err, "failed to update Stalled/ConfigError conditions")
-		}
-	}
+func writeBackCurrent(tag string, status v1alpha1.TagUpdaterStatus, remoteHead string) bool {
+	return tag == status.LastTag && status.LastWriteCommit != "" && remoteHead == status.LastWriteCommit
 }
 
-// stalledCondition renders the Stalled condition for key from the progress
-// tracker. Stalled=True means reconciles have not succeeded within the
-// staleness window — the per-updater "deploys are silently frozen" signal.
-func (r *TagUpdaterReconciler) stalledCondition(key string) metav1.Condition {
-	if r.progress.isStale(key, time.Now()) {
-		return metav1.Condition{
-			Type:    "Stalled",
-			Status:  metav1.ConditionTrue,
-			Reason:  "ReconcileStale",
-			Message: "no successful reconcile within the staleness window; deploys for this updater may be frozen",
-		}
-	}
-	return metav1.Condition{
-		Type:    "Stalled",
-		Status:  metav1.ConditionFalse,
-		Reason:  "Progressing",
-		Message: "reconciles are completing within the staleness window",
-	}
-}
-
-// checkTargetAppConditions best-effort inspects the target ArgoCD Application
-// for error conditions (ComparisonError, InvalidSpecError, ...). ArgoCD parks
-// an App in ComparisonError on CRD/manifest schema skew and simply stops
-// converging — patches still apply but nothing deploys. Emits an error-level
-// log and increments tagupdater_target_app_error; never fails the reconcile.
-func (r *TagUpdaterReconciler) checkTargetAppConditions(ctx context.Context, ref *v1alpha1.ArgoCDAppRef) {
-	log := log.FromContext(ctx)
-	ns := ref.Namespace
-	if ns == "" {
-		ns = "argocd"
-	}
-	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
-	obj, err := r.Dynamic.Resource(gvr).Namespace(ns).Get(ctx, ref.Name, metav1.GetOptions{})
+func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, tu *v1alpha1.TagUpdater) (time.Duration, error) {
+	revisionRef := revisionObserver(tu)
+	revisionState, err := r.argoCDAppState(ctx, revisionRef)
 	if err != nil {
-		return
-	}
-	conditions, _, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
-	for _, raw := range conditions {
-		condition, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		conditionType, _ := condition["type"].(string)
-		if !strings.HasSuffix(conditionType, "Error") {
-			continue
-		}
-		message, _ := condition["message"].(string)
-		log.Error(fmt.Errorf("%s: %s", conditionType, message),
-			"target ArgoCD Application has an error condition; syncs may be silently frozen",
-			"app", ns+"/"+ref.Name, "conditionType", conditionType)
-		targetAppErrorTotal.WithLabelValues(ref.Name, conditionType).Inc()
-	}
-}
-
-// checkHealthAndMaybeRollback checks the ArgoCD app health while WatchingTag is set.
-// Returns (requeue duration, error): requeue>0 means come back later; 0 means health watch complete.
-func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, tu *v1alpha1.TagUpdater, interval time.Duration) (time.Duration, error) {
-	log := log.FromContext(ctx)
-
-	timeout := defaultRollbackTimeout
-	if tu.Spec.Rollback.Timeout.Duration > 0 {
-		timeout = tu.Spec.Rollback.Timeout.Duration
-	}
-
-	watching := tu.Status.WatchingTag
-	since := tu.Status.WatchingSince
-
-	elapsed := time.Duration(0)
-	if since != nil {
-		elapsed = time.Since(since.Time)
-	}
-
-	health, degradeReason, err := r.argoCDAppHealth(ctx, tu.Spec.ArgoCDApp)
-	if err != nil {
-		log.Error(err, "failed to read ArgoCD app health during rollback watch", "watchingTag", watching)
-		if elapsed > timeout {
-			log.Info("rollback timeout: health unreadable, reverting", "watchingTag", watching, "elapsed", elapsed)
-			return 0, r.doRollback(ctx, tu, watching)
+		message := err.Error()
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "HealthReadFailed", Message: message})
+		_ = r.Status().Update(ctx, tu)
+		if r.Recorder != nil {
+			r.Recorder.Event(tu, corev1.EventTypeWarning, "HealthReadFailed", message)
 		}
 		return 15 * time.Second, nil
 	}
-
-	switch health {
-	case "Healthy":
-		log.Info("deployment healthy, rollback watch complete", "tag", watching)
-		tu.Status.WatchingTag = ""
-		tu.Status.WatchingSince = nil
-		// Clear skipped tags — a successful new deployment means previous skips are stale.
-		tu.Status.SkippedTags = nil
+	if tu.Status.WatchingSince == nil {
+		if !revisionState.observes(tu.Status.WatchingCommit) {
+			// This phase MUST be bounded. Reconcile short-circuits every tag
+			// update while WatchingTag is set, so an ArgoCD that never observes
+			// the commit (app renamed or deleted, repo credentials broken,
+			// branch mismatch, controller down) would otherwise freeze the
+			// updater permanently — and, because the caller marks progress
+			// successful on this path, freeze it silently.
+			if r.observationDeadlineExceeded(tu) {
+				return 0, r.abandonWatch(ctx, tu)
+			}
+			return 15 * time.Second, nil
+		}
+		now := metav1.Now()
+		tu.Status.WatchingSince = &now
 		if err := r.Status().Update(ctx, tu); err != nil {
 			return 0, err
 		}
-		return 0, nil
-
-	case "Degraded":
-		log.Info("deployment degraded, rolling back", "watchingTag", watching, "reason", degradeReason)
-		return 0, r.doRollback(ctx, tu, watching)
-
-	default:
-		if elapsed > timeout {
-			log.Info("rollback timeout waiting for healthy, reverting", "watchingTag", watching, "elapsed", elapsed, "health", health)
-			return 0, r.doRollback(ctx, tu, watching)
-		}
-		log.Info("waiting for deployment health", "watchingTag", watching, "health", health, "elapsed", elapsed)
+	}
+	state, err := r.argoCDAppState(ctx, tu.Spec.ArgoCDApp)
+	if err != nil {
+		message := err.Error()
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "HealthReadFailed", Message: message})
+		_ = r.Status().Update(ctx, tu)
 		return 15 * time.Second, nil
 	}
+
+	if state.Health == "Healthy" {
+		tu.Status.WatchingTag = ""
+		tu.Status.WatchingCommit = ""
+		tu.Status.WatchingArmedAt = nil
+		tu.Status.WatchingSince = nil
+		tu.Status.SkippedTags = nil
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionTrue, Reason: "DeploymentHealthy", Message: "ArgoCD reports the written commit Healthy"})
+		return 0, r.Status().Update(ctx, tu)
+	}
+	if state.Health == "Degraded" && !state.syncInFlight() {
+		return 0, r.rollbackWithStatus(ctx, tu)
+	}
+	if time.Since(tu.Status.WatchingSince.Time) >= rollbackTimeout(tu) {
+		return 0, r.rollbackWithStatus(ctx, tu)
+	}
+	return 15 * time.Second, nil
 }
 
-// doRollback reverts all targets to previousTag and records badTag in skippedTags.
-func (r *TagUpdaterReconciler) doRollback(ctx context.Context, tu *v1alpha1.TagUpdater, badTag string) error {
-	log := log.FromContext(ctx)
+// rollbackTimeout is the configured health timeout, and doubles as the deadline
+// for ArgoCD to observe the written commit in the first place.
+func rollbackTimeout(tu *v1alpha1.TagUpdater) time.Duration {
+	if tu.Spec.Rollback != nil && tu.Spec.Rollback.Timeout.Duration > 0 {
+		return tu.Spec.Rollback.Timeout.Duration
+	}
+	return defaultRollbackTimeout
+}
 
-	prevTag := tu.Status.PreviousTag
-	if prevTag == "" || prevTag == badTag {
-		log.Info("no previous tag to roll back to, skipping rollback", "badTag", badTag, "previousTag", prevTag)
+// observationDeadlineExceeded reports whether ArgoCD has had long enough to pick
+// up WatchingCommit. A watch armed before WatchingArmedAt existed has no arm
+// time recorded; treat that as not-yet-exceeded so an upgrade never rolls back
+// or abandons a watch purely because the field was absent.
+func (r *TagUpdaterReconciler) observationDeadlineExceeded(tu *v1alpha1.TagUpdater) bool {
+	if tu.Status.WatchingArmedAt == nil {
+		return false
+	}
+	return time.Since(tu.Status.WatchingArmedAt.Time) >= rollbackTimeout(tu)
+}
+
+// abandonWatch releases a watch ArgoCD never picked up, so tag updates resume.
+//
+// It deliberately does NOT roll back. Never being observed means the commit was
+// never deployed, so there is no failed rollout to revert — the fault is in the
+// delivery path (missing app, bad credentials, wrong branch), and rewriting git
+// would churn the manifest without addressing it. The tag therefore stays in
+// place and is NOT added to SkippedTags; it gets another chance once ArgoCD is
+// working again. The failure is surfaced loudly instead.
+func (r *TagUpdaterReconciler) abandonWatch(ctx context.Context, tu *v1alpha1.TagUpdater) error {
+	observer := revisionObserver(tu)
+	message := fmt.Sprintf(
+		"ArgoCD application %s did not report commit %s within %s; abandoning health watch for tag %s so tag updates resume (check the application exists, its repo credentials, and that it tracks branch %s)",
+		observer.Name, tu.Status.WatchingCommit, rollbackTimeout(tu), tu.Status.WatchingTag, tu.Spec.WriteBack.Branch)
+	tu.Status.WatchingTag = ""
+	tu.Status.WatchingCommit = ""
+	tu.Status.WatchingArmedAt = nil
+	tu.Status.WatchingSince = nil
+	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "CommitNeverObserved", Message: message})
+	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "CommitNeverObserved", Message: message})
+	if r.Recorder != nil {
+		r.Recorder.Event(tu, corev1.EventTypeWarning, "CommitNeverObserved", message)
+	}
+	return r.Status().Update(ctx, tu)
+}
+
+func revisionObserver(tu *v1alpha1.TagUpdater) *v1alpha1.ArgoCDAppRef {
+	if tu.Spec.ManagingApp != nil {
+		return tu.Spec.ManagingApp
+	}
+	return tu.Spec.ArgoCDApp
+}
+
+func (r *TagUpdaterReconciler) rollbackWithStatus(ctx context.Context, tu *v1alpha1.TagUpdater) error {
+	if err := r.doRollback(ctx, tu); err != nil {
+		message := err.Error()
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "RollbackWriteFailed", Message: message})
+		_ = r.Status().Update(ctx, tu)
+		if r.Recorder != nil {
+			r.Recorder.Event(tu, corev1.EventTypeWarning, "RollbackWriteFailed", message)
+		}
+		return err
+	}
+	return nil
+}
+
+type argoCDState struct {
+	Revision  string
+	Revisions []string
+	Health    string
+	Operation string
+}
+
+func (s argoCDState) observes(commit string) bool {
+	if commit != "" && s.Revision == commit {
+		return true
+	}
+	for _, revision := range s.Revisions {
+		if revision == commit && commit != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s argoCDState) syncInFlight() bool {
+	return s.Operation == "Running" || s.Operation == "Terminating"
+}
+
+func (r *TagUpdaterReconciler) argoCDAppState(ctx context.Context, ref *v1alpha1.ArgoCDAppRef) (argoCDState, error) {
+	if ref == nil || r.Dynamic == nil {
+		return argoCDState{}, fmt.Errorf("rollback requires spec.argoCDApp and a dynamic client")
+	}
+	namespace := ref.Namespace
+	if namespace == "" {
+		namespace = "argocd"
+	}
+	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+	obj, err := r.Dynamic.Resource(gvr).Namespace(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		return argoCDState{}, fmt.Errorf("get application %s/%s: %w", namespace, ref.Name, err)
+	}
+	state := argoCDState{}
+	state.Revision, _, _ = unstructured.NestedString(obj.Object, "status", "sync", "revision")
+	state.Revisions, _, _ = unstructured.NestedStringSlice(obj.Object, "status", "sync", "revisions")
+	state.Health, _, _ = unstructured.NestedString(obj.Object, "status", "health", "status")
+	state.Operation, _, _ = unstructured.NestedString(obj.Object, "status", "operationState", "phase")
+	return state, nil
+}
+
+func (r *TagUpdaterReconciler) doRollback(ctx context.Context, tu *v1alpha1.TagUpdater) error {
+	badTag, previousTag := tu.Status.WatchingTag, tu.Status.PreviousTag
+	if previousTag == "" || previousTag == badTag {
 		tu.Status.WatchingTag = ""
+		tu.Status.WatchingCommit = ""
+		tu.Status.WatchingArmedAt = nil
 		tu.Status.WatchingSince = nil
 		tu.Status.SkippedTags = appendUnique(tu.Status.SkippedTags, badTag)
+		message := fmt.Sprintf("tag %s failed but no previous tag is available to write back", badTag)
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "RollbackUnavailable", Message: message})
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "NoPreviousTag", Message: message})
 		return r.Status().Update(ctx, tu)
 	}
-
-	log.Info("rolling back to previous tag", "badTag", badTag, "previousTag", prevTag)
-
 	m, err := matcher.New(tu.Spec.Source.TagPattern)
 	if err != nil {
 		return err
 	}
-
-	match, ok := m.Latest([]string{prevTag})
+	previous, ok := m.Latest([]string{previousTag})
 	if !ok {
-		log.Info("previous tag does not match pattern, cannot roll back", "previousTag", prevTag)
-		tu.Status.WatchingTag = ""
-		tu.Status.WatchingSince = nil
-		tu.Status.SkippedTags = appendUnique(tu.Status.SkippedTags, badTag)
-		return r.Status().Update(ctx, tu)
+		return fmt.Errorf("previous tag %s no longer matches spec.source.tagPattern", previousTag)
 	}
-
-	data := match.Captures
-	data["tag"] = match.Tag
-	for k, v := range parseRepo(tu.Spec.Source.Repo) {
-		data[k] = v
+	data := previous.Captures
+	data["tag"] = previous.Tag
+	for key, value := range parseRepo(tu.Spec.Source.Repo) {
+		data[key] = value
 	}
-
-	// Re-resolve the previous tag's immutable sha so a `{{ .rev }}` template
-	// reverts to a valid pinned ref instead of an empty one. Fail-closed: if the
-	// rev cannot be resolved, abort the rollback rather than patch an impure ref.
-	if src, serr := sourceFor(tu.Spec.Source, ""); serr == nil {
-		if err := r.addRev(ctx, src, prevTag, data); err != nil {
-			log.Error(err, "cannot resolve previous tag to sha; skipping rollback patch", "previousTag", prevTag)
-			return err
+	src, err := sourceFor(tu.Spec.Source, "")
+	if err != nil {
+		return err
+	}
+	if resolver, ok := src.(intsource.TagResolver); ok {
+		if extra, resolveErr := resolver.Resolve(ctx); resolveErr == nil {
+			for key, value := range extra {
+				data[key] = value
+			}
 		}
 	}
-
-	p := patcher.Patcher{Client: r.Dynamic, Mapper: r.Mapper}
-	for _, target := range tu.Spec.Targets {
-		patches := make([]patcher.Patch, len(target.Patches))
-		for i, patch := range target.Patches {
-			patches[i] = patcher.Patch{Field: patch.Field, Template: patch.Template}
-		}
-		_, changed, err := p.ApplyAll(ctx, patcher.Target{
-			APIVersion: target.APIVersion,
-			Kind:       target.Kind,
-			Name:       target.Name,
-			Namespace:  target.Namespace,
-		}, patches, data)
-		if err != nil {
-			log.Error(err, "rollback patch failed", "kind", target.Kind)
-			continue
-		}
-		if len(changed) > 0 {
-			log.Info("rolled back", "kind", target.Kind, "names", changed, "tag", prevTag)
-		}
+	if err := r.addRev(ctx, src, previousTag, data); err != nil {
+		return err
 	}
-
-	if tu.Spec.ArgoCDApp != nil {
-		if err := r.triggerArgoCDSync(ctx, tu.Spec.ArgoCDApp); err != nil {
-			log.Error(err, "failed to trigger ArgoCD sync after rollback")
-		}
+	credentials, err := r.resolveWriteBackCredentials(ctx, tu)
+	if err != nil {
+		return err
 	}
-
+	result, err := (writeback.Writer{Spec: tu.Spec.WriteBack, Credentials: credentials, Targets: tu.Spec.Targets, Data: data}).Apply(ctx)
+	if err != nil {
+		return err
+	}
 	now := metav1.Now()
-	tu.Status.LastTag = prevTag
+	tu.Status.LastTag = previousTag
 	tu.Status.LastUpdated = &now
+	tu.Status.LastWriteCommit = result.CommitSHA
 	tu.Status.WatchingTag = ""
+	tu.Status.WatchingCommit = ""
+	tu.Status.WatchingArmedAt = nil
 	tu.Status.WatchingSince = nil
 	tu.Status.SkippedTags = appendUnique(tu.Status.SkippedTags, badTag)
-	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
-		Type:    "Ready",
-		Status:  metav1.ConditionFalse,
-		Reason:  "RolledBack",
-		Message: fmt.Sprintf("tag %s failed, reverted to %s", badTag, prevTag),
-	})
+	message := fmt.Sprintf("tag %s failed; wrote previous tag %s to git", badTag, previousTag)
+	if !result.Committed {
+		message += " (manifest was already rolled back; no commit created)"
+	}
+	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "RolledBack", Message: message})
+	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionTrue, Reason: "RollbackWritten", Message: message})
+	if r.Recorder != nil {
+		r.Recorder.Event(tu, corev1.EventTypeWarning, "RolledBack", message)
+	}
 	return r.Status().Update(ctx, tu)
 }
 
-// argoCDAppHealth returns the ArgoCD Application health.status and a description
-// of any degraded reason (for logging). Returns ("", "", err) on read failure.
-func (r *TagUpdaterReconciler) argoCDAppHealth(ctx context.Context, ref *v1alpha1.ArgoCDAppRef) (string, string, error) {
-	ns := ref.Namespace
-	if ns == "" {
-		ns = "argocd"
+func filterSkipped(tags, skipped []string) []string {
+	if len(skipped) == 0 {
+		return tags
 	}
-	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
-	obj, err := r.Dynamic.Resource(gvr).Namespace(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-	if err != nil {
-		return "", "", fmt.Errorf("get application %s/%s: %w", ns, ref.Name, err)
+	set := make(map[string]struct{}, len(skipped))
+	for _, tag := range skipped {
+		set[tag] = struct{}{}
 	}
-
-	health, _, _ := unstructured.NestedString(obj.Object, "status", "health", "status")
-	opMsg, _, _ := unstructured.NestedString(obj.Object, "status", "operationState", "message")
-
-	// Treat ProgressDeadlineExceeded in the operation message as Degraded.
-	if health != "Degraded" && strings.Contains(opMsg, "ProgressDeadlineExceeded") {
-		health = "Degraded"
+	filtered := tags[:0:0]
+	for _, tag := range tags {
+		if _, found := set[tag]; !found {
+			filtered = append(filtered, tag)
+		}
 	}
-
-	return health, opMsg, nil
+	return filtered
 }
 
-// addRev enriches the template data with `rev` — the immutable full commit sha
-// of tag — when the source implements TagRevResolver (the git source). It is
-// fail-closed: for a git source, a resolver fault or an absent sha returns an
-// error so the caller aborts the update rather than rendering an impure
-// tag-only (or empty `?rev=`) flakeRef. A source that cannot resolve revs at
-// all (the nix source) is not a TagRevResolver and returns nil unchanged.
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func validateWriteBack(spec v1alpha1.WriteBackSpec) error {
+	var missing []string
+	if strings.TrimSpace(spec.Repo) == "" {
+		missing = append(missing, "repo")
+	}
+	if strings.TrimSpace(spec.Branch) == "" {
+		missing = append(missing, "branch")
+	}
+	if strings.TrimSpace(spec.Path) == "" {
+		missing = append(missing, "path")
+	}
+	if strings.TrimSpace(spec.CredentialsSecretRef.Name) == "" {
+		missing = append(missing, "credentialsSecretRef.name")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("spec.writeBack is required with non-empty repo, branch, path, and credentialsSecretRef.name; add missing field(s): %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func (r *TagUpdaterReconciler) resolveWriteBackCredentials(ctx context.Context, tu *v1alpha1.TagUpdater) (writeback.Credentials, error) {
+	ref := tu.Spec.WriteBack.CredentialsSecretRef
+	var secret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: tu.Namespace, Name: ref.Name}, &secret); err != nil {
+		return writeback.Credentials{}, fmt.Errorf("get write-back credentials secret %s/%s: %w", tu.Namespace, ref.Name, err)
+	}
+	credentials := writeback.Credentials{
+		Token: string(secret.Data["token"]), Username: string(secret.Data["username"]),
+		Password: string(secret.Data["password"]), SSHPrivateKey: secret.Data["sshPrivateKey"],
+		KnownHosts:            secret.Data["knownHosts"],
+		InsecureIgnoreHostKey: strings.EqualFold(strings.TrimSpace(string(secret.Data["insecureIgnoreHostKey"])), "true"),
+	}
+	if credentials.Token == "" && len(credentials.SSHPrivateKey) == 0 && (credentials.Username == "" || credentials.Password == "") {
+		return writeback.Credentials{}, fmt.Errorf("write-back credentials secret %s/%s must contain token, sshPrivateKey, or both username and password", tu.Namespace, ref.Name)
+	}
+	return credentials, nil
+}
+
+func (r *TagUpdaterReconciler) markReconcileSucceeded(ctx context.Context, tu *v1alpha1.TagUpdater, key string) {
+	r.progress.success(key, time.Now())
+	if meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(key)) {
+		if err := r.Status().Update(ctx, tu); err != nil {
+			log.FromContext(ctx).Error(err, "failed to update Stalled condition")
+		}
+	}
+}
+
+func (r *TagUpdaterReconciler) stalledCondition(key string) metav1.Condition {
+	if r.progress.isStale(key, time.Now()) {
+		return metav1.Condition{Type: "Stalled", Status: metav1.ConditionTrue, Reason: "ReconcileStale", Message: "no successful reconcile within the staleness window; deploys for this updater may be frozen"}
+	}
+	return metav1.Condition{Type: "Stalled", Status: metav1.ConditionFalse, Reason: "Progressing", Message: "reconciles are completing within the staleness window"}
+}
+
 func (r *TagUpdaterReconciler) addRev(ctx context.Context, src intsource.Source, tag string, data map[string]string) error {
 	resolver, ok := src.(intsource.TagRevResolver)
 	if !ok {
@@ -572,12 +552,6 @@ func (r *TagUpdaterReconciler) addRev(ctx context.Context, src intsource.Source,
 	return nil
 }
 
-// RevResolutionHealthz reports unhealthy once a git source has been reconciled
-// but tag->rev resolution has not succeeded within revStaleAfter. Wired as a
-// liveness check so a sustained resolver outage — the class of failure that
-// silently pinned every target at a stale tag — restarts the pod and, under
-// leader election, hands off to a replica that can reach the git remote. Inert
-// until the first git-source reconcile so nix-only deployments never trip it.
 func (r *TagUpdaterReconciler) RevResolutionHealthz() healthz.Checker {
 	return func(*http.Request) error {
 		if !r.revAttempted.Load() {
@@ -594,155 +568,32 @@ func (r *TagUpdaterReconciler) RevResolutionHealthz() healthz.Checker {
 	}
 }
 
-// filterSkipped removes any tags that appear in the skipped list.
-func filterSkipped(tags []string, skipped []string) []string {
-	if len(skipped) == 0 {
-		return tags
-	}
-	skip := make(map[string]struct{}, len(skipped))
-	for _, s := range skipped {
-		skip[s] = struct{}{}
-	}
-	out := tags[:0:0]
-	for _, t := range tags {
-		if _, bad := skip[t]; !bad {
-			out = append(out, t)
-		}
-	}
-	return out
-}
-
-func appendUnique(slice []string, s string) []string {
-	for _, v := range slice {
-		if v == s {
-			return slice
-		}
-	}
-	return append(slice, s)
-}
-
 func (r *TagUpdaterReconciler) setFailed(ctx context.Context, tu *v1alpha1.TagUpdater, cause error) error {
-	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
-		Type:    "Ready",
-		Status:  metav1.ConditionFalse,
-		Reason:  "Error",
-		Message: cause.Error(),
-	})
-	// Also surface reconcile-progress staleness on the CR itself: sustained
-	// failures flip Stalled=True so `kubectl get tagupdater -o yaml` shows the
-	// silent-freeze state, not just the latest error.
+	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "Error", Message: cause.Error()})
 	meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(client.ObjectKeyFromObject(tu).String()))
 	_ = r.Status().Update(ctx, tu)
 	return cause
 }
 
-// isPermanentPatchError reports whether a patch failure is deterministic and
-// cannot be fixed by retrying: a structural field-path fault (patcher.PathError
-// — bad index, unmatched name selector, type mismatch) or the API server
-// rejecting the patch as Invalid/BadRequest (422/400). Transient faults
-// (network, conflict, 5xx, not-found) return false and keep the error backoff.
-func isPermanentPatchError(err error) bool {
-	var pe *patcher.PathError
-	if errors.As(err, &pe) {
-		return true
-	}
-	return apierrors.IsInvalid(err) || apierrors.IsBadRequest(err)
-}
-
-// setConfigError marks the CR as failing on a permanent misconfiguration:
-// Ready=False/ConfigError plus a distinct ConfigError=True condition, so
-// `kubectl get tagupdater -o yaml` names the misconfigured path. Stalled is
-// refreshed too. The caller returns a nil error (slow-interval requeue, no
-// backoff); the ConfigError condition is cleared on the next successful
-// reconcile (see markReconcileSucceeded).
-func (r *TagUpdaterReconciler) setConfigError(ctx context.Context, tu *v1alpha1.TagUpdater, cause error) {
-	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
-		Type:    "Ready",
-		Status:  metav1.ConditionFalse,
-		Reason:  "ConfigError",
-		Message: cause.Error(),
-	})
-	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
-		Type:    "ConfigError",
-		Status:  metav1.ConditionTrue,
-		Reason:  "InvalidPatchPath",
-		Message: cause.Error(),
-	})
-	meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(client.ObjectKeyFromObject(tu).String()))
-	_ = r.Status().Update(ctx, tu)
-}
-
-func (r *TagUpdaterReconciler) ensureRespectIgnoreDifferences(ctx context.Context, ref *v1alpha1.ArgoCDAppRef) error {
-	ns := ref.Namespace
-	if ns == "" {
-		ns = "argocd"
-	}
-	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
-	obj, err := r.Dynamic.Resource(gvr).Namespace(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("get application %s/%s: %w", ns, ref.Name, err)
-	}
-	opts, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "syncPolicy", "syncOptions")
-	const opt = "RespectIgnoreDifferences=true"
-	for _, o := range opts {
-		if o == opt {
-			return nil
-		}
-	}
-	modified := obj.DeepCopy()
-	opts = append(opts, opt)
-	if err := unstructured.SetNestedStringSlice(modified.Object, opts, "spec", "syncPolicy", "syncOptions"); err != nil {
-		return fmt.Errorf("set syncOptions: %w", err)
-	}
-	_, err = r.Dynamic.Resource(gvr).Namespace(ns).Update(ctx, modified, metav1.UpdateOptions{})
-	return err
-}
-
-func (r *TagUpdaterReconciler) triggerArgoCDSync(ctx context.Context, ref *v1alpha1.ArgoCDAppRef) error {
-	ns := ref.Namespace
-	if ns == "" {
-		ns = "argocd"
-	}
-	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
-	obj, err := r.Dynamic.Resource(gvr).Namespace(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("get application %s/%s: %w", ns, ref.Name, err)
-	}
-	patch := obj.DeepCopy()
-	if err := unstructured.SetNestedMap(patch.Object, map[string]any{
-		"initiatedBy": map[string]any{"username": "argocd-tag-updater"},
-		"sync":        map[string]any{},
-	}, "operation"); err != nil {
-		return fmt.Errorf("set operation: %w", err)
-	}
-	_, err = r.Dynamic.Resource(gvr).Namespace(ns).Update(ctx, patch, metav1.UpdateOptions{})
-	return err
-}
-
 func parseRepo(raw string) map[string]string {
 	out := map[string]string{"repoURL": raw}
 	raw = strings.TrimSuffix(raw, ".git")
-
 	if strings.HasPrefix(raw, "git@") {
 		raw = strings.TrimPrefix(raw, "git@")
-		host, path, ok := strings.Cut(raw, ":")
-		if ok {
+		if host, path, ok := strings.Cut(raw, ":"); ok {
 			out["host"] = host
 			setOwnerRepo(out, path)
 		}
 		return out
 	}
-
 	if i := strings.Index(raw, ":"); i > 0 && !strings.Contains(raw[:i], "/") {
 		out["host"] = raw[:i] + ".com"
 		setOwnerRepo(out, raw[i+1:])
 		return out
 	}
-
 	if strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "http://") {
 		raw = strings.SplitN(raw, "://", 2)[1]
-		slash := strings.Index(raw, "/")
-		if slash > 0 {
+		if slash := strings.Index(raw, "/"); slash > 0 {
 			out["host"] = raw[:slash]
 			setOwnerRepo(out, raw[slash+1:])
 		}
@@ -751,10 +602,8 @@ func parseRepo(raw string) map[string]string {
 }
 
 func setOwnerRepo(out map[string]string, path string) {
-	owner, repo, ok := strings.Cut(path, "/")
-	if ok {
-		out["owner"] = owner
-		out["repo"] = repo
+	if owner, repo, ok := strings.Cut(path, "/"); ok {
+		out["owner"], out["repo"] = owner, repo
 	}
 }
 
@@ -762,36 +611,28 @@ func sourceFor(spec v1alpha1.SourceSpec, ociBasicAuth string) (intsource.Source,
 	switch spec.Type {
 	case v1alpha1.SourceTypeGit:
 		return &intsource.Git{
-			Repo:       spec.Repo,
-			SSHKeyFile: os.Getenv("GIT_SSH_KEY_FILE"),
-			Token:      os.Getenv("GIT_TOKEN"),
+			Repo: spec.Repo, SSHKeyFile: os.Getenv("GIT_SSH_KEY_FILE"), Token: os.Getenv("GIT_TOKEN"),
+			KnownHostsFile:        os.Getenv("GIT_KNOWN_HOSTS_FILE"),
+			InsecureIgnoreHostKey: strings.EqualFold(os.Getenv("GIT_INSECURE_IGNORE_HOST_KEY"), "true"),
 		}, nil
 	case v1alpha1.SourceTypeOCI:
 		return &intsource.OCI{Repo: spec.Repo, BasicAuth: ociBasicAuth}, nil
 	case v1alpha1.SourceTypeNix:
-		return &intsource.Nix{
-			Repo:  spec.Repo,
-			Token: os.Getenv("NIX_CACHE_TOKEN"),
-		}, nil
+		return &intsource.Nix{Repo: spec.Repo, Token: os.Getenv("NIX_CACHE_TOKEN")}, nil
 	default:
 		return nil, fmt.Errorf("unknown source type %q", spec.Type)
 	}
 }
 
-// resolveDockerAuth reads a kubernetes.io/dockerconfigjson Secret and returns
-// the base64-encoded "user:pass" auth string for the registry host derived from
-// repo. Returns an error if the secret is missing or contains no matching entry.
-func (r *TagUpdaterReconciler) resolveDockerAuth(ctx context.Context, ns, secretName, repo string) (string, error) {
+func (r *TagUpdaterReconciler) resolveDockerAuth(ctx context.Context, namespace, secretName, repo string) (string, error) {
 	var secret corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: secretName}, &secret); err != nil {
-		return "", fmt.Errorf("get secret %s/%s: %w", ns, secretName, err)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: secretName}, &secret); err != nil {
+		return "", fmt.Errorf("get secret %s/%s: %w", namespace, secretName, err)
 	}
-
 	raw, ok := secret.Data[".dockerconfigjson"]
 	if !ok {
-		return "", fmt.Errorf("secret %s/%s missing .dockerconfigjson key", ns, secretName)
+		return "", fmt.Errorf("secret %s/%s missing .dockerconfigjson key", namespace, secretName)
 	}
-
 	var cfg struct {
 		Auths map[string]struct {
 			Auth     string `json:"auth"`
@@ -800,13 +641,10 @@ func (r *TagUpdaterReconciler) resolveDockerAuth(ctx context.Context, ns, secret
 		} `json:"auths"`
 	}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return "", fmt.Errorf("parse dockerconfigjson in %s/%s: %w", ns, secretName, err)
+		return "", fmt.Errorf("parse dockerconfigjson in %s/%s: %w", namespace, secretName, err)
 	}
-
-	// Strip scheme prefix and extract the registry host from repo.
 	ref := strings.TrimPrefix(strings.TrimPrefix(repo, "https://"), "http://")
 	host, _, _ := strings.Cut(ref, "/")
-
 	for registryHost, entry := range cfg.Auths {
 		if registryHost != host {
 			continue
@@ -818,93 +656,12 @@ func (r *TagUpdaterReconciler) resolveDockerAuth(ctx context.Context, ns, secret
 			return base64.StdEncoding.EncodeToString([]byte(entry.Username + ":" + entry.Password)), nil
 		}
 	}
-	return "", fmt.Errorf("no auth entry for host %q in secret %s/%s", host, ns, secretName)
+	return "", fmt.Errorf("no auth entry for host %q in secret %s/%s", host, namespace, secretName)
 }
 
 func (r *TagUpdaterReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.Cache = mgr.GetCache()
 	r.progress.multiplier = r.StaleMultiplier
 	r.progress.floor = r.StaleFloor
 	metrics.Registry.MustRegister(progressCollector{tracker: &r.progress})
-	c, err := ctrl.NewControllerManagedBy(mgr).
-		For(&v1alpha1.TagUpdater{}).
-		Build(r)
-	if err != nil {
-		return err
-	}
-	r.ctrl = c
-	return nil
-}
-
-func parseGVK(apiVersion, kind string) schema.GroupVersionKind {
-	gv, _ := schema.ParseGroupVersion(apiVersion)
-	return gv.WithKind(kind)
-}
-
-func (r *TagUpdaterReconciler) ensureWatches(ctx context.Context, tu *v1alpha1.TagUpdater) {
-	log := log.FromContext(ctx)
-	for _, target := range tu.Spec.Targets {
-		gvk := parseGVK(target.APIVersion, target.Kind)
-		if _, loaded := r.watchedGVKs.LoadOrStore(gvk, struct{}{}); loaded {
-			continue
-		}
-		log.Info("adding watch", "gvk", gvk)
-		obj := &unstructured.Unstructured{}
-		obj.SetGroupVersionKind(gvk)
-		if err := r.ctrl.Watch(source.Kind(r.Cache, obj,
-			handler.TypedEnqueueRequestsFromMapFunc(r.mapTargetToTagUpdater),
-		)); err != nil {
-			log.Error(err, "failed to add watch", "gvk", gvk)
-			// remove from map so next reconcile retries
-			r.watchedGVKs.Delete(gvk)
-		}
-	}
-}
-
-func (r *TagUpdaterReconciler) mapTargetToTagUpdater(ctx context.Context, obj *unstructured.Unstructured) []reconcile.Request {
-	var tuList v1alpha1.TagUpdaterList
-	if err := r.List(ctx, &tuList); err != nil {
-		return nil
-	}
-
-	objGVK := obj.GroupVersionKind()
-	seen := map[types.NamespacedName]struct{}{}
-	var requests []reconcile.Request
-
-	for _, tu := range tuList.Items {
-		for _, target := range tu.Spec.Targets {
-			gvk := parseGVK(target.APIVersion, target.Kind)
-			if gvk != objGVK {
-				continue
-			}
-
-			matched := false
-			if target.Name != "" {
-				ns := target.Namespace
-				if ns == "" {
-					ns = obj.GetNamespace()
-				}
-				matched = target.Name == obj.GetName() && ns == obj.GetNamespace()
-			} else if target.Selector != nil {
-				sel, err := metav1.LabelSelectorAsSelector(target.Selector)
-				if err != nil {
-					continue
-				}
-				matched = sel.Matches(labels.Set(obj.GetLabels()))
-			} else {
-				// no name or selector — match all objects of this GVK
-				matched = true
-			}
-
-			if matched {
-				key := types.NamespacedName{Namespace: tu.Namespace, Name: tu.Name}
-				if _, ok := seen[key]; !ok {
-					seen[key] = struct{}{}
-					requests = append(requests, reconcile.Request{NamespacedName: key})
-				}
-				break
-			}
-		}
-	}
-	return requests
+	return ctrl.NewControllerManagedBy(mgr).For(&v1alpha1.TagUpdater{}).Complete(r)
 }

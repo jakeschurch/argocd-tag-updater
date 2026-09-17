@@ -60,7 +60,6 @@ func main() {
 	if err != nil {
 		fail("new manager: %v", err)
 	}
-
 	dynClient, err := dynamic.NewForConfig(cfg)
 	if err != nil {
 		fail("dynamic client: %v", err)
@@ -69,7 +68,7 @@ func main() {
 	reconciler := &controller.TagUpdaterReconciler{
 		Client:          mgr.GetClient(),
 		Dynamic:         dynClient,
-		Mapper:          mgr.GetRESTMapper(),
+		Recorder:        mgr.GetEventRecorderFor("argocd-tag-updater"), //nolint:staticcheck // controller currently uses the typed core/v1 recorder API
 		StaleMultiplier: staleMultiplier,
 		StaleFloor:      staleFloor,
 	}
