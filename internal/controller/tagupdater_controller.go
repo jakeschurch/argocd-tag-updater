@@ -141,12 +141,12 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		data[key] = value
 	}
 	if resolver, ok := src.(intsource.TagResolver); ok {
-		if extra, resolveErr := resolver.Resolve(ctx); resolveErr != nil {
-			logger.Info("tag resolver failed; templating with tag captures only", "err", resolveErr)
-		} else {
-			for key, value := range extra {
-				data[key] = value
-			}
+		extra, resolveErr := resolver.Resolve(ctx, latest.Tag)
+		if resolveErr != nil {
+			return ctrl.Result{}, r.setFailed(ctx, &tu, fmt.Errorf("resolve release record for tag %s: %w", latest.Tag, resolveErr))
+		}
+		for key, value := range extra {
+			data[key] = value
 		}
 	}
 	if err := r.addRev(ctx, src, latest.Tag, data); err != nil {
@@ -415,10 +415,12 @@ func (r *TagUpdaterReconciler) doRollback(ctx context.Context, tu *v1alpha1.TagU
 		return err
 	}
 	if resolver, ok := src.(intsource.TagResolver); ok {
-		if extra, resolveErr := resolver.Resolve(ctx); resolveErr == nil {
-			for key, value := range extra {
-				data[key] = value
-			}
+		extra, resolveErr := resolver.Resolve(ctx, previousTag)
+		if resolveErr != nil {
+			return fmt.Errorf("resolve release record for rollback tag %s: %w", previousTag, resolveErr)
+		}
+		for key, value := range extra {
+			data[key] = value
 		}
 	}
 	if err := r.addRev(ctx, src, previousTag, data); err != nil {

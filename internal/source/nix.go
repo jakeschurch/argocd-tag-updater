@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -81,16 +82,16 @@ func (n *Nix) Tags(ctx context.Context) ([]string, error) {
 // store_path is guaranteed pullable — the bootstrap-availability gate is the
 // tag's own precondition.
 type nixTagEntry struct {
+	Tag       string `json:"tag"`
 	StorePath string `json:"store_path"`
 	Root      string `json:"root"`
 	Rev       string `json:"rev"`
 }
 
-// Resolve implements TagResolver. It fetches /v1/tags/<name>/latest and returns
-// the entry's store_path/root/rev as template fields. The cache exposes only
-// /latest (no per-tag GET); for monotonic release tags that equals the matcher's
-// latest. Returns an error (best-effort upstream) on any transport/decode fault.
-func (n *Nix) Resolve(ctx context.Context) (map[string]string, error) {
+// Resolve implements TagResolver. It fetches the record for exactly tag, rather
+// than a moving /latest pointer, so store_path and rev cannot belong to a
+// different release than the matcher selected.
+func (n *Nix) Resolve(ctx context.Context, tag string) (map[string]string, error) {
 	scheme := "https"
 	ref := n.Repo
 	switch {
@@ -108,8 +109,8 @@ func (n *Nix) Resolve(ctx context.Context) (map[string]string, error) {
 	}
 	host = strings.TrimSuffix(host, "/v1/tags")
 
-	url := fmt.Sprintf("%s://%s/v1/tags/%s/latest", scheme, host, name)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	endpoint := fmt.Sprintf("%s://%s/v1/tags/%s/%s", scheme, host, url.PathEscape(name), url.PathEscape(tag))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("nix resolve request: %w", err)
 	}
@@ -130,16 +131,21 @@ func (n *Nix) Resolve(ctx context.Context) (map[string]string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(entry); err != nil {
 		return nil, fmt.Errorf("resolve %s: decode: %w", n.Repo, err)
 	}
-	out := map[string]string{}
-	if entry.StorePath != "" {
-		out["store_path"] = entry.StorePath
+	if entry.Tag != "" && entry.Tag != tag {
+		return nil, fmt.Errorf("release record tag %q does not match requested tag %q", entry.Tag, tag)
 	}
+	if entry.StorePath == "" {
+		return nil, fmt.Errorf("release record for tag %s is missing store_path", tag)
+	}
+	if entry.Rev == "" {
+		return nil, fmt.Errorf("release record for tag %s is missing rev", tag)
+	}
+	out := map[string]string{}
+	out["store_path"] = entry.StorePath
 	if entry.Root != "" {
 		out["root"] = entry.Root
 	}
-	if entry.Rev != "" {
-		out["rev"] = entry.Rev
-	}
+	out["rev"] = entry.Rev
 	return out, nil
 }
 
