@@ -193,3 +193,20 @@ func TestKnownHostsCallbackAcceptsPinnedKey(t *testing.T) {
 		t.Fatalf("pinned host key rejected: %v", err)
 	}
 }
+
+// Write-back commits land on the same branch CI watches, carrying values that
+// came from a build that just finished. Without the skip marker every
+// successful build pushes a commit that triggers the next one — a loop that
+// stayed hidden while the tag stream and the CI trigger sat on different
+// remotes.
+func TestCommitMessageCarriesSkipCIMarker(t *testing.T) {
+	w := Writer{Data: map[string]string{"tag": "nix-csi-go.main.20260918045919.1e8af9"}}
+	msg := w.commitMessage()
+	if !strings.Contains(msg, "[skip-ci]") {
+		t.Fatalf("commit message must carry [skip-ci], got %q", msg)
+	}
+	subject, _, _ := strings.Cut(msg, "\n")
+	if !strings.Contains(subject, "nix-csi-go.main.20260918045919.1e8af9") {
+		t.Fatalf("subject should still name the tag, got %q", subject)
+	}
+}

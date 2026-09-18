@@ -195,7 +195,15 @@ func (w Writer) commitMessage() string {
 		}
 	}
 	sort.Strings(fields)
-	return fmt.Sprintf("chore: update %s via argocd-tag-updater\n\nFields: %s", tag, strings.Join(fields, ", "))
+	// [skip-ci] keeps the write-back from starting a build. The commit lands on
+	// the same branch CI watches, and the values it carries come FROM a build
+	// that just finished — so without the marker each successful build pushes a
+	// commit that triggers the next one. That was harmless only while the tag
+	// stream and the CI trigger lived on different remotes; once both are on
+	// forgejo it is a loop, and every CI sensor here already skips on this
+	// marker.
+	return fmt.Sprintf("chore: update %s via argocd-tag-updater [skip-ci]\n\nFields: %s",
+		tag, strings.Join(fields, ", "))
 }
 
 func hostKeyCallback(data []byte, insecure bool) (gossh.HostKeyCallback, func(), error) {
