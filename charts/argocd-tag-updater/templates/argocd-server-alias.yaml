@@ -1,0 +1,28 @@
+{{/*
+ExternalName alias so the controller can reach the ArgoCD API server at the
+conventional `argocd-server` name regardless of what the ArgoCD release
+actually called its Service (argo-cd-argocd-server, when installed under the
+`argo-cd` release name).
+
+Off by default: in a cluster whose ArgoCD Service is already named
+`argocd-server` this would collide with it.
+*/}}
+{{- if .Values.argocdServerAlias.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.argocdServerAlias.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "argocd-tag-updater.labels" . | nindent 4 }}
+spec:
+  type: ExternalName
+  externalName: {{ required "argocdServerAlias.externalName is required when argocdServerAlias.enabled" .Values.argocdServerAlias.externalName | quote }}
+  ports:
+    {{- range .Values.argocdServerAlias.ports }}
+    - name: {{ .name }}
+      port: {{ .port }}
+      protocol: {{ .protocol | default "TCP" }}
+      targetPort: {{ .targetPort }}
+    {{- end }}
+{{- end }}

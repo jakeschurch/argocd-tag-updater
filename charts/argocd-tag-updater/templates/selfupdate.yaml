@@ -1,0 +1,59 @@
+{{/*
+The controller's own TagUpdater: it watches this repo's tag stream and
+repins the Application's nixMount.flakeRef, so the controller upgrades
+itself. It lives here rather than in the cluster repo so that the CR and
+the chart it patches move together — a patch field renamed in the chart
+and a CR left behind in another repo is how builders[].image went stale
+for months.
+
+Off by default: the CR only makes sense against a real Application, so
+a standalone `helm install` gets the controller without it. The cluster
+turns it on through the Application's valuesObject.
+
+Whoever enables this MUST also remove any copy of the same TagUpdater
+from the Application's other sources in the same commit. Two sources
+rendering one object name fails the sync outright with duplicate
+resources.
+*/}}
+{{- if .Values.selfUpdate.enabled }}
+apiVersion: updater.argocd.io/v1alpha1
+kind: TagUpdater
+metadata:
+  name: {{ include "argocd-tag-updater.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "argocd-tag-updater.labels" . | nindent 4 }}
+spec:
+  argoCDApp:
+    name: {{ .Values.selfUpdate.argoCDAppName | default (include "argocd-tag-updater.fullname" .) }}
+  interval: {{ .Values.selfUpdate.interval }}
+  {{- with .Values.selfUpdate.managingApp }}
+  managingApp:
+    name: {{ .name }}
+    namespace: {{ .namespace }}
+  {{- end }}
+  source:
+    type: git
+    repo: {{ required "selfUpdate.source.repo is required when selfUpdate.enabled" .Values.selfUpdate.source.repo | quote }}
+    tagPattern: {{ .Values.selfUpdate.source.tagPattern | quote }}
+  targets:
+    - apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      name: {{ .Values.selfUpdate.argoCDAppName | default (include "argocd-tag-updater.fullname" .) }}
+      namespace: {{ .Release.Namespace }}
+      patches:
+        # Index 0 is the chart source; the flakeRef it carries is the bundle
+        # the Deployment actually runs from.
+        - field: spec.sources.0.helm.valuesObject.nixMount.flakeRef
+          template: {{ required "selfUpdate.flakeRefTemplate is required when selfUpdate.enabled" .Values.selfUpdate.flakeRefTemplate | quote }}
+  {{- with .Values.selfUpdate.writeBack }}
+  writeBack:
+    repo: {{ required "selfUpdate.writeBack.repo is required" .repo | quote }}
+    branch: {{ required "selfUpdate.writeBack.branch is required" .branch | quote }}
+    path: {{ required "selfUpdate.writeBack.path is required" .path | quote }}
+    {{- with .credentialsSecretRef }}
+    credentialsSecretRef:
+      name: {{ .name }}
+    {{- end }}
+  {{- end }}
+{{- end }}

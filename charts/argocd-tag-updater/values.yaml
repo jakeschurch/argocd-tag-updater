@@ -50,6 +50,53 @@ serviceAccount:
 crd:
   install: true
 
+# The controller's own TagUpdater — watches this repo's tags and repins
+# nixMount.flakeRef on the Application that runs it. Off by default so a
+# standalone `helm install` does not create a CR pointing at an Application
+# that does not exist. Enabling it in a cluster means removing any other copy
+# of this CR from the Application's other sources in the SAME commit: two
+# sources rendering one object name fails the sync with duplicate resources.
+selfUpdate:
+  enabled: false
+  # Application to patch. Defaults to the chart fullname.
+  argoCDAppName: ""
+  interval: 15s
+  managingApp:
+    name: cluster-apps
+    namespace: argocd
+  source:
+    # Tag stream to watch. Must be the remote the controller can actually
+    # reach with its mounted credentials.
+    repo: ""
+    tagPattern: ^argocd-tag-updater\.(?P<branch>[^.]+)\.(?P<n>\d{14})\.(?P<sha>[0-9a-f]{6})$
+  # Rendered with the matched tag's captures ({{ .tag }}, {{ .rev }}, {{ .sha }},
+  # {{ .branch }}) and written to spec.sources.0.helm.valuesObject.nixMount.flakeRef.
+  flakeRefTemplate: ""
+  # Where the patched value is committed so git stays the source of truth.
+  writeBack: {}
+  #  repo: ssh://git@forgejo-ssh.forgejo.svc.cluster.local:22/jake/homelab.git
+  #  branch: v1
+  #  path: vmetal/apps/argocd-tag-updater.yaml
+  #  credentialsSecretRef:
+  #    name: argocd-tag-updater-forgejo-writeback
+
+# ExternalName alias pointing the conventional `argocd-server` name at the
+# Service the ArgoCD release actually created. Off by default: it collides
+# with the real Service in a cluster that already uses that name.
+argocdServerAlias:
+  enabled: false
+  name: argocd-server
+  externalName: ""
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 80
+    - name: https
+      port: 443
+      protocol: TCP
+      targetPort: 443
+
 resources:
   requests:
     cpu: 50m
