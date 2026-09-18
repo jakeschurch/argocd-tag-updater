@@ -8,7 +8,7 @@ rules:
   # Own CRD — watch instances, read/write status.
   - apiGroups: ["updater.argocd.io"]
     resources: ["tagupdaters"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get"]
   - apiGroups: ["updater.argocd.io"]
     resources: ["tagupdaters/status"]
     verbs: ["get", "update", "patch"]
@@ -16,7 +16,7 @@ rules:
   # Source and write-back credential secrets.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch"]
 
   # Rollback health observation (read-only).
   - apiGroups: ["argoproj.io"]

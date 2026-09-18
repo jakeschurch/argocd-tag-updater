@@ -47,6 +47,10 @@ spec:
               value: {{ .Values.sslCertFile | quote }}
             - name: TMPDIR
               value: {{ .Values.nixMount.mountPath | quote }}
+            - name: WATCH_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             {{- if .Values.git.sshKey.enabled }}
             - name: GIT_SSH_KEY_FILE
               value: {{ .Values.git.sshKey.keyFile | quote }}

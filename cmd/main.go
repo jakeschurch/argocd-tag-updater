@@ -6,10 +6,13 @@ import (
 	"os"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/dynamic"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -50,13 +53,23 @@ func main() {
 		fail("get rest config: %v", err)
 	}
 
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+	watchNamespace := os.Getenv("WATCH_NAMESPACE")
+	mgrOptions := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
 		LeaderElectionID:       "argocd-tag-updater.updater.argocd.io",
-	})
+	}
+	if watchNamespace != "" {
+		// Credentials are always namespace-local to a TagUpdater. Restrict the
+		// Secret informer accordingly so the controller never needs to list
+		// Secrets across the cluster.
+		mgrOptions.Cache = cache.Options{ByObject: map[client.Object]cache.ByObject{
+			&corev1.Secret{}: {Namespaces: map[string]cache.Config{watchNamespace: {}}},
+		}}
+	}
+	mgr, err := ctrl.NewManager(cfg, mgrOptions)
 	if err != nil {
 		fail("new manager: %v", err)
 	}
