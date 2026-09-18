@@ -132,19 +132,32 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	src, err := sourceFor(tu.Spec.Source, ociBasicAuth)
 	if err != nil {
-		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
+		return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, err)
 	}
 	tags, err := src.Tags(ctx)
 	if err != nil {
-		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
+		return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, err)
 	}
 	m, err := matcher.New(tu.Spec.Source.TagPattern)
 	if err != nil {
-		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
+		return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, err)
 	}
 	latest, ok := m.Latest(filterSkipped(tags, tu.Status.SkippedTags))
 	if !ok {
+		// Refresh BOTH conditions before returning. This path used to return
+		// with only Stalled touched, so Ready/WriteBackReady kept whatever the
+		// last reconcile that got past here left behind — a source or
+		// write-back error from days or months ago that no longer describes
+		// anything. An updater whose tag stream has gone empty (tags pushed to
+		// a different remote than spec.source.repo, say) then reports a
+		// long-dead failure forever.
+		message := fmt.Sprintf("no tag in %s matched pattern %s", tu.Spec.Source.Repo, tu.Spec.Source.TagPattern)
 		logger.Info("no tags matched pattern", "pattern", tu.Spec.Source.TagPattern)
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "NoMatchingTags", Message: message})
+		setWriteBackNotAttempted(&tu, message)
+		if err := r.Status().Update(ctx, &tu); err != nil {
+			return ctrl.Result{}, err
+		}
 		r.markReconcileSucceeded(ctx, &tu, progressKey)
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
@@ -157,14 +170,14 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if resolver, ok := src.(intsource.TagResolver); ok {
 		extra, resolveErr := resolver.Resolve(ctx, latest.Tag)
 		if resolveErr != nil {
-			return ctrl.Result{}, r.setFailed(ctx, &tu, fmt.Errorf("resolve release record for tag %s: %w", latest.Tag, resolveErr))
+			return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, fmt.Errorf("resolve release record for tag %s: %w", latest.Tag, resolveErr))
 		}
 		for key, value := range extra {
 			data[key] = value
 		}
 	}
 	if err := r.addRev(ctx, src, latest.Tag, data); err != nil {
-		return ctrl.Result{}, r.setFailed(ctx, &tu, err)
+		return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, err)
 	}
 
 	var writeResult writeback.Result
@@ -624,6 +637,31 @@ func (r *TagUpdaterReconciler) RevResolutionHealthz() healthz.Checker {
 		}
 		return nil
 	}
+}
+
+// setWriteBackNotAttempted records that this reconcile ended before the
+// write-back leg ran, so WriteBackReady describes THIS pass instead of
+// silently retaining the verdict of the last pass that reached the writer.
+// Unknown (not False) is the honest status: nothing was tried, so nothing
+// failed.
+func setWriteBackNotAttempted(tu *v1alpha1.TagUpdater, cause string) {
+	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{
+		Type:    "WriteBackReady",
+		Status:  metav1.ConditionUnknown,
+		Reason:  "NotAttempted",
+		Message: "write-back not attempted this reconcile: " + cause,
+	})
+}
+
+// setFailedBeforeWriteBack is setFailed for the error paths that abort ahead of
+// the write-back leg (source construction, tag listing, pattern compilation,
+// release-record resolution, tag->rev resolution). Those must clear
+// WriteBackReady too; setFailed alone touches only Ready, which is how a CR can
+// sit at Ready=False/Error while WriteBackReady still reports a stale failure
+// from a spec or credential that was fixed long ago.
+func (r *TagUpdaterReconciler) setFailedBeforeWriteBack(ctx context.Context, tu *v1alpha1.TagUpdater, cause error) error {
+	setWriteBackNotAttempted(tu, cause.Error())
+	return r.setFailed(ctx, tu, cause)
 }
 
 func (r *TagUpdaterReconciler) setFailed(ctx context.Context, tu *v1alpha1.TagUpdater, cause error) error {

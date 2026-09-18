@@ -119,13 +119,19 @@ func (n *Nix) Resolve(ctx context.Context, tag string) (map[string]string, error
 		req.Header.Set("Authorization", "Bearer "+n.Token)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	// Same bounded client as Tags: http.DefaultClient has no timeout, so a
+	// hung nix-cache would pin a reconcile worker until ctx expiry.
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", n.Repo, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("resolve %s: status %d", n.Repo, resp.StatusCode)
+		// Report the endpoint actually fetched, not just n.Repo: a 404 here is
+		// either "the cache has no release record for this tag" or "this cache
+		// build does not serve per-tag records at all", and the two are
+		// indistinguishable without the full path.
+		return nil, fmt.Errorf("resolve %s: status %d", endpoint, resp.StatusCode)
 	}
 
 	entry := new(nixTagEntry)
