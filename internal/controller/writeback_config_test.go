@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	v1alpha1 "github.com/jakeschurch/argocd-tag-updater/api/v1alpha1"
 )
 
@@ -70,5 +72,32 @@ func TestWriteBackCurrentRequiresTagAndRemoteHead(t *testing.T) {
 	}
 	if writeBackCurrent("v3", status, "abc") || writeBackCurrent("v2", status, "def") {
 		t.Fatal("stale tag or remote head was treated as current")
+	}
+}
+
+func TestValidateFieldOwnershipRejectsDuplicateWriter(t *testing.T) {
+	updaters := []v1alpha1.TagUpdater{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "argocd", Name: "first"}, Spec: ownershipSpec("apps/foundry.yaml", "spec.sources.0.helm.valuesObject.nixMount.storePath")},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "argocd", Name: "second"}, Spec: ownershipSpec("apps/foundry.yaml", "spec.sources.0.helm.valuesObject.nixMount.storePath")},
+	}
+	if err := validateFieldOwnership(updaters); err == nil || !strings.Contains(err.Error(), "both argocd/first and argocd/second") {
+		t.Fatalf("duplicate writer was accepted: %v", err)
+	}
+}
+
+func TestValidateFieldOwnershipAllowsSeparateFields(t *testing.T) {
+	updaters := []v1alpha1.TagUpdater{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "argocd", Name: "store-path"}, Spec: ownershipSpec("apps/foundry.yaml", "spec.sources.0.helm.valuesObject.nixMount.storePath")},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "argocd", Name: "flake-ref"}, Spec: ownershipSpec("apps/foundry.yaml", "spec.sources.0.helm.valuesObject.nixMount.flakeRef")},
+	}
+	if err := validateFieldOwnership(updaters); err != nil {
+		t.Fatalf("separate fields rejected: %v", err)
+	}
+}
+
+func ownershipSpec(path, field string) v1alpha1.TagUpdaterSpec {
+	return v1alpha1.TagUpdaterSpec{
+		WriteBack: v1alpha1.WriteBackSpec{Repo: "git@example.com:org/manifests.git", Branch: "main", Path: path},
+		Targets:   []v1alpha1.TargetSpec{{APIVersion: "argoproj.io/v1alpha1", Kind: "Application", Name: "foundry", Namespace: "argocd", Patches: []v1alpha1.PatchSpec{{Field: field}}}},
 	}
 }

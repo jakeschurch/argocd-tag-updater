@@ -106,6 +106,20 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		logger.Error(err, "required git write-back configuration is missing")
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
+	var updaters v1alpha1.TagUpdaterList
+	if err := r.List(ctx, &updaters); err != nil {
+		return ctrl.Result{}, fmt.Errorf("list TagUpdaters to validate field ownership: %w", err)
+	}
+	if err := validateFieldOwnership(updaters.Items); err != nil {
+		message := err.Error()
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "WriteBackReady", Status: metav1.ConditionFalse, Reason: "ConflictingFieldOwner", Message: message})
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "ConflictingFieldOwner", Message: message})
+		_ = r.Status().Update(ctx, &tu)
+		if r.Recorder != nil {
+			r.Recorder.Event(&tu, corev1.EventTypeWarning, "ConflictingFieldOwner", message)
+		}
+		return ctrl.Result{RequeueAfter: interval}, nil
+	}
 
 	var ociBasicAuth string
 	if tu.Spec.Source.Type == v1alpha1.SourceTypeOCI && tu.Spec.Source.ImagePullSecretRef != nil {
@@ -494,6 +508,34 @@ func validateWriteBack(spec v1alpha1.WriteBackSpec) error {
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("spec.writeBack is required with non-empty repo, branch, and path; add missing field(s): %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// validateFieldOwnership ensures one updater is the sole writer for a scalar
+// in a manifest. Separate updaters advancing a store path, flake ref, or image
+// field independently can produce a mixed release, even if each individual git
+// commit is valid.
+func validateFieldOwnership(updaters []v1alpha1.TagUpdater) error {
+	owners := make(map[string]string)
+	for _, updater := range updaters {
+		for _, target := range updater.Spec.Targets {
+			selector, err := json.Marshal(target.Selector)
+			if err != nil {
+				return fmt.Errorf("serialize selector for %s/%s: %w", updater.Namespace, updater.Name, err)
+			}
+			for _, patch := range target.Patches {
+				key := strings.Join([]string{
+					updater.Spec.WriteBack.Repo, updater.Spec.WriteBack.Branch, updater.Spec.WriteBack.Path,
+					target.APIVersion, target.Kind, target.Namespace, target.Name, string(selector), patch.Field,
+				}, "\x00")
+				owner := updater.Namespace + "/" + updater.Name
+				if previous, exists := owners[key]; exists && previous != owner {
+					return fmt.Errorf("manifest field %s on %s/%s is owned by both %s and %s; consolidate it into one TagUpdater", patch.Field, target.Kind, target.Name, previous, owner)
+				}
+				owners[key] = owner
+			}
+		}
 	}
 	return nil
 }
