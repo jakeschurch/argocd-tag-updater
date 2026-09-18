@@ -45,6 +45,8 @@ spec:
           env:
             - name: SSL_CERT_FILE
               value: {{ .Values.sslCertFile | quote }}
+            - name: TMPDIR
+              value: {{ .Values.nixMount.mountPath | quote }}
             {{- if .Values.git.sshKey.enabled }}
             - name: GIT_SSH_KEY_FILE
               value: {{ .Values.git.sshKey.keyFile | quote }}
