@@ -42,6 +42,10 @@ spec:
             - --leader-elect={{ .Values.leaderElect }}
             - --metrics-addr=:{{ .Values.ports.metrics }}
             - --probe-addr=:{{ .Values.ports.probe }}
+            # Existing TagUpdater status can predate a controller rollout by
+            # months. Leave enough time for a newly elected leader to heal
+            # those records before stale-progress liveness can restart it.
+            - --reconcile-stale-floor=24h
           env:
             - name: SSL_CERT_FILE
               value: {{ .Values.sslCertFile | quote }}
