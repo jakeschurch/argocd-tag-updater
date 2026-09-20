@@ -258,7 +258,7 @@ func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, 
 		return 15 * time.Second, nil
 	}
 	if tu.Status.WatchingSince == nil {
-		if !revisionState.observes(tu.Status.WatchingCommit) {
+		if !revisionState.observes(tu.Status.WatchingCommit, tu.Status.WatchingArmedAt) {
 			// This phase MUST be bounded. Reconcile short-circuits every tag
 			// update while WatchingTag is set, so an ArgoCD that never observes
 			// the commit (app renamed or deleted, repo credentials broken,
@@ -367,19 +367,74 @@ func (r *TagUpdaterReconciler) rollbackWithStatus(ctx context.Context, tu *v1alp
 	return nil
 }
 
+// argoCDDeployment is one rollout ArgoCD actually performed. Revisions is a
+// slice because a multi-source Application resolves one revision per source.
+// StartedAt is what orders a rollout against a write-back commit: a rollout
+// that began after the commit was pushed resolved the branch to a head at or
+// after it.
+type argoCDDeployment struct {
+	Revisions []string
+	StartedAt time.Time
+}
+
 type argoCDState struct {
 	Revision  string
 	Revisions []string
-	Health    string
-	Operation string
+	// Deployments are the rollouts ArgoCD still retains, oldest first: its
+	// history plus the current operation once it has succeeded.
+	Deployments []argoCDDeployment
+	Health      string
+	Operation   string
 }
 
-func (s argoCDState) observes(commit string) bool {
-	if commit != "" && s.Revision == commit {
+// observes reports whether ArgoCD has caught up to commit, which was pushed to
+// the write-back branch at pushedAt.
+//
+// Equality against the instantaneous status.sync.revision is not a usable test.
+// ArgoCD resolves the branch to whatever head exists when it next refreshes, so
+// that one field only ever names the newest revision it has looked at — it does
+// not retain what was actually rolled out. Commits written by this controller
+// were reported CommitNeverObserved while sitting in the very same
+// Application's deployment history, so a watch could never open for a change
+// that had already shipped, and abandonWatch then blamed the delivery path.
+//
+// So: match every revision ArgoCD still names — the compared head, the sync
+// revisions, and each retained rollout. The write-back branch is also shared by
+// every TagUpdater and by humans, so a commit can be superseded before ArgoCD
+// next resolves the branch; it is then coalesced into a later rollout and never
+// named anywhere. Because the branch only fast-forwards, any rollout that
+// started after the commit was pushed necessarily carries it, so accept that
+// too. ArgoCD resolves a target revision at comparison time rather than at
+// rollout time, so this can accept a rollout up to one refresh interval stale;
+// opening the gate marginally early is the deliberate trade against a gate that
+// never opens at all.
+//
+// A watch armed by an older build records no push time. Fall back to exact
+// matching there rather than guessing, as observationDeadlineExceeded does.
+func (s argoCDState) observes(commit string, pushedAt *metav1.Time) bool {
+	if commit == "" {
+		return false
+	}
+	if s.Revision == commit {
 		return true
 	}
 	for _, revision := range s.Revisions {
-		if revision == commit && commit != "" {
+		if revision == commit {
+			return true
+		}
+	}
+	for _, deployment := range s.Deployments {
+		for _, revision := range deployment.Revisions {
+			if revision == commit {
+				return true
+			}
+		}
+	}
+	if pushedAt == nil {
+		return false
+	}
+	for _, deployment := range s.Deployments {
+		if deployment.StartedAt.After(pushedAt.Time) {
 			return true
 		}
 	}
@@ -408,7 +463,70 @@ func (r *TagUpdaterReconciler) argoCDAppState(ctx context.Context, ref *v1alpha1
 	state.Revisions, _, _ = unstructured.NestedStringSlice(obj.Object, "status", "sync", "revisions")
 	state.Health, _, _ = unstructured.NestedString(obj.Object, "status", "health", "status")
 	state.Operation, _, _ = unstructured.NestedString(obj.Object, "status", "operationState", "phase")
+	state.Deployments = deploymentsFrom(obj.Object)
 	return state, nil
+}
+
+// deploymentsFrom collects the rollouts ArgoCD retains. status.history holds
+// only completed deployments and is capped by spec.revisionHistoryLimit, so the
+// in-flight operation is appended once it succeeds — history has not caught up
+// to it yet, and that newest rollout is the one most likely to carry a commit
+// still under watch.
+func deploymentsFrom(app map[string]interface{}) []argoCDDeployment {
+	history, _, _ := unstructured.NestedSlice(app, "status", "history")
+	deployments := make([]argoCDDeployment, 0, len(history)+1)
+	for _, item := range history {
+		entry, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		revisions := revisionsOf(entry)
+		if len(revisions) == 0 {
+			continue
+		}
+		// deployStartedAt is when the rollout began; deployedAt is when it
+		// finished. Only the start orders the rollout against a push, because a
+		// rollout already running when the commit landed cannot contain it.
+		started, _, _ := unstructured.NestedString(entry, "deployStartedAt")
+		if started == "" {
+			started, _, _ = unstructured.NestedString(entry, "deployedAt")
+		}
+		deployments = append(deployments, argoCDDeployment{Revisions: revisions, StartedAt: parseTimestamp(started)})
+	}
+	if phase, _, _ := unstructured.NestedString(app, "status", "operationState", "phase"); phase == "Succeeded" {
+		result, _, _ := unstructured.NestedMap(app, "status", "operationState", "syncResult")
+		if revisions := revisionsOf(result); len(revisions) > 0 {
+			started, _, _ := unstructured.NestedString(app, "status", "operationState", "startedAt")
+			deployments = append(deployments, argoCDDeployment{Revisions: revisions, StartedAt: parseTimestamp(started)})
+		}
+	}
+	return deployments
+}
+
+// revisionsOf reads the revisions a history entry or sync result names. A
+// single-source Application fills revision; a multi-source one fills revisions
+// instead and leaves revision empty, so both have to be read or exact matching
+// silently degrades to ordering alone on multi-source apps.
+func revisionsOf(entry map[string]interface{}) []string {
+	revisions, _, _ := unstructured.NestedStringSlice(entry, "revisions")
+	if revision, _, _ := unstructured.NestedString(entry, "revision"); revision != "" {
+		revisions = append(revisions, revision)
+	}
+	return revisions
+}
+
+// parseTimestamp reads an RFC3339 instant, yielding the zero time when it is
+// absent or malformed. A zero start never satisfies the ordering test, so an
+// unparseable timestamp can only make observes stricter, never looser.
+func parseTimestamp(raw string) time.Time {
+	if raw == "" {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
 }
 
 func (r *TagUpdaterReconciler) doRollback(ctx context.Context, tu *v1alpha1.TagUpdater) error {
