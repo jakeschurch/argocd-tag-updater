@@ -91,10 +91,18 @@ spec:
                 type: object
               source:
                 properties:
+                  digestAuthRealm:
+                    description: DigestAuthRealm explicitly trusts a cross-origin
+                      HTTPS Bearer token endpoint.
+                    type: string
+                  digestRepo:
+                    description: DigestRepo is the OCI repository whose exact git
+                      release tag is resolved.
+                    type: string
                   imagePullSecretRef:
                     description: |-
                       ImagePullSecretRef names a kubernetes.io/dockerconfigjson Secret in the same
-                      namespace as the TagUpdater. When set on an oci source, the controller reads
+                      namespace as the TagUpdater. For OCI sources or opted-in digest resolution, it reads
                       the secret and uses its credentials to authenticate against the registry.
                     properties:
                       name:
@@ -107,6 +115,11 @@ spec:
                       Repo is a git remote URL (git source), OCI repository reference (oci source),
                       or nix cache tag namespace "<host>/<name>" (nix source).
                     type: string
+                  resolveDigest:
+                    default: false
+                    description: ResolveDigest enables exact-tag OCI manifest digest
+                      lookup for a git release source.
+                    type: boolean
                   tagPattern:
                     description: |-
                       TagPattern is a named-group regex. Captures are available in Patch templates.
@@ -216,8 +229,10 @@ spec:
                   type: object
                 type: array
               writeBack:
-                description: WriteBack is the required git destination for rendered
-                  target patches.
+                description: |-
+                  WriteBack is the required git destination for rendered target patches.
+                  Its credentialsSecretRef is optional when the controller has mounted Git
+                  credentials configured through GIT_SSH_KEY_FILE.
                 properties:
                   branch:
                     description: Branch is the branch cloned and pushed by the controller.
@@ -313,6 +328,10 @@ spec:
                   - type
                   type: object
                 type: array
+              lastImageDigest:
+                description: LastImageDigest and PreviousImageDigest preserve immutable
+                  release identities.
+                type: string
               lastTag:
                 type: string
               lastUpdated:
@@ -322,6 +341,13 @@ spec:
                 description: |-
                   LastWriteCommit is the manifest branch commit verified by the last
                   successful write-back. It enables a cheap remote-head guard before cloning.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration gates the remote-head shortcut after
+                  configuration changes.
+                format: int64
+                type: integer
+              previousImageDigest:
                 type: string
               previousTag:
                 description: PreviousTag is the tag applied before LastTag.

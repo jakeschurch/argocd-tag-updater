@@ -19,6 +19,8 @@ import (
 type OCI struct {
 	Repo      string
 	BasicAuth string
+	// AuthRealm trusts the exact cross-origin Bearer endpoint for digest lookup.
+	AuthRealm string
 }
 
 type tagsList struct {

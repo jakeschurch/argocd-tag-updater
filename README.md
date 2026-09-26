@@ -179,3 +179,37 @@ Suggested alert: `tagupdater_reconcile_stale == 1`.
 kubectl apply -f config/crd/updater.argocd.io_tagupdaters.yaml
 # helm chart coming soon
 ```
+
+### Opt-in immutable image digests
+
+`source.resolveDigest: true` enables exact-tag manifest HEAD resolution for **Git release sources only**, exposing `{{ .image_digest }}`. It defaults to false. `source.digestRepo` identifies the registry repository whose tag matches the selected Git tag. CI must publish Git tags only after image signing and attestation; registry tag listing alone is not a release gate. Opt-in OCI/Nix sources are rejected, preserving their legacy tag behavior without introducing credential-bearing pagination paths.
+
+```yaml
+source:
+  type: git
+  repo: ssh://git@forgejo.example/org/app.git
+  tagPattern: '^app\.(?P<branch>main)\.(?P<n>\d{14})\.(?P<sha>[0-9a-f]{6})$'
+  resolveDigest: true
+  digestRepo: https://registry.example/org/app
+  digestAuthRealm: https://registry.example/service/token
+  imagePullSecretRef:
+    name: registry-reader
+targets:
+  - apiVersion: argoproj.io/v1alpha1
+    kind: Application
+    name: app
+    namespace: argocd
+    patches:
+      - field: spec.sources.0.helm.valuesObject.image.tag
+        template: '{{ .tag }}'
+      - field: spec.sources.0.helm.valuesObject.image.digest
+        template: '{{ .image_digest }}'
+```
+
+Dockerconfigjson credentials reuse the existing Basic mechanism. A Bearer challenge can exchange them for a bounded token at the exact repository `pull` scope; anonymous exchanges are permitted when no secret is configured. Token responses are limited to 64KiB. A cross-origin realm must use HTTPS and match `digestAuthRealm` exactly; same-origin HTTP/HTTPS realms are trusted only when no explicit realm is configured. An explicit realm must always match exactly. Manifest and token redirects are rejected. Explicit credential errors, scope/realm mismatches, registry errors and missing/invalid lowercase SHA256 digest headers stop write-back. OCI and Docker manifest/index media types are requested. Private projects still require a reader credential: receiving an anonymous token does not grant pull permission.
+
+A recorded release tag resolving to a different digest fails closed with `RegistryDigestChanged`; it does not silently replace the known-good pin, even after unrelated configuration changes. Publish a new gated release tag to promote changed content.
+
+Successful writes retain `status.lastImageDigest` and rotate the old tag's digest to `status.previousImageDigest`. Rollback restores that recorded digest without trusting the tag's current registry binding; missing prior digest history blocks rollback. `status.observedGeneration` and the resolved digest gate the unchanged-head optimization, so enabling digest resolution or changing desired patch fields at an existing tag cannot silently skip write-back.
+
+CRD generation: `CGO_ENABLED=0 controller-gen crd paths=./api/... output:crd:artifacts:config=config/crd` and `CGO_ENABLED=0 controller-gen object paths=./api/...`; the Helm CRD mirrors the generated schema inside its install conditional. The optional real Harbor test uses `LIVE_HARBOR_DIGEST_TEST=1` and `LIVE_HARBOR_REPOSITORY`. `LIVE_HARBOR_PULL_SECRET=1` explicitly authorizes reading the existing argocd/harbor-pull-secret into test memory for the known registry release; no credentials or tokens are printed. Without that flag the release must be anonymously readable.

@@ -16,7 +16,14 @@ type LocalObjectReference struct {
 }
 
 type SourceSpec struct {
-	Type SourceType `json:"type"`
+	// DigestAuthRealm explicitly trusts a cross-origin HTTPS Bearer token endpoint.
+	DigestAuthRealm string `json:"digestAuthRealm,omitempty"`
+	// ResolveDigest enables exact-tag OCI manifest digest lookup for a git release source.
+	// +kubebuilder:default=false
+	ResolveDigest bool `json:"resolveDigest,omitempty"`
+	// DigestRepo is the OCI repository whose exact git release tag is resolved.
+	DigestRepo string     `json:"digestRepo,omitempty"`
+	Type       SourceType `json:"type"`
 	// Repo is a git remote URL (git source), OCI repository reference (oci source),
 	// or nix cache tag namespace "<host>/<name>" (nix source).
 	Repo string `json:"repo"`
@@ -25,7 +32,7 @@ type SourceSpec struct {
 	// e.g.: platform\.(?P<branch>[^.]+)\.build-(?P<n>\d+)\.(?P<sha>[0-9a-f]{6,})
 	TagPattern string `json:"tagPattern"`
 	// ImagePullSecretRef names a kubernetes.io/dockerconfigjson Secret in the same
-	// namespace as the TagUpdater. When set on an oci source, the controller reads
+	// namespace as the TagUpdater. For OCI sources or opted-in digest resolution, it reads
 	// the secret and uses its credentials to authenticate against the registry.
 	ImagePullSecretRef *LocalObjectReference `json:"imagePullSecretRef,omitempty"`
 }
@@ -125,9 +132,14 @@ type TagUpdaterSpec struct {
 }
 
 type TagUpdaterStatus struct {
-	LastTag     string             `json:"lastTag,omitempty"`
-	LastUpdated *metav1.Time       `json:"lastUpdated,omitempty"`
-	Conditions  []metav1.Condition `json:"conditions,omitempty"`
+	// LastImageDigest and PreviousImageDigest preserve immutable release identities.
+	LastImageDigest     string `json:"lastImageDigest,omitempty"`
+	PreviousImageDigest string `json:"previousImageDigest,omitempty"`
+	// ObservedGeneration gates the remote-head shortcut after configuration changes.
+	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	LastTag            string             `json:"lastTag,omitempty"`
+	LastUpdated        *metav1.Time       `json:"lastUpdated,omitempty"`
+	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 	// LastWriteCommit is the manifest branch commit verified by the last
 	// successful write-back. It enables a cheap remote-head guard before cloning.
 	LastWriteCommit string `json:"lastWriteCommit,omitempty"`
