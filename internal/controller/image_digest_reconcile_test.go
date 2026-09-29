@@ -176,3 +176,65 @@ func TestReconcileRejectsOCIDigestBeforeSourceOrCredentialAccess(t *testing.T) {
 		t.Fatalf("missing explicit failure: %+v", condition)
 	}
 }
+
+func TestReconcileUnverifiableDigestNeverWritesManifest(t *testing.T) {
+	for _, key := range []string{"GIT_TOKEN", "GIT_SSH_KEY_FILE", "GIT_USERNAME", "GIT_PASSWORD"} {
+		t.Setenv(key, "")
+	}
+	for name, respond := range map[string]func(http.ResponseWriter){
+		"missing manifest": func(w http.ResponseWriter) { w.WriteHeader(http.StatusNotFound) },
+		"missing digest":   func(w http.ResponseWriter) {},
+		"invalid digest":   func(w http.ResponseWriter) { w.Header().Set("Docker-Content-Digest", "sha256:UPPER") },
+		"registry error":   func(w http.ResponseWriter) { w.WriteHeader(http.StatusInternalServerError) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			source := t.TempDir()
+			repository, err := git.PlainInit(source, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest := "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: test\n  namespace: argocd\nspec:\n  image:\n    tag: A.1\n"
+			if err = os.WriteFile(filepath.Join(source, "app.yaml"), []byte(manifest), 0600); err != nil {
+				t.Fatal(err)
+			}
+			tree, _ := repository.Worktree()
+			_, _ = tree.Add("app.yaml")
+			commit, err := tree.Commit("initial", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.com", When: time.Now()}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = repository.CreateTag("A.1", commit, nil)
+			_, _ = repository.CreateTag("B.2", commit, nil)
+			remote := filepath.Join(t.TempDir(), "remote.git")
+			bare, err := git.PlainClone(remote, true, &git.CloneOptions{URL: source})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { respond(w) }))
+			defer server.Close()
+			previousDigest := "sha256:" + strings.Repeat("a", 64)
+			updater := &v1.TagUpdater{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "argocd", Generation: 1}, Spec: v1.TagUpdaterSpec{Source: v1.SourceSpec{Type: v1.SourceTypeGit, Repo: remote, TagPattern: `^(?P<label>[AB])\.(?P<n>\d+)$`, ResolveDigest: true, DigestRepo: server.URL + "/repo"}, WriteBack: v1.WriteBackSpec{Repo: remote, Branch: "master", Path: "app.yaml", CredentialsSecretRef: v1.LocalObjectReference{Name: "test-credentials"}}, Targets: []v1.TargetSpec{{APIVersion: "argoproj.io/v1alpha1", Kind: "Application", Name: "test", Namespace: "argocd", Patches: []v1.PatchSpec{{Field: "spec.image.tag", Template: "{{ .tag }}"}, {Field: "spec.image.digest", Template: "{{ .image_digest }}"}}}}}, Status: v1.TagUpdaterStatus{LastTag: "A.1", LastImageDigest: previousDigest, LastWriteCommit: commit.String(), ObservedGeneration: 1}}
+			storage := &digestTestClient{updater: updater}
+			reconciler := &TagUpdaterReconciler{Client: storage}
+			if _, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "argocd"}}); err == nil {
+				t.Fatal("unverifiable digest must fail the reconcile")
+			}
+			head, _ := bare.Head()
+			if head.Hash() != commit {
+				t.Fatalf("manifest branch moved to %s without a verified digest", head.Hash())
+			}
+			if updater.Status.LastTag != "A.1" || updater.Status.LastImageDigest != previousDigest {
+				t.Fatalf("status advanced without a verified digest: %+v", updater.Status)
+			}
+			ready := metav1.Condition{}
+			for _, condition := range updater.Status.Conditions {
+				if condition.Type == "Ready" {
+					ready = condition
+				}
+			}
+			if ready.Status != metav1.ConditionFalse {
+				t.Fatalf("Ready must be False, got %+v", ready)
+			}
+		})
+	}
+}
