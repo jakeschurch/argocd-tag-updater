@@ -21,7 +21,7 @@ const (
 
 // progressTracker records, per TagUpdater, when a reconcile was first
 // attempted and when one last completed successfully — the in-memory analogue
-// of revAttempted/lastRevSuccess, but keyed per updater so one broken repo is
+// of firstRevAttempt/lastRevSuccess, but keyed per updater so one broken repo is
 // distinguishable from a systemic freeze.
 type progressTracker struct {
 	mu      sync.Mutex

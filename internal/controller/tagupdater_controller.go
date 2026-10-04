@@ -40,9 +40,9 @@ type TagUpdaterReconciler struct {
 	Recorder record.EventRecorder
 	Dynamic  dynamic.Interface
 
-	revAttempted   atomic.Bool
-	lastRevSuccess atomic.Int64
-	progress       progressTracker
+	firstRevAttempt atomic.Int64
+	lastRevSuccess  atomic.Int64
+	progress        progressTracker
 
 	StaleMultiplier int
 	StaleFloor      time.Duration
@@ -755,7 +755,7 @@ func (r *TagUpdaterReconciler) addRev(ctx context.Context, src intsource.Source,
 	if !ok {
 		return nil
 	}
-	r.revAttempted.Store(true)
+	r.firstRevAttempt.CompareAndSwap(0, time.Now().UnixNano())
 	revs, err := resolver.TagRevs(ctx)
 	if err != nil {
 		return fmt.Errorf("resolve tag %q to commit sha: %w", tag, err)
@@ -771,18 +771,24 @@ func (r *TagUpdaterReconciler) addRev(ctx context.Context, src intsource.Source,
 
 func (r *TagUpdaterReconciler) RevResolutionHealthz() healthz.Checker {
 	return func(*http.Request) error {
-		if !r.revAttempted.Load() {
-			return nil
-		}
-		last := r.lastRevSuccess.Load()
-		if last == 0 {
-			return fmt.Errorf("git tag->rev resolution has never succeeded")
-		}
-		if age := time.Since(time.Unix(0, last)); age > revStaleAfter {
-			return fmt.Errorf("git tag->rev resolution stale: last success %s ago (>%s)", age.Round(time.Second), revStaleAfter)
-		}
+		return r.revResolutionHealth(time.Now())
+	}
+}
+
+func (r *TagUpdaterReconciler) revResolutionHealth(now time.Time) error {
+	last := r.lastRevSuccess.Load()
+	anchor := "last success"
+	if last == 0 {
+		last = r.firstRevAttempt.Load()
+		anchor = "first attempt"
+	}
+	if last == 0 {
 		return nil
 	}
+	if age := now.Sub(time.Unix(0, last)); age > revStaleAfter {
+		return fmt.Errorf("git tag->rev resolution stale: %s %s ago (>%s)", anchor, age.Round(time.Second), revStaleAfter)
+	}
+	return nil
 }
 
 // setWriteBackNotAttempted records that this reconcile ended before the
