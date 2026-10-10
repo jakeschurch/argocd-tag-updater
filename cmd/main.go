@@ -19,6 +19,7 @@ import (
 
 	v1alpha1 "github.com/jakeschurch/argocd-tag-updater/api/v1alpha1"
 	"github.com/jakeschurch/argocd-tag-updater/internal/controller"
+	"github.com/jakeschurch/argocd-tag-updater/internal/writeback"
 )
 
 func main() {
@@ -39,6 +40,11 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true), zap.WriteTo(os.Stderr)))
+	releaseWritebackTempDir, err := writeback.PrepareWritebackTempDir()
+	if err != nil {
+		fail("prepare write-back temp directory: %v", err)
+	}
+	defer releaseWritebackTempDir()
 
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {

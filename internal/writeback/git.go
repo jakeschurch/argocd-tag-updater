@@ -85,20 +85,21 @@ func (w Writer) RemoteHead(ctx context.Context) (string, error) {
 }
 
 func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoURL string) (Result, error) {
-	dir, err := os.MkdirTemp("", "argocd-tag-updater-writeback-")
+	_, cleanPath, err := safeManifestPath(".", w.Spec.Path)
+	if err != nil {
+		return Result{}, err
+	}
+	cloneDirectoryPath, err := newCloneDirectory()
 	if err != nil {
 		return Result{}, fmt.Errorf("create clone directory: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(dir) }()
+	defer func() { _ = os.RemoveAll(cloneDirectoryPath) }()
 
-	branch := plumbing.NewBranchReferenceName(w.Spec.Branch)
-	repo, err := git.PlainCloneContext(ctx, dir, false, &git.CloneOptions{
-		URL: repoURL, Auth: auth, SingleBranch: true, ReferenceName: branch,
-	})
+	repo, workingTree, err := cloneBranchForWriteback(ctx, cloneDirectoryPath, repoURL, auth, w.Spec.Branch, cleanPath)
 	if err != nil {
-		return Result{}, fmt.Errorf("clone %s branch %s: %w", repoURL, w.Spec.Branch, err)
+		return Result{}, err
 	}
-	manifestPath, cleanPath, err := safeManifestPath(dir, w.Spec.Path)
+	manifestPath, _, err := safeManifestPath(cloneDirectoryPath, w.Spec.Path)
 	if err != nil {
 		return Result{}, err
 	}
@@ -120,14 +121,10 @@ func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoUR
 	if err := os.WriteFile(manifestPath, output, 0o600); err != nil {
 		return Result{}, fmt.Errorf("write manifest %s: %w", w.Spec.Path, err)
 	}
-	wt, err := repo.Worktree()
-	if err != nil {
-		return Result{}, fmt.Errorf("open worktree: %w", err)
-	}
-	if _, err := wt.Add(cleanPath); err != nil {
+	if _, err := workingTree.Add(cleanPath); err != nil {
 		return Result{}, fmt.Errorf("stage manifest %s: %w", cleanPath, err)
 	}
-	commitHash, err := wt.Commit(w.commitMessage(), &git.CommitOptions{Author: &object.Signature{
+	commitHash, err := workingTree.Commit(w.commitMessage(), &git.CommitOptions{Author: &object.Signature{
 		Name: "argocd-tag-updater", Email: "argocd-tag-updater@localhost", When: time.Now(),
 	}})
 	if errors.Is(err, git.ErrEmptyCommit) {
@@ -144,6 +141,37 @@ func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoUR
 		return Result{}, err
 	}
 	return Result{Committed: true, CommitSHA: commitHash.String()}, nil
+}
+
+// cloneBranchForWriteback uses go-git's path-prefix sparse checkout; a tracked
+// path beginning with the manifest path may also be materialized. Depth limits
+// commit history, but go-git still fetches all blobs from the branch tip.
+func cloneBranchForWriteback(
+	ctx context.Context,
+	cloneDirectoryPath string,
+	repoURL string,
+	auth transport.AuthMethod,
+	branchName string,
+	manifestPath string,
+) (*git.Repository, *git.Worktree, error) {
+	branch := plumbing.NewBranchReferenceName(branchName)
+	repo, err := git.PlainCloneContext(ctx, cloneDirectoryPath, false, &git.CloneOptions{
+		URL: repoURL, Auth: auth, SingleBranch: true, ReferenceName: branch,
+		Depth: 1, NoCheckout: true, Tags: git.NoTags,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("clone %s branch %s: %w", repoURL, branchName, err)
+	}
+	workingTree, err := repo.Worktree()
+	if err != nil {
+		return nil, nil, fmt.Errorf("open worktree: %w", err)
+	}
+	if err := workingTree.Checkout(&git.CheckoutOptions{
+		Branch: branch, SparseCheckoutDirectories: []string{manifestPath},
+	}); err != nil {
+		return nil, nil, fmt.Errorf("checkout manifest %s: %w", manifestPath, err)
+	}
+	return repo, workingTree, nil
 }
 
 func (w Writer) auth() (transport.AuthMethod, string, func(), error) {
@@ -174,6 +202,9 @@ func safeManifestPath(root, path string) (string, string, error) {
 		return "", "", fmt.Errorf("manifest path must be a non-empty repository-relative path")
 	}
 	clean := filepath.Clean(path)
+	if clean == "." {
+		return "", "", fmt.Errorf("manifest path must name a repository file")
+	}
 	if clean == ".." || len(clean) > 3 && clean[:3] == ".."+string(filepath.Separator) {
 		return "", "", fmt.Errorf("manifest path %q escapes repository", path)
 	}
