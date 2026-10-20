@@ -156,10 +156,23 @@ spec:
                         apply to each matched CR.
                       items:
                         properties:
+                          expectedValue:
+                            description: ExpectedValue is required for remove, including
+                              an explicitly empty string.
+                            type: string
                           field:
                             description: |-
                               Field is a dot-notation path into the target manifest. e.g. "spec.flakeRef" or
                               "spec.source.helm.valuesObject.image.tag".
+                            type: string
+                          operation:
+                            default: set
+                            description: |-
+                              Operation defaults to set. Remove deletes a block mapping's single-line
+                              string scalar only when it equals ExpectedValue; absent fields are a no-op.
+                            enum:
+                            - set
+                            - remove
                             type: string
                           template:
                             description: |-
@@ -172,8 +185,15 @@ spec:
                             type: string
                         required:
                         - field
-                        - template
                         type: object
+                        x-kubernetes-validations:
+                        - message: remove requires expectedValue
+                          rule: self.operation != 'remove' || has(self.expectedValue)
+                        - message: remove cannot render a template
+                          rule: self.operation != 'remove' || !has(self.template)
+                            || size(self.template) == 0
+                        - message: expectedValue is only supported for remove
+                          rule: self.operation == 'remove' || !has(self.expectedValue)
                       type: array
                     selector:
                       description: |-

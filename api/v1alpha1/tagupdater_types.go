@@ -37,17 +37,27 @@ type SourceSpec struct {
 	ImagePullSecretRef *LocalObjectReference `json:"imagePullSecretRef,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="self.operation != 'remove' || has(self.expectedValue)",message="remove requires expectedValue"
+// +kubebuilder:validation:XValidation:rule="self.operation != 'remove' || !has(self.template) || size(self.template) == 0",message="remove cannot render a template"
+// +kubebuilder:validation:XValidation:rule="self.operation == 'remove' || !has(self.expectedValue)",message="expectedValue is only supported for remove"
 type PatchSpec struct {
 	// Field is a dot-notation path into the target manifest. e.g. "spec.flakeRef" or
 	// "spec.source.helm.valuesObject.image.tag".
 	Field string `json:"field"`
+	// Operation defaults to set. Remove deletes a block mapping's single-line
+	// string scalar only when it equals ExpectedValue; absent fields are a no-op.
+	// +kubebuilder:validation:Enum=set;remove
+	// +kubebuilder:default=set
+	Operation string `json:"operation,omitempty"`
+	// ExpectedValue is required for remove, including an explicitly empty string.
+	ExpectedValue *string `json:"expectedValue,omitempty"`
 	// Template is a Go template rendered with named captures from TagPattern plus
 	// repo-derived fields (owner, repo, host, repoURL), "tag" (full tag string),
 	// and — for the git source — "rev", the matched tag's immutable full commit
 	// sha, enabling an immutable flake ref like
 	// "github:{{ .owner }}/{{ .repo }}/{{ .tag }}?rev={{ .rev }}#attr".
 	// An absent key renders empty and the whole field is skipped (never blanked).
-	Template string `json:"template"`
+	Template string `json:"template,omitempty"`
 }
 
 type TargetSpec struct {

@@ -35,6 +35,7 @@ func UpdateManifest(input []byte, targets []v1alpha1.TargetSpec, data map[string
 
 	edits := map[*yaml.Node]string{}
 	insertions := map[*yaml.Node][]*yaml.Node{}
+	removals := map[*yaml.Node]*yaml.Node{}
 	for _, target := range targets {
 		matched := 0
 		for _, doc := range docs {
@@ -51,6 +52,29 @@ func UpdateManifest(input []byte, targets []v1alpha1.TargetSpec, data map[string
 			}
 			matched++
 			for _, p := range target.Patches {
+				switch p.Operation {
+				case "", "set":
+					if p.ExpectedValue != nil {
+						return nil, false, fmt.Errorf("field %q: expectedValue is only supported for remove", p.Field)
+					}
+				case "remove":
+					if p.ExpectedValue == nil || p.Template != "" {
+						return nil, false, fmt.Errorf("field %q: remove requires expectedValue and no template", p.Field)
+					}
+					key, value, err := removalTarget(root, strings.Split(p.Field, "."))
+					if err != nil {
+						return nil, false, fmt.Errorf("field %q: %w", p.Field, err)
+					}
+					if value != nil {
+						if value.Kind != yaml.ScalarNode || value.Tag != "!!str" || value.Value != *p.ExpectedValue {
+							return nil, false, fmt.Errorf("field %q: remove expectedValue does not match the existing string scalar", p.Field)
+						}
+						removals[key] = value
+					}
+					continue
+				default:
+					return nil, false, fmt.Errorf("field %q: unsupported operation %q", p.Field, p.Operation)
+				}
 				value, err := renderTemplate(p.Template, data)
 				if err != nil {
 					return nil, false, fmt.Errorf("render template for field %q: %w", p.Field, err)
@@ -75,14 +99,54 @@ func UpdateManifest(input []byte, targets []v1alpha1.TargetSpec, data map[string
 			return nil, false, fmt.Errorf("target %s/%s not found in manifest", target.Kind, target.Name)
 		}
 	}
-	if len(edits) == 0 && len(insertions) == 0 {
+	if len(edits) == 0 && len(insertions) == 0 && len(removals) == 0 {
 		return input, false, nil
 	}
-	output, err := applyYAMLEdits(input, edits, insertions)
+	output, err := applyYAMLEdits(input, edits, insertions, removals)
 	if err != nil {
 		return nil, false, err
 	}
 	return output, !bytes.Equal(output, input), nil
+}
+
+func removalTarget(node *yaml.Node, path []string) (*yaml.Node, *yaml.Node, error) {
+	for index, segment := range path {
+		if segment == "" {
+			return nil, nil, fmt.Errorf("empty field path segment")
+		}
+		switch node.Kind {
+		case yaml.MappingNode:
+			matched := -1
+			for entry := 0; entry < len(node.Content); entry += 2 {
+				if node.Content[entry].Value != segment {
+					continue
+				}
+				if matched >= 0 {
+					return nil, nil, fmt.Errorf("remove path contains a duplicate mapping key")
+				}
+				matched = entry
+			}
+			if matched < 0 {
+				return nil, nil, nil
+			}
+			if index == len(path)-1 {
+				if node.Style&yaml.FlowStyle != 0 || len(node.Content) == 2 {
+					return nil, nil, fmt.Errorf("remove requires a block mapping with another retained entry")
+				}
+				return node.Content[matched], node.Content[matched+1], nil
+			}
+			node = node.Content[matched+1]
+		case yaml.SequenceNode:
+			position, err := strconv.Atoi(segment)
+			if err != nil || position < 0 || position >= len(node.Content) || index == len(path)-1 {
+				return nil, nil, fmt.Errorf("remove path has an invalid list index or selects a list element")
+			}
+			node = node.Content[position]
+		default:
+			return nil, nil, fmt.Errorf("remove path traverses a non-mapping value")
+		}
+	}
+	return nil, nil, fmt.Errorf("remove path must select a mapping entry")
 }
 
 func renderTemplate(text string, data map[string]string) (string, error) {
@@ -183,7 +247,7 @@ type scalarEdit struct {
 // then replaces scalar token spans in the original byte stream. Unlike a YAML
 // encode round trip, unrelated whitespace, comments, directives, and document
 // separators remain byte-for-byte identical.
-func applyYAMLEdits(input []byte, values map[*yaml.Node]string, insertions map[*yaml.Node][]*yaml.Node) ([]byte, error) {
+func applyYAMLEdits(input []byte, values map[*yaml.Node]string, insertions map[*yaml.Node][]*yaml.Node, removals map[*yaml.Node]*yaml.Node) ([]byte, error) {
 	lineStarts := []int{0}
 	for i, b := range input {
 		if b == '\n' {
@@ -191,6 +255,38 @@ func applyYAMLEdits(input []byte, values map[*yaml.Node]string, insertions map[*
 		}
 	}
 	var edits []scalarEdit
+	for key, value := range removals {
+		if key.Line < 1 || key.Line > len(lineStarts) || value.Line != key.Line || key.Column < 1 || value.Column < 1 || value.Anchor != "" || key.Anchor != "" || value.Style&(yaml.LiteralStyle|yaml.FoldedStyle) != 0 {
+			return nil, fmt.Errorf("remove requires an unanchored single-line mapping entry")
+		}
+		start := lineStarts[key.Line-1]
+		end := len(input)
+		if key.Line < len(lineStarts) {
+			end = lineStarts[key.Line]
+		}
+		keyStart := start + key.Column - 1
+		valueStart := start + value.Column - 1
+		if keyStart > end || valueStart >= end || strings.TrimSpace(string(input[start:keyStart])) != "" {
+			return nil, fmt.Errorf("remove requires a standalone mapping entry")
+		}
+		valueEnd, err := scalarTokenEnd(input, valueStart, value.Style)
+		if err != nil || valueEnd > end {
+			return nil, fmt.Errorf("remove requires a single-line scalar")
+		}
+		trailing := strings.TrimSpace(string(input[valueEnd:end]))
+		if trailing != "" && !strings.HasPrefix(trailing, "#") {
+			return nil, fmt.Errorf("remove would affect another YAML token")
+		}
+		var singleLine yaml.Node
+		if err := yaml.Unmarshal(input[start:end], &singleLine); err != nil || len(singleLine.Content) != 1 {
+			return nil, fmt.Errorf("remove requires a complete single-line mapping entry")
+		}
+		parsed := mapValue(singleLine.Content[0], key.Value)
+		if parsed == nil || parsed.Kind != value.Kind || parsed.Tag != value.Tag || parsed.Value != value.Value {
+			return nil, fmt.Errorf("remove cannot truncate a multiline value")
+		}
+		edits = append(edits, scalarEdit{start: start, end: end})
+	}
 	for node, value := range values {
 		if node.Line < 1 || node.Line > len(lineStarts) || node.Column < 1 {
 			return nil, fmt.Errorf("invalid YAML source position for edited scalar")
@@ -231,7 +327,10 @@ func applyYAMLEdits(input []byte, values map[*yaml.Node]string, insertions map[*
 		}
 	}
 	out := append([]byte(nil), input...)
-	for _, edit := range edits {
+	for index, edit := range edits {
+		if index > 0 && edit.end > edits[index-1].start {
+			return nil, fmt.Errorf("configured YAML edits overlap")
+		}
 		out = append(out[:edit.start], append([]byte(edit.value), out[edit.end:]...)...)
 	}
 	return out, nil

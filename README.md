@@ -79,6 +79,27 @@ Standard Go `text/template` rendered with all named captures as a flat `map[stri
 
 `field` uses dot-notation (`spec.flakeRef`, `spec.sources.0.targetRevision`) to navigate YAML mappings and numeric sequence indices.
 
+Patches default to `operation: set`, preserving existing template behavior.
+For an owner-approved obsolete string field, use a guarded removal:
+
+```yaml
+patches:
+  - field: spec.settings.obsoleteMode
+    operation: remove
+    expectedValue: old-mode
+```
+
+Removal requires an exact string `expectedValue` and no template. An absent
+field or mapping is already converged; a different value aborts the entire
+write-back without a commit. Removal supports standalone, single-line scalar
+entries in block mappings with a retained sibling, including paths through sequence indices. It rejects
+collections, flow mappings, duplicate keys, sequence-element deletion, anchors and multiline
+values. Unrelated pins, comments and formatting retain their original bytes.
+Changing a TagUpdater's generation runs its patches even when the tag is unchanged.
+
+Install the updated CRD and controller before enabling removal patches. A source
+PR or offline patch preview does not authorize publishing a managed manifest.
+
 ### Git write-back (required)
 
 `spec.writeBack` is the controller's only update destination:
