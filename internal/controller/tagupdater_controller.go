@@ -222,6 +222,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				if r.Recorder != nil {
 					r.Recorder.Event(&tu, corev1.EventTypeNormal, "WriteBackCommitted", message)
 				}
+				r.refreshAfterWriteBack(ctx, &tu)
 			}
 			meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "WriteBackReady", Status: metav1.ConditionTrue, Reason: reason, Message: message})
 		}
@@ -340,6 +341,30 @@ func (r *TagUpdaterReconciler) observationDeadlineExceeded(tu *v1alpha1.TagUpdat
 		return false
 	}
 	return time.Since(tu.Status.WatchingArmedAt.Time) >= rollbackTimeout(tu)
+}
+
+// refreshAfterWriteBack asks ArgoCD to read the commit just pushed, instead of it finding the
+// commit when its cached branch heads expire, about three minutes later. The annotation only
+// compares: it starts no sync and touches no operation, so the Application's own sync policy still
+// decides everything. ArgoCD removes it once read. Failing costs only those minutes, so it is
+// logged and nothing else.
+func (r *TagUpdaterReconciler) refreshAfterWriteBack(ctx context.Context, tu *v1alpha1.TagUpdater) {
+	ref := revisionObserver(tu)
+	if ref == nil || r.Dynamic == nil {
+		return
+	}
+
+	namespace := ref.Namespace
+	if namespace == "" {
+		namespace = "argocd"
+	}
+
+	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+	patch := []byte(`{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"normal"}}}`)
+
+	if _, err := r.Dynamic.Resource(gvr).Namespace(namespace).Patch(ctx, ref.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		log.FromContext(ctx).Info("could not ask ArgoCD to refresh; it will find the commit on its own", "application", ref.Name, "err", err)
+	}
 }
 
 // abandonWatch releases a watch ArgoCD never picked up, so tag updates resume.

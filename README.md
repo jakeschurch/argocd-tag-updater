@@ -127,10 +127,15 @@ when every rendered value is already present.
 
 ### Health-gated rollback
 
-When `rollback.enabled` is set, `argoCDApp` is a read-only health reference:
-the controller never patches or sync-triggers it. For app-of-apps deployments,
-optional `managingApp` is the read-only revision observer; otherwise
-`argoCDApp` serves both roles. After pushing a tag update, the controller
+After each commit it writes, the controller sets
+`argocd.argoproj.io/refresh: normal` on `managingApp`, or on `argoCDApp` without
+one, so ArgoCD reads the commit now and not when its cached branch heads expire.
+That is its only write to an Application: it never syncs one or touches its
+operation, and a failed patch costs only the wait.
+
+When `rollback.enabled` is set, `argoCDApp` is a health reference. For
+app-of-apps deployments, optional `managingApp` is the revision observer;
+otherwise `argoCDApp` serves both roles. After pushing a tag update, the controller
 records the manifest commit SHA and waits for the revision observer's
 `status.sync.revision` (or an entry in `status.sync.revisions`) to equal it.
 Only then does the health timeout start. The timeout defaults to 20m

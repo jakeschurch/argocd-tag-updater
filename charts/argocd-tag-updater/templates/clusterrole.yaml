@@ -18,10 +18,10 @@ rules:
     resources: ["secrets"]
     verbs: ["get"]
 
-  # Rollback health observation (read-only).
+  # Rollback health observation, and the refresh annotation after a write-back.
   - apiGroups: ["argoproj.io"]
     resources: ["applications"]
-    verbs: ["get"]
+    verbs: ["get", "patch"]
 
   # Leader election lease.
   - apiGroups: ["coordination.k8s.io"]

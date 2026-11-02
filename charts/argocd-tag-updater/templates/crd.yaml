@@ -50,8 +50,9 @@ spec:
             properties:
               argoCDApp:
                 description: |-
-                  ArgoCDApp is a read-only reference used to observe sync revision and health.
-                  The controller never patches or triggers this Application.
+                  ArgoCDApp is a reference used to observe sync revision and health. The controller
+                  never syncs this Application. It asks it to refresh after a write-back unless
+                  ManagingApp is set.
                 properties:
                   name:
                     type: string
@@ -65,9 +66,9 @@ spec:
                 type: string
               managingApp:
                 description: |-
-                  ManagingApp optionally identifies the read-only app-of-apps Application whose
-                  sync revision must observe the pushed manifest commit. When omitted,
-                  ArgoCDApp is used for both revision and health observation.
+                  ManagingApp optionally identifies the app-of-apps Application whose sync revision
+                  must observe the pushed manifest commit, and which is asked to refresh after a
+                  write-back. When omitted, ArgoCDApp is used for both revision and health observation.
                 properties:
                   name:
                     type: string

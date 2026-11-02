@@ -129,12 +129,13 @@ type TagUpdaterSpec struct {
 	// Its credentialsSecretRef is optional when the controller has mounted Git
 	// credentials configured through GIT_SSH_KEY_FILE.
 	WriteBack WriteBackSpec `json:"writeBack"`
-	// ArgoCDApp is a read-only reference used to observe sync revision and health.
-	// The controller never patches or triggers this Application.
+	// ArgoCDApp is a reference used to observe sync revision and health. The controller
+	// never syncs this Application. It asks it to refresh after a write-back unless
+	// ManagingApp is set.
 	ArgoCDApp *ArgoCDAppRef `json:"argoCDApp,omitempty"`
-	// ManagingApp optionally identifies the read-only app-of-apps Application whose
-	// sync revision must observe the pushed manifest commit. When omitted,
-	// ArgoCDApp is used for both revision and health observation.
+	// ManagingApp optionally identifies the app-of-apps Application whose sync revision
+	// must observe the pushed manifest commit, and which is asked to refresh after a
+	// write-back. When omitted, ArgoCDApp is used for both revision and health observation.
 	ManagingApp *ArgoCDAppRef `json:"managingApp,omitempty"`
 	// Rollback commits the previous tag's rendered values when ArgoCD reports a
 	// terminal deployment failure. Requires ArgoCDApp to be set.
