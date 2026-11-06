@@ -177,7 +177,13 @@ When all pass, the tag is written as usual.
 Checks fail closed: a missing object, a read error or a malformed check holds the
 tag. They gate only a new tag — never a rollback, and never re-rendering the
 current tag after a spec change. The controller needs `get` on each checked kind;
-grant it through the chart's `extraRules` value.
+grant it through the chart's `extraRules` value. A check that cannot be read or
+is malformed also sets `Ready=False`, so a typo does not hold tags silently.
+
+A check passes at the moment of write-back; ArgoCD's sync and the rollout follow
+seconds to minutes later, so what it guards can change in between. Add a check for
+anything that announces the next busy period early (a queue's collection window,
+say) to narrow that gap.
 
 ## Tag format convention
 

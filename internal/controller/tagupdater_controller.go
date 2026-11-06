@@ -211,11 +211,22 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			tu.Status.HeldTag = latest.Tag
 			meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "MergeChecks", Status: metav1.ConditionFalse, Reason: result.reason, Message: fmt.Sprintf("holding tag %s: %s", latest.Tag, result.message)})
 			setWriteBackNotAttempted(&tu, "tag "+latest.Tag+" is held by merge checks")
+			// A check that says "not now" is the controller working as
+			// configured. One that cannot be read or is malformed would hold
+			// every tag forever, so it is a failure that must show and stall.
+			if result.reason != "Holding" {
+				meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: result.reason, Message: result.message})
+				meta.SetStatusCondition(&tu.Status.Conditions, r.stalledCondition(progressKey))
+				if r.Recorder != nil {
+					r.Recorder.Event(&tu, corev1.EventTypeWarning, result.reason, result.message)
+				}
+			}
 			if err := r.Status().Update(ctx, &tu); err != nil {
 				return ctrl.Result{}, err
 			}
-			// Holding is the controller working as configured, not a stall.
-			r.markReconcileSucceeded(ctx, &tu, progressKey)
+			if result.reason == "Holding" {
+				r.markReconcileSucceeded(ctx, &tu, progressKey)
+			}
 			return ctrl.Result{RequeueAfter: interval}, nil
 		}
 		tu.Status.HeldTag = ""

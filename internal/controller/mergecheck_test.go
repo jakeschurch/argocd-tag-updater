@@ -169,6 +169,17 @@ func TestReconcileHoldsANewTagUntilMergeChecksPass(t *testing.T) {
 	reconciler := &TagUpdaterReconciler{Client: storage}
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "argocd"}}
 
+	// A check that cannot read its object holds too, and says so on Ready.
+	storage.objects = map[string]map[string]interface{}{}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(updater.Status.Conditions, "Ready")
+	if updater.Status.LastTag != "v1" || updater.Status.HeldTag != "v2" || ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "MergeCheckError" {
+		t.Fatalf("unreadable check: status %+v", updater.Status)
+	}
+	storage.objects["argo/foundry"] = busy
+
 	result, err := reconciler.Reconcile(context.Background(), request)
 	if err != nil || result.RequeueAfter == 0 {
 		t.Fatalf("held reconcile = %v, %v", result, err)
