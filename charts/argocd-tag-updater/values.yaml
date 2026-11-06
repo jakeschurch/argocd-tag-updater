@@ -50,6 +50,13 @@ serviceAccount:
 crd:
   install: true
 
+# Extra ClusterRole rules. Merge checks read their objects directly, so grant
+# get on each kind a TagUpdater's spec.mergeChecks names, for example:
+#   - apiGroups: ["ci.foundrybox.dev"]
+#     resources: ["mergequeues"]
+#     verbs: ["get"]
+extraRules: []
+
 # The controller's own TagUpdater — watches this repo's tags and repins
 # nixMount.flakeRef on the Application that runs it. Off by default so a
 # standalone `helm install` does not create a CR pointing at an Application

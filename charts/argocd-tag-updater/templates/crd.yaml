@@ -77,6 +77,60 @@ spec:
                 required:
                 - name
                 type: object
+              mergeChecks:
+                description: |-
+                  MergeChecks must all pass before a new tag is written back. Until they do,
+                  the tag is held in status.heldTag and checked again every interval. They do
+                  not gate rollbacks, or re-rendering the current tag after a spec change.
+                items:
+                  description: |-
+                    MergeCheck holds a new tag until a field on another object says the rollout is
+                    safe, such as a queue with no batch in flight. The object is read directly from
+                    the API server on each poll, so the controller needs get on it.
+                  properties:
+                    field:
+                      description: |-
+                        Field is a dot-notation path into the object, such as status.activeBatch.
+                        Numeric segments index lists.
+                      type: string
+                    name:
+                      description: Name identifies the check in conditions and events.
+                      type: string
+                    object:
+                      description: ObjectReference names one object of any kind.
+                      properties:
+                        apiVersion:
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          description: Namespace is required for namespaced kinds.
+                          type: string
+                      required:
+                      - apiVersion
+                      - kind
+                      - name
+                      type: object
+                    operator:
+                      description: MergeCheckOperator compares a MergeCheck's field.
+                      enum:
+                      - Empty
+                      - NotEmpty
+                      - Equals
+                      - NotEquals
+                      type: string
+                    value:
+                      description: Value is compared by Equals and NotEquals.
+                      type: string
+                  required:
+                  - field
+                  - name
+                  - object
+                  - operator
+                  type: object
+                type: array
               rollback:
                 description: |-
                   Rollback commits the previous tag's rendered values when ArgoCD reports a
@@ -350,6 +404,11 @@ spec:
                   - type
                   type: object
                 type: array
+              heldTag:
+                description: |-
+                  HeldTag is a new tag waiting for spec.mergeChecks to pass. Empty when
+                  nothing is held.
+                type: string
               lastImageDigest:
                 description: LastImageDigest and PreviousImageDigest preserve immutable
                   release identities.

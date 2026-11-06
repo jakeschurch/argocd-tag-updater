@@ -147,6 +147,38 @@ tag's values back through a new surgical commit. A Degraded result is ignored
 while `status.operationState.phase` is Running or Terminating. Failed tags are
 kept in `status.skippedTags` so they are not immediately selected again.
 
+### Merge checks
+
+`mergeChecks` hold a new tag until fields on other objects say it is safe to roll
+out, such as a merge queue with no batch in flight:
+
+```yaml
+spec:
+  mergeChecks:
+    - name: queue-idle
+      object:
+        apiVersion: ci.foundrybox.dev/v1alpha1
+        kind: MergeQueue
+        name: foundry
+        namespace: argo
+      field: status.activeBatch   # dot notation; numeric segments index lists
+      operator: Empty             # Empty | NotEmpty | Equals | NotEquals
+      # value: "..."              # for Equals and NotEquals
+```
+
+Each poll, before writing a new tag, the controller reads every object directly
+from the API server and compares its field. `Empty` passes for a missing field,
+null, `""`, or an empty list or map; `Equals` compares strings, numbers and
+booleans as text. If any check fails, nothing is committed: the tag is recorded
+in `status.heldTag`, the `MergeChecks` condition is `False` with the reason, a
+`TagHeld` event is emitted once per tag, and the check runs again next interval.
+When all pass, the tag is written as usual.
+
+Checks fail closed: a missing object, a read error or a malformed check holds the
+tag. They gate only a new tag — never a rollback, and never re-rendering the
+current tag after a spec change. The controller needs `get` on each checked kind;
+grant it through the chart's `extraRules` value.
+
 ## Tag format convention
 
 ```

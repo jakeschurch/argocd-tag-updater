@@ -32,3 +32,8 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  {{- with .Values.extraRules }}
+
+  # Extra reads, such as the objects spec.mergeChecks reads.
+  {{- toYaml . | nindent 2 }}
+  {{- end }}

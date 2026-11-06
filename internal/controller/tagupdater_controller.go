@@ -197,6 +197,31 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
+	// Merge checks gate only a new tag: re-rendering the current one after a
+	// spec change, and rollbacks, are never held.
+	if len(tu.Spec.MergeChecks) == 0 {
+		meta.RemoveStatusCondition(&tu.Status.Conditions, "MergeChecks")
+		tu.Status.HeldTag = ""
+	} else if latest.Tag != tu.Status.LastTag {
+		result := r.evaluateMergeChecks(ctx, tu.Spec.MergeChecks)
+		if !result.passed {
+			if tu.Status.HeldTag != latest.Tag && r.Recorder != nil {
+				r.Recorder.Event(&tu, corev1.EventTypeNormal, "TagHeld", fmt.Sprintf("holding tag %s: %s", latest.Tag, result.message))
+			}
+			tu.Status.HeldTag = latest.Tag
+			meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "MergeChecks", Status: metav1.ConditionFalse, Reason: result.reason, Message: fmt.Sprintf("holding tag %s: %s", latest.Tag, result.message)})
+			setWriteBackNotAttempted(&tu, "tag "+latest.Tag+" is held by merge checks")
+			if err := r.Status().Update(ctx, &tu); err != nil {
+				return ctrl.Result{}, err
+			}
+			// Holding is the controller working as configured, not a stall.
+			r.markReconcileSucceeded(ctx, &tu, progressKey)
+			return ctrl.Result{RequeueAfter: interval}, nil
+		}
+		tu.Status.HeldTag = ""
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "MergeChecks", Status: metav1.ConditionTrue, Reason: result.reason, Message: result.message})
+	}
+
 	var writeResult writeback.Result
 	credentials, err := r.resolveWriteBackCredentials(ctx, &tu)
 	if err == nil {

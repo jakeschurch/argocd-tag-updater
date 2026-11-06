@@ -88,6 +88,45 @@ type RollbackSpec struct {
 	Timeout metav1.Duration `json:"timeout,omitempty"`
 }
 
+// MergeCheckOperator compares a MergeCheck's field.
+// +kubebuilder:validation:Enum=Empty;NotEmpty;Equals;NotEquals
+type MergeCheckOperator string
+
+const (
+	// MergeCheckEmpty passes when the field is missing, null, "", or an empty list or map.
+	MergeCheckEmpty MergeCheckOperator = "Empty"
+	// MergeCheckNotEmpty passes when MergeCheckEmpty would not.
+	MergeCheckNotEmpty MergeCheckOperator = "NotEmpty"
+	// MergeCheckEquals passes when the field, as a string, equals Value.
+	MergeCheckEquals MergeCheckOperator = "Equals"
+	// MergeCheckNotEquals passes when MergeCheckEquals would not.
+	MergeCheckNotEquals MergeCheckOperator = "NotEquals"
+)
+
+// ObjectReference names one object of any kind.
+type ObjectReference struct {
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Name       string `json:"name"`
+	// Namespace is required for namespaced kinds.
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// MergeCheck holds a new tag until a field on another object says the rollout is
+// safe, such as a queue with no batch in flight. The object is read directly from
+// the API server on each poll, so the controller needs get on it.
+type MergeCheck struct {
+	// Name identifies the check in conditions and events.
+	Name   string          `json:"name"`
+	Object ObjectReference `json:"object"`
+	// Field is a dot-notation path into the object, such as status.activeBatch.
+	// Numeric segments index lists.
+	Field    string             `json:"field"`
+	Operator MergeCheckOperator `json:"operator"`
+	// Value is compared by Equals and NotEquals.
+	Value string `json:"value,omitempty"`
+}
+
 // WriteBackSpec identifies the git manifest that is the sole update target.
 type WriteBackSpec struct {
 	// Repo is the git repository containing the target manifest. It is independent
@@ -140,6 +179,10 @@ type TagUpdaterSpec struct {
 	// Rollback commits the previous tag's rendered values when ArgoCD reports a
 	// terminal deployment failure. Requires ArgoCDApp to be set.
 	Rollback *RollbackSpec `json:"rollback,omitempty"`
+	// MergeChecks must all pass before a new tag is written back. Until they do,
+	// the tag is held in status.heldTag and checked again every interval. They do
+	// not gate rollbacks, or re-rendering the current tag after a spec change.
+	MergeChecks []MergeCheck `json:"mergeChecks,omitempty"`
 }
 
 type TagUpdaterStatus struct {
@@ -159,6 +202,9 @@ type TagUpdaterStatus struct {
 	// SkippedTags contains failed tags excluded from Latest() until a newer tag
 	// deploys successfully.
 	SkippedTags []string `json:"skippedTags,omitempty"`
+	// HeldTag is a new tag waiting for spec.mergeChecks to pass. Empty when
+	// nothing is held.
+	HeldTag string `json:"heldTag,omitempty"`
 	// WatchingTag is the deployed tag currently under health observation.
 	WatchingTag string `json:"watchingTag,omitempty"`
 	// WatchingCommit is the pushed manifest commit ArgoCD must observe before the
