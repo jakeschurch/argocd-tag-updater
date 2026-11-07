@@ -184,6 +184,11 @@ type TagUpdaterStatus struct {
 	// SkippedTags contains failed tags excluded from Latest() until a newer tag
 	// deploys successfully.
 	SkippedTags []string `json:"skippedTags,omitempty"`
+	// LastSignedDigest and PreviousSignedDigest are the digests verified by
+	// spec.source.requireSigned for LastTag and PreviousTag. Rollback renders
+	// "signed_digest" from PreviousSignedDigest.
+	LastSignedDigest     string `json:"lastSignedDigest,omitempty"`
+	PreviousSignedDigest string `json:"previousSignedDigest,omitempty"`
 	// AwaitingSignatureTag is the newest matching tag held back by
 	// spec.source.requireSigned because its image carries no signature yet.
 	AwaitingSignatureTag string `json:"awaitingSignatureTag,omitempty"`

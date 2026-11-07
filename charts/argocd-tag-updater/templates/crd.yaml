@@ -374,6 +374,12 @@ spec:
                 description: LastImageDigest and PreviousImageDigest preserve immutable
                   release identities.
                 type: string
+              lastSignedDigest:
+                description: |-
+                  LastSignedDigest and PreviousSignedDigest are the digests verified by
+                  spec.source.requireSigned for LastTag and PreviousTag. Rollback renders
+                  "signed_digest" from PreviousSignedDigest.
+                type: string
               lastTag:
                 type: string
               lastUpdated:
@@ -390,6 +396,8 @@ spec:
                 format: int64
                 type: integer
               previousImageDigest:
+                type: string
+              previousSignedDigest:
                 type: string
               previousTag:
                 description: PreviousTag is the tag applied before LastTag.

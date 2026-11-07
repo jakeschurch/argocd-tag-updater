@@ -194,6 +194,10 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if tu.Spec.Source.RequireSigned != "" {
 		signed, digest, signErr := r.verifySigned(ctx, &tu, ociBasicAuth, latest.Tag, data)
 		if signErr != nil {
+			meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: signatureCondition, Status: metav1.ConditionUnknown, Reason: "SignatureCheckFailed", Message: signErr.Error()})
+			if r.Recorder != nil {
+				r.Recorder.Event(&tu, corev1.EventTypeWarning, "SignatureCheckFailed", signErr.Error())
+			}
 			return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, signErr)
 		}
 		if !signed {
@@ -225,7 +229,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	credentials, err := r.resolveWriteBackCredentials(ctx, &tu)
 	if err == nil {
 		writer := writeback.Writer{Spec: tu.Spec.WriteBack, Credentials: credentials, Targets: tu.Spec.Targets, Data: data}
-		if latest.Tag == tu.Status.LastTag && tu.Status.LastWriteCommit != "" && tu.Status.ObservedGeneration == tu.Generation && (!tu.Spec.Source.ResolveDigest || tu.Status.LastImageDigest == data["image_digest"]) {
+		if latest.Tag == tu.Status.LastTag && tu.Status.LastWriteCommit != "" && tu.Status.ObservedGeneration == tu.Generation && (!tu.Spec.Source.ResolveDigest || tu.Status.LastImageDigest == data["image_digest"]) && tu.Status.LastSignedDigest == data["signed_digest"] {
 			remoteHead, headErr := writer.RemoteHead(ctx)
 			if headErr == nil && writeBackCurrent(latest.Tag, tu.Status, remoteHead) {
 				meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "WriteBackReady", Status: metav1.ConditionTrue, Reason: "RemoteUnchanged", Message: "tag and manifest branch head are unchanged; clone skipped"})
@@ -264,6 +268,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		now := metav1.Now()
 		tu.Status.PreviousTag = tu.Status.LastTag
 		tu.Status.PreviousImageDigest = tu.Status.LastImageDigest
+		tu.Status.PreviousSignedDigest = tu.Status.LastSignedDigest
 		tu.Status.LastTag = latest.Tag
 		tu.Status.LastUpdated = &now
 		if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Spec.ArgoCDApp != nil {
@@ -276,6 +281,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 	tu.Status.LastImageDigest = data["image_digest"]
+	tu.Status.LastSignedDigest = data["signed_digest"]
 	tu.Status.ObservedGeneration = tu.Generation
 	tu.Status.LastWriteCommit = writeResult.CommitSHA
 	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "WrittenToGit", Message: fmt.Sprintf("manifest values for tag %s are present in git", latest.Tag)})
@@ -646,6 +652,9 @@ func (r *TagUpdaterReconciler) doRollback(ctx context.Context, tu *v1alpha1.TagU
 		}
 		data["image_digest"] = tu.Status.PreviousImageDigest
 	}
+	if err := addRollbackSignedDigest(tu, data); err != nil {
+		return err
+	}
 	credentials, err := r.resolveWriteBackCredentials(ctx, tu)
 	if err != nil {
 		return err
@@ -657,6 +666,7 @@ func (r *TagUpdaterReconciler) doRollback(ctx context.Context, tu *v1alpha1.TagU
 	now := metav1.Now()
 	tu.Status.LastTag = previousTag
 	tu.Status.LastImageDigest = data["image_digest"]
+	tu.Status.LastSignedDigest = data["signed_digest"]
 	tu.Status.ObservedGeneration = tu.Generation
 	tu.Status.LastUpdated = &now
 	tu.Status.LastWriteCommit = result.CommitSHA

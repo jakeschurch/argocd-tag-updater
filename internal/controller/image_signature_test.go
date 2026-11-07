@@ -175,6 +175,9 @@ func TestReconcileRequireSignedMarker(t *testing.T) {
 				if updater.Status.LastTag != current.wantTag {
 					t.Fatalf("step %d: status.lastTag %s, want %s", index, updater.Status.LastTag, current.wantTag)
 				}
+				if tc.requireSigned != "" && current.wantTag == newTag && updater.Status.LastSignedDigest != digestNew {
+					t.Fatalf("step %d: status.lastSignedDigest %q, want %q", index, updater.Status.LastSignedDigest, digestNew)
+				}
 				if len(updater.Status.SkippedTags) != 0 {
 					t.Fatalf("step %d: unsigned tag must not be skipped: %v", index, updater.Status.SkippedTags)
 				}
@@ -215,6 +218,110 @@ func TestRequireSignedCachesSignedDigest(t *testing.T) {
 	}
 	if registry.headCount("app.1") != 3 {
 		t.Fatalf("mutable tag must be resolved every time, got %d", registry.headCount("app.1"))
+	}
+}
+
+func TestRollbackRendersRecordedSignedDigest(t *testing.T) {
+	for _, key := range []string{"GIT_TOKEN", "GIT_SSH_KEY_FILE", "GIT_USERNAME", "GIT_PASSWORD"} {
+		t.Setenv(key, "")
+	}
+	digestOld := "sha256:" + strings.Repeat("a", 64)
+	digestNew := "sha256:" + strings.Repeat("b", 64)
+	const oldTag, newTag = "app.main.20261107140000.aaaaaa", "app.main.20261107141002.1dd98a"
+	for _, tc := range []struct {
+		name     string
+		previous string
+		wantErr  bool
+	}{{"with recorded history", digestOld, false}, {"without history fails closed", "", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The registry must not be consulted: the tag may have moved since it deployed.
+			registry := &fakeRegistry{manifests: map[string]string{}, heads: map[string]int{}}
+			server := httptest.NewServer(registry)
+			defer server.Close()
+			remote, repository, initial := signatureManifestRepo(t, newTag)
+			updater := signatureUpdater(server.URL+"/foundry/app", remote, v1.SignatureModeMarker, newTag, initial)
+			updater.Spec.ArgoCDApp = &v1.ArgoCDAppRef{Name: "app"}
+			updater.Spec.Rollback = &v1.RollbackSpec{Enabled: true}
+			updater.Status.PreviousTag = oldTag
+			updater.Status.WatchingTag = newTag
+			updater.Status.LastSignedDigest = digestNew
+			updater.Status.PreviousSignedDigest = tc.previous
+			reconciler := &TagUpdaterReconciler{Client: &digestTestClient{updater: updater}}
+			err := reconciler.rollbackWithStatus(context.Background(), updater)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("rollback error %v, want error %v", err, tc.wantErr)
+			}
+			if registry.totalHeads() != 0 {
+				t.Fatalf("rollback queried the registry %d times", registry.totalHeads())
+			}
+			if tc.wantErr {
+				if manifestTag(t, repository) != newTag {
+					t.Fatal("failed rollback moved the manifest")
+				}
+				condition := meta.FindStatusCondition(updater.Status.Conditions, "RollbackReady")
+				if condition == nil || condition.Reason != "RollbackWriteFailed" || !strings.Contains(condition.Message, "previousSignedDigest") {
+					t.Fatalf("fail-closed rollback not surfaced: %+v", condition)
+				}
+				return
+			}
+			if manifestTag(t, repository) != oldTag || manifestDigest(t, repository) != digestOld {
+				t.Fatalf("rollback wrote tag %s digest %s", manifestTag(t, repository), manifestDigest(t, repository))
+			}
+			if updater.Status.LastSignedDigest != digestOld || updater.Status.WatchingTag != "" {
+				t.Fatalf("rollback status not restored: %+v", updater.Status)
+			}
+		})
+	}
+}
+
+func TestReconcileRequireSignedGitSourceUsesDigestRepo(t *testing.T) {
+	for _, key := range []string{"GIT_TOKEN", "GIT_SSH_KEY_FILE", "GIT_USERNAME", "GIT_PASSWORD"} {
+		t.Setenv(key, "")
+	}
+	digestNew := "sha256:" + strings.Repeat("b", 64)
+	const oldTag, newTag = "app.main.20261107140000.aaaaaa", "app.main.20261107141002.1dd98a"
+	registry := &fakeRegistry{manifests: map[string]string{newTag: digestNew, signedMarkerFor(digestNew): digestNew}, heads: map[string]int{}}
+	server := httptest.NewServer(registry)
+	defer server.Close()
+	remote, repository, initial := signatureManifestRepo(t, oldTag)
+	for _, tag := range []string{oldTag, newTag} {
+		if _, err := repository.CreateTag(tag, initial, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updater := signatureUpdater("", remote, v1.SignatureModeMarker, oldTag, initial)
+	updater.Spec.Source.Type = v1.SourceTypeGit
+	updater.Spec.Source.Repo = remote
+	updater.Spec.Source.DigestRepo = server.URL + "/foundry/app"
+	updater.Spec.Source.ResolveDigest = true
+	reconciler := &TagUpdaterReconciler{Client: &digestTestClient{updater: updater}}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "app", Namespace: "argocd"}}); err != nil {
+		t.Fatal(err)
+	}
+	if manifestTag(t, repository) != newTag || manifestDigest(t, repository) != digestNew {
+		t.Fatalf("git source wrote tag %s digest %s", manifestTag(t, repository), manifestDigest(t, repository))
+	}
+	if registry.headCount(signedMarkerFor(digestNew)) != 1 {
+		t.Fatalf("marker not checked in digestRepo")
+	}
+	if updater.Status.LastImageDigest != digestNew || updater.Status.LastSignedDigest != digestNew {
+		t.Fatalf("digests not recorded: %+v", updater.Status)
+	}
+}
+
+func TestVerifySignedRejectsTagMovedSinceDigestResolution(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("d", 64)
+	registry := &fakeRegistry{manifests: map[string]string{"app.1": digest, signedMarkerFor(digest): digest}, heads: map[string]int{}}
+	server := httptest.NewServer(registry)
+	defer server.Close()
+	updater := &v1.TagUpdater{Spec: v1.TagUpdaterSpec{Source: v1.SourceSpec{Type: v1.SourceTypeGit, DigestRepo: server.URL + "/foundry/app", RequireSigned: v1.SignatureModeMarker}}}
+	data := map[string]string{"image_digest": "sha256:" + strings.Repeat("e", 64)}
+	signed, _, err := (&TagUpdaterReconciler{}).verifySigned(context.Background(), updater, "", "app.1", data)
+	if err == nil || signed || !strings.Contains(err.Error(), "moved") {
+		t.Fatalf("signed=%v err=%v, want tag-moved error", signed, err)
+	}
+	if registry.headCount(signedMarkerFor(digest)) != 0 {
+		t.Fatal("marker checked for a digest that will not be written")
 	}
 }
 

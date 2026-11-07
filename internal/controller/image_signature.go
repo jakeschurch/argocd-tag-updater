@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -125,4 +126,23 @@ func markSigned(tu *v1alpha1.TagUpdater, tag, digest string) {
 func clearSignatureStatus(tu *v1alpha1.TagUpdater) {
 	tu.Status.AwaitingSignatureTag = ""
 	meta.RemoveStatusCondition(&tu.Status.Conditions, signatureCondition)
+}
+
+// addRollbackSignedDigest restores the digest verified when the rollback tag
+// was deployed. The tag is not re-verified: its binding may have moved since.
+// Without a record, a template that renders signed_digest cannot be written,
+// so rollback fails closed with that reason rather than a template error.
+func addRollbackSignedDigest(tu *v1alpha1.TagUpdater, data map[string]string) error {
+	if intsource.ValidDigest(tu.Status.PreviousSignedDigest) {
+		data["signed_digest"] = tu.Status.PreviousSignedDigest
+		return nil
+	}
+	for _, target := range tu.Spec.Targets {
+		for _, patch := range target.Patches {
+			if strings.Contains(patch.Template, "signed_digest") {
+				return fmt.Errorf("rollback to %s requires status.previousSignedDigest, which is not recorded; restore the previous image manually", tu.Status.PreviousTag)
+			}
+		}
+	}
+	return nil
 }
