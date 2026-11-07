@@ -47,3 +47,24 @@ func TestOCIDigestRejectsUnavailableInvalidAndRedirectedRelease(t *testing.T) {
 		})
 	}
 }
+
+func TestOCIHasTagAnswersOnlyPresentOrAbsent(t *testing.T) {
+	for _, tc := range []struct {
+		status  int
+		present bool
+		fails   bool
+	}{{200, true, false}, {404, false, false}, {500, false, true}, {401, false, true}, {302, false, true}} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodHead || r.URL.Path != "/v2/repo/manifests/sha256-"+strings.Repeat("a", 64)+".signed" {
+				t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			}
+			w.Header().Set("Location", "/elsewhere")
+			w.WriteHeader(tc.status)
+		}))
+		present, err := (&OCI{Repo: server.URL + "/repo"}).HasTag(context.Background(), SignedMarkerTag("sha256:"+strings.Repeat("a", 64)))
+		server.Close()
+		if present != tc.present || (err != nil) != tc.fails {
+			t.Errorf("status %d: present=%v err=%v", tc.status, present, err)
+		}
+	}
+}

@@ -49,8 +49,9 @@ spec:
             properties:
               argoCDApp:
                 description: |-
-                  ArgoCDApp is a read-only reference used to observe sync revision and health.
-                  The controller never patches or triggers this Application.
+                  ArgoCDApp is a reference used to observe sync revision and health. The controller
+                  never syncs this Application. It asks it to refresh after a write-back unless
+                  ManagingApp is set.
                 properties:
                   name:
                     type: string
@@ -64,9 +65,9 @@ spec:
                 type: string
               managingApp:
                 description: |-
-                  ManagingApp optionally identifies the read-only app-of-apps Application whose
-                  sync revision must observe the pushed manifest commit. When omitted,
-                  ArgoCDApp is used for both revision and health observation.
+                  ManagingApp optionally identifies the app-of-apps Application whose sync revision
+                  must observe the pushed manifest commit, and which is asked to refresh after a
+                  write-back. When omitted, ArgoCDApp is used for both revision and health observation.
                 properties:
                   name:
                     type: string
@@ -96,8 +97,9 @@ spec:
                       HTTPS Bearer token endpoint.
                     type: string
                   digestRepo:
-                    description: DigestRepo is the OCI repository whose exact git
-                      release tag is resolved.
+                    description: |-
+                      DigestRepo is the OCI repository whose exact git release tag is resolved.
+                      It is also the repository RequireSigned checks for a git source.
                     type: string
                   imagePullSecretRef:
                     description: |-
@@ -114,6 +116,20 @@ spec:
                     description: |-
                       Repo is a git remote URL (git source), OCI repository reference (oci source),
                       or nix cache tag namespace "<host>/<name>" (nix source).
+                    type: string
+                  requireSigned:
+                    description: |-
+                      RequireSigned withholds a new tag until its image is signed. With "marker",
+                      the newest matching tag is resolved to its manifest digest and written only
+                      when the repository also holds the tag <digest with ':' replaced by '-'>.signed.
+                      Until then nothing is written, the SignatureVerified condition is False with
+                      reason AwaitingSignature, and the tag is checked again every interval, so it
+                      deploys once signed. A registry error writes nothing. The repository is
+                      source.repo for an OCI source and source.digestRepo for a git source; nix
+                      sources are rejected. The verified digest is available to templates as
+                      "signed_digest". Unset keeps tag-only behavior.
+                    enum:
+                    - marker
                     type: string
                   resolveDigest:
                     default: false
@@ -292,6 +308,11 @@ spec:
             type: object
           status:
             properties:
+              awaitingSignatureTag:
+                description: |-
+                  AwaitingSignatureTag is the newest matching tag held back by
+                  spec.source.requireSigned because its image carries no signature yet.
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -352,6 +373,12 @@ spec:
                 description: LastImageDigest and PreviousImageDigest preserve immutable
                   release identities.
                 type: string
+              lastSignedDigest:
+                description: |-
+                  LastSignedDigest and PreviousSignedDigest are the digests verified by
+                  spec.source.requireSigned for LastTag and PreviousTag. Rollback renders
+                  "signed_digest" from PreviousSignedDigest.
+                type: string
               lastTag:
                 type: string
               lastUpdated:
@@ -368,6 +395,8 @@ spec:
                 format: int64
                 type: integer
               previousImageDigest:
+                type: string
+              previousSignedDigest:
                 type: string
               previousTag:
                 description: PreviousTag is the tag applied before LastTag.
