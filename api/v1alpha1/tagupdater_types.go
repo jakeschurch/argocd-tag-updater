@@ -10,6 +10,19 @@ const (
 	SourceTypeNix SourceType = "nix"
 )
 
+// SignatureMode selects the evidence a candidate release must carry before it
+// is written. See SourceSpec.RequireSigned.
+type SignatureMode string
+
+const (
+	// SignatureModeMarker requires the release pipeline's signed-marker tag:
+	// the candidate's manifest digest with ':' replaced by '-', plus ".signed",
+	// in the same repository (sha256:abc... -> sha256-abc....signed).
+	SignatureModeMarker SignatureMode = "marker"
+	// TODO: a "cosign" mode verifying the signature against a public key Secret.
+	// It needs sigstore dependencies this module does not vendor yet.
+)
+
 // LocalObjectReference names a secret in the same namespace as the TagUpdater.
 type LocalObjectReference struct {
 	Name string `json:"name"`
@@ -22,8 +35,20 @@ type SourceSpec struct {
 	// +kubebuilder:default=false
 	ResolveDigest bool `json:"resolveDigest,omitempty"`
 	// DigestRepo is the OCI repository whose exact git release tag is resolved.
-	DigestRepo string     `json:"digestRepo,omitempty"`
-	Type       SourceType `json:"type"`
+	// It is also the repository RequireSigned checks for a git source.
+	DigestRepo string `json:"digestRepo,omitempty"`
+	// RequireSigned withholds a new tag until its image is signed. With "marker",
+	// the newest matching tag is resolved to its manifest digest and written only
+	// when the repository also holds the tag <digest with ':' replaced by '-'>.signed.
+	// Until then nothing is written, the SignatureVerified condition is False with
+	// reason AwaitingSignature, and the tag is checked again every interval, so it
+	// deploys once signed. A registry error writes nothing. The repository is
+	// source.repo for an OCI source and source.digestRepo for a git source; nix
+	// sources are rejected. The verified digest is available to templates as
+	// "signed_digest". Unset keeps tag-only behavior.
+	// +kubebuilder:validation:Enum=marker
+	RequireSigned SignatureMode `json:"requireSigned,omitempty"`
+	Type          SourceType    `json:"type"`
 	// Repo is a git remote URL (git source), OCI repository reference (oci source),
 	// or nix cache tag namespace "<host>/<name>" (nix source).
 	Repo string `json:"repo"`
@@ -159,6 +184,9 @@ type TagUpdaterStatus struct {
 	// SkippedTags contains failed tags excluded from Latest() until a newer tag
 	// deploys successfully.
 	SkippedTags []string `json:"skippedTags,omitempty"`
+	// AwaitingSignatureTag is the newest matching tag held back by
+	// spec.source.requireSigned because its image carries no signature yet.
+	AwaitingSignatureTag string `json:"awaitingSignatureTag,omitempty"`
 	// WatchingTag is the deployed tag currently under health observation.
 	WatchingTag string `json:"watchingTag,omitempty"`
 	// WatchingCommit is the pushed manifest commit ArgoCD must observe before the

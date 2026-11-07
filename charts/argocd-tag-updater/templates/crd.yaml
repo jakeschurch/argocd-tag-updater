@@ -98,8 +98,9 @@ spec:
                       HTTPS Bearer token endpoint.
                     type: string
                   digestRepo:
-                    description: DigestRepo is the OCI repository whose exact git
-                      release tag is resolved.
+                    description: |-
+                      DigestRepo is the OCI repository whose exact git release tag is resolved.
+                      It is also the repository RequireSigned checks for a git source.
                     type: string
                   imagePullSecretRef:
                     description: |-
@@ -116,6 +117,20 @@ spec:
                     description: |-
                       Repo is a git remote URL (git source), OCI repository reference (oci source),
                       or nix cache tag namespace "<host>/<name>" (nix source).
+                    type: string
+                  requireSigned:
+                    description: |-
+                      RequireSigned withholds a new tag until its image is signed. With "marker",
+                      the newest matching tag is resolved to its manifest digest and written only
+                      when the repository also holds the tag <digest with ':' replaced by '-'>.signed.
+                      Until then nothing is written, the SignatureVerified condition is False with
+                      reason AwaitingSignature, and the tag is checked again every interval, so it
+                      deploys once signed. A registry error writes nothing. The repository is
+                      source.repo for an OCI source and source.digestRepo for a git source; nix
+                      sources are rejected. The verified digest is available to templates as
+                      "signed_digest". Unset keeps tag-only behavior.
+                    enum:
+                    - marker
                     type: string
                   resolveDigest:
                     default: false
@@ -294,6 +309,11 @@ spec:
             type: object
           status:
             properties:
+              awaitingSignatureTag:
+                description: |-
+                  AwaitingSignatureTag is the newest matching tag held back by
+                  spec.source.requireSigned because its image carries no signature yet.
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

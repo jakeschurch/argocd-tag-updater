@@ -43,6 +43,7 @@ type TagUpdaterReconciler struct {
 	firstRevAttempt atomic.Int64
 	lastRevSuccess  atomic.Int64
 	progress        progressTracker
+	signed          signedDigests
 
 	StaleMultiplier int
 	StaleFloor      time.Duration
@@ -68,6 +69,9 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	r.progress.attempt(progressKey, interval, time.Now())
 	if tu.Spec.Source.ResolveDigest && tu.Spec.Source.Type != v1alpha1.SourceTypeGit {
 		return ctrl.Result{RequeueAfter: interval}, r.setFailedBeforeWriteBack(ctx, &tu, fmt.Errorf("resolveDigest is supported only for Git sources"))
+	}
+	if err := validateRequireSigned(tu.Spec.Source); err != nil {
+		return ctrl.Result{RequeueAfter: interval}, r.setFailedBeforeWriteBack(ctx, &tu, err)
 	}
 	if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Spec.ArgoCDApp == nil {
 		message := "spec.rollback.enabled requires spec.argoCDApp for read-only sync revision and health observation"
@@ -185,6 +189,26 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	if err := r.addImageDigest(ctx, &tu, latest.Tag, data); err != nil {
 		return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, err)
+	}
+
+	if tu.Spec.Source.RequireSigned != "" {
+		signed, digest, signErr := r.verifySigned(ctx, &tu, ociBasicAuth, latest.Tag, data)
+		if signErr != nil {
+			return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, signErr)
+		}
+		if !signed {
+			// Holding is a wait, not a failure: the tag is not skipped, so the
+			// next poll writes it once the pipeline adds its signed marker.
+			if err := r.awaitSignature(ctx, &tu, latest.Tag, digest); err != nil {
+				return ctrl.Result{}, err
+			}
+			r.markReconcileSucceeded(ctx, &tu, progressKey)
+			return ctrl.Result{RequeueAfter: interval}, nil
+		}
+		markSigned(&tu, latest.Tag, digest)
+		data["signed_digest"] = digest
+	} else {
+		clearSignatureStatus(&tu)
 	}
 
 	if tu.Spec.Source.ResolveDigest && latest.Tag == tu.Status.LastTag && intsource.ValidDigest(tu.Status.LastImageDigest) && tu.Status.LastImageDigest != data["image_digest"] {
