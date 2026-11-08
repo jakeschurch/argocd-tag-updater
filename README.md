@@ -276,4 +276,38 @@ A recorded release tag resolving to a different digest fails closed with `Regist
 
 Successful writes retain `status.lastImageDigest` and rotate the old tag's digest to `status.previousImageDigest`. Rollback restores that recorded digest without trusting the tag's current registry binding; missing prior digest history blocks rollback. `status.observedGeneration` and the resolved digest gate the unchanged-head optimization, so enabling digest resolution or changing desired patch fields at an existing tag cannot silently skip write-back.
 
+### Opt-in signature gate
+
+`source.requireSigned: marker` withholds a new tag until its image is signed. The newest matching tag is resolved to its manifest digest (one HEAD), and it is written only when the same repository also holds the release pipeline's signed marker: the digest with `:` replaced by `-`, plus `.signed` (`sha256:abcd…` → `sha256-abcd….signed`). The pipeline pushes that tag only after `cosign sign` succeeds.
+
+```yaml
+source:
+  type: oci
+  repo: http://harbor.oci-registry.svc.cluster.local/foundry/app
+  tagPattern: '^app\.(?P<branch>main)\.(?P<n>\d{14})\.(?P<sha>[0-9a-f]{6})$'
+  requireSigned: marker
+  # Harbor answers the internal host with a token challenge on its external
+  # hostname; a cross-origin realm is followed only when named here.
+  digestAuthRealm: https://registry.example/service/token
+  imagePullSecretRef:
+    name: harbor-pull-secret
+targets:
+  - # ...
+    patches:
+      - field: spec.template.spec.containers.0.image
+        template: 'harbor.oci-registry.svc.cluster.local/foundry/app:{{ .tag }}@{{ .signed_digest }}'
+```
+
+**Upgrade order:** roll out a controller that has this feature before setting `requireSigned` on any TagUpdater. An older controller ignores the field and keeps writing unsigned tags without any error. Once enabled, a `SignatureVerified` condition on the CR confirms the gate is active.
+
+- **Unsigned:** nothing is written. `status.awaitingSignatureTag` names the held tag, the `SignatureVerified` and `Ready` conditions are False with reason `AwaitingSignature`, and one `AwaitingSignature` Warning event is recorded per held tag. The tag is not added to `skippedTags`; it is checked again every `interval` and written once its marker appears.
+- **Registry error** (anything but 200 or 404 on the tag or the marker): nothing is written, the reconcile fails as for any pre-write-back error, `SignatureVerified` becomes Unknown with reason `SignatureCheckFailed`, and a `SignatureCheckFailed` Warning event is recorded.
+- **Rollback** renders `{{ .signed_digest }}` from `status.previousSignedDigest`, the digest verified when that tag deployed, without asking the registry again. Written digests are kept in `status.lastSignedDigest` / `previousSignedDigest`. If a template uses `signed_digest` and no previous digest is recorded (the tag deployed before the gate was enabled), rollback fails closed with `RollbackWriteFailed`; restore that image by hand.
+- **No fallback:** an older signed tag is never written in place of an unsigned newer one, so enabling the gate cannot roll a deployment back. A tag already in git that is unsigned is held there, reported as `AwaitingSignature`, until a newer signed tag arrives.
+- **Repository:** `source.repo` for an OCI source; `source.digestRepo` for a git source (required). Nix sources are rejected. With `resolveDigest` the resolved `image_digest` must equal the verified digest.
+- **Cost:** the candidate tag is resolved on every poll, since tags can move. A digest found signed is cached in memory; absence is never cached.
+- Unset, the controller makes no extra registry requests and behaves as before.
+
+The verified digest is exposed to templates as `{{ .signed_digest }}`. Writing `repo:{{ .tag }}@{{ .signed_digest }}` pins the image that was checked; a bare `{{ .tag }}` leaves a window in which the tag could be moved after the check. The check is a marker, not a cryptographic verification: it trusts whoever can push tags to the repository. Verifying the cosign signature against a public key Secret is a planned `cosign` mode.
+
 CRD generation: `CGO_ENABLED=0 controller-gen crd paths=./api/... output:crd:artifacts:config=config/crd` and `CGO_ENABLED=0 controller-gen object paths=./api/...`; the Helm CRD mirrors the generated schema inside its install conditional. The optional real Harbor test uses `LIVE_HARBOR_DIGEST_TEST=1` and `LIVE_HARBOR_REPOSITORY`. `LIVE_HARBOR_PULL_SECRET=1` explicitly authorizes reading the existing argocd/harbor-pull-secret into test memory for the known registry release; no credentials or tokens are printed. Without that flag the release must be anonymously readable.
