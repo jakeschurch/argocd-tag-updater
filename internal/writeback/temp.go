@@ -47,6 +47,8 @@ func newCloneDirectory() (string, error) {
 	return cloneDirectoryPath, nil
 }
 
+// ensureWritebackTempDir allows an inherited setgid bit, as on Kubernetes fsGroup
+// volumes, while requiring the current owner and private access permissions.
 func ensureWritebackTempDir() (string, error) {
 	root := filepath.Join(os.TempDir(), writebackTempDirName)
 	if err := os.Mkdir(root, 0o700); err != nil && !os.IsExist(err) {
@@ -62,7 +64,8 @@ func ensureWritebackTempDir() (string, error) {
 	if rootStatus.Uid != uint32(os.Geteuid()) {
 		return "", fmt.Errorf("write-back temp root %s is owned by uid %d, current uid is %d", root, rootStatus.Uid, os.Geteuid())
 	}
-	if rootStatus.Mode&0o7777 != 0o700 {
+	privateMode := rootStatus.Mode &^ unix.S_ISGID
+	if privateMode&0o7777 != 0o700 {
 		return "", fmt.Errorf("write-back temp root %s must be owner-only mode 0700", root)
 	}
 	return root, nil
