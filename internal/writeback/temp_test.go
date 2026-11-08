@@ -113,3 +113,47 @@ func TestPrepareWritebackTempDirRejectsSymlinkRoot(t *testing.T) {
 		t.Fatalf("symlink target was changed: info=%v err=%v", info, err)
 	}
 }
+
+func TestPrepareWritebackTempDirUnderSetgidParent(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o700|os.ModeSetgid); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", parent)
+	release, err := PrepareWritebackTempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	root := filepath.Join(parent, writebackTempDirName)
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 || info.Mode()&os.ModeSetgid == 0 {
+		t.Fatalf("private inherited directory mode: %v", info.Mode())
+	}
+	clone, err := newCloneDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(clone); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("clone lost private permissions: info=%v error=%v", info, err)
+	}
+}
+
+func TestPrepareWritebackTempDirRejectsGroupAccessWithSetgid(t *testing.T) {
+	parent := t.TempDir()
+	t.Setenv("TMPDIR", parent)
+	root := filepath.Join(parent, writebackTempDirName)
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o770|os.ModeSetgid); err != nil {
+		t.Fatal(err)
+	}
+	if release, err := PrepareWritebackTempDir(); err == nil {
+		release()
+		t.Fatal("group-writable root accepted")
+	}
+}
