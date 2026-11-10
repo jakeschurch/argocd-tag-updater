@@ -60,6 +60,13 @@ selfUpdate:
   enabled: false
   # Application to patch. Defaults to the chart fullname.
   argoCDAppName: ""
+  # Extra metadata.labels on the self-update TagUpdater, added to the chart's
+  # standard labels. Cluster tooling selects TagUpdaters by label (for example
+  # foundry.io/source-repo), so the cluster sets them here. Keys must not
+  # repeat a standard chart label.
+  labels: {}
+  #  foundry.io/source-repo: foundry-labs.argocd-tag-updater
+  # How often the tag stream is polled (Go duration, e.g. 10m).
   interval: 15s
   managingApp:
     name: cluster-apps
