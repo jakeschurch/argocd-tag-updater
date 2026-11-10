@@ -287,6 +287,22 @@ kubectl apply -f config/crd/updater.argocd.io_tagupdaters.yaml
 # helm chart coming soon
 ```
 
+### Chart: self-updating controller
+
+The chart in `charts/argocd-tag-updater` can render the controller's own TagUpdater. It is off by default. Values under `selfUpdate`:
+
+| Value | Default | Meaning |
+|---|---|---|
+| `selfUpdate.enabled` | `false` | Render the self-update TagUpdater. |
+| `selfUpdate.interval` | `15s` | Poll interval for the tag stream (Go duration). |
+| `selfUpdate.labels` | `{}` | Extra `metadata.labels` on the TagUpdater, added to the chart's standard labels. Use for cluster tooling that selects TagUpdaters by label, such as `foundry.io/source-repo`. |
+| `selfUpdate.argoCDAppName` | chart fullname | Application to patch. |
+| `selfUpdate.managingApp` | `cluster-apps` in `argocd` | App that owns the Application. |
+| `selfUpdate.source.repo` | required | Git tag stream to watch. |
+| `selfUpdate.source.tagPattern` | release tag regex | Tag pattern with `branch`, `n`, `sha` captures. |
+| `selfUpdate.flakeRefTemplate` | required | Template for `nixMount.flakeRef`. |
+| `selfUpdate.writeBack` | `{}` | Git write-back target (`repo`, `branch`, `path`, `credentialsSecretRef`, `commitAuthor`). |
+
 ### Opt-in immutable image digests
 
 `source.resolveDigest: true` enables exact-tag manifest HEAD resolution for **Git release sources only**, exposing `{{ .image_digest }}`. It defaults to false. `source.digestRepo` identifies the registry repository whose tag matches the selected Git tag. CI must publish Git tags only after image signing and attestation; registry tag listing alone is not a release gate. Opt-in OCI/Nix sources are rejected, preserving their legacy tag behavior without introducing credential-bearing pagination paths.
