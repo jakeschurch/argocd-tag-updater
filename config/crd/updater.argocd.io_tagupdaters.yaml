@@ -210,6 +210,15 @@ spec:
                         - message: expectedValue is only supported for remove
                           rule: self.operation == 'remove' || !has(self.expectedValue)
                       type: array
+                    path:
+                      description: |-
+                        Path is the repository-relative path, inside writeBack.repo, of the YAML
+                        manifest holding this target. Set it on every target, and leave
+                        writeBack.path empty, to update several files from one tag: all files
+                        are edited in a single commit and pushed once, and if any target fails
+                        nothing is written. Leave it empty on every target to use writeBack.path.
+                        Setting both writeBack.path and a target path is rejected.
+                      type: string
                     selector:
                       description: |-
                         Selector dynamically selects CRs by label. All matching CRs receive every patch.
@@ -306,7 +315,9 @@ spec:
                   path:
                     description: |-
                       Path is the repository-relative path to a YAML manifest. Multi-document YAML
-                      is supported; target identity selects the document to edit.
+                      is supported; target identity selects the document to edit. Exactly one of
+                      path and per-target spec.targets[].path is required: leave this empty
+                      when every target names its own file.
                     type: string
                   repo:
                     description: |-
@@ -315,7 +326,6 @@ spec:
                     type: string
                 required:
                 - branch
-                - path
                 - repo
                 type: object
             required:

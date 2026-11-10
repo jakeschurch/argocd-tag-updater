@@ -86,9 +86,13 @@ func (w Writer) RemoteHead(ctx context.Context) (string, error) {
 }
 
 func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoURL string) (Result, error) {
-	_, cleanPath, err := safeManifestPath(".", w.Spec.Path)
+	files, err := manifestFiles(w.Spec, w.Targets)
 	if err != nil {
 		return Result{}, err
+	}
+	cleanPaths := make([]string, 0, len(files))
+	for _, file := range files {
+		cleanPaths = append(cleanPaths, file.path)
 	}
 	cloneDirectoryPath, err := newCloneDirectory()
 	if err != nil {
@@ -96,34 +100,48 @@ func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoUR
 	}
 	defer func() { _ = os.RemoveAll(cloneDirectoryPath) }()
 
-	repo, workingTree, err := cloneBranchForWriteback(ctx, cloneDirectoryPath, repoURL, auth, w.Spec.Branch, cleanPath)
+	repo, workingTree, err := cloneBranchForWriteback(ctx, cloneDirectoryPath, repoURL, auth, w.Spec.Branch, cleanPaths)
 	if err != nil {
 		return Result{}, err
 	}
-	manifestPath, _, err := safeManifestPath(cloneDirectoryPath, w.Spec.Path)
-	if err != nil {
-		return Result{}, err
+	// Every file is edited in memory before any is written, so a target that
+	// fails in a later file leaves the clone, and therefore the branch, as is.
+	type fileEdit struct {
+		absolute, clean string
+		output          []byte
 	}
-	input, err := os.ReadFile(manifestPath)
-	if err != nil {
-		return Result{}, fmt.Errorf("read manifest %s: %w", w.Spec.Path, err)
+	var edits []fileEdit
+	for _, file := range files {
+		manifestPath, _, err := safeManifestPath(cloneDirectoryPath, file.path)
+		if err != nil {
+			return Result{}, err
+		}
+		input, err := os.ReadFile(manifestPath)
+		if err != nil {
+			return Result{}, fmt.Errorf("read manifest %s: %w", file.path, err)
+		}
+		output, changed, err := UpdateManifest(input, file.targets, w.Data)
+		if err != nil {
+			return Result{}, fmt.Errorf("edit manifest %s: %w", file.path, err)
+		}
+		if changed {
+			edits = append(edits, fileEdit{absolute: manifestPath, clean: file.path, output: output})
+		}
 	}
-	output, changed, err := UpdateManifest(input, w.Targets, w.Data)
-	if err != nil {
-		return Result{}, fmt.Errorf("edit manifest %s: %w", w.Spec.Path, err)
-	}
-	if !changed {
+	if len(edits) == 0 {
 		head, headErr := repo.Head()
 		if headErr != nil {
 			return Result{}, fmt.Errorf("resolve manifest branch head: %w", headErr)
 		}
 		return Result{CommitSHA: head.Hash().String()}, nil
 	}
-	if err := os.WriteFile(manifestPath, output, 0o600); err != nil {
-		return Result{}, fmt.Errorf("write manifest %s: %w", w.Spec.Path, err)
-	}
-	if _, err := workingTree.Add(cleanPath); err != nil {
-		return Result{}, fmt.Errorf("stage manifest %s: %w", cleanPath, err)
+	for _, edit := range edits {
+		if err := os.WriteFile(edit.absolute, edit.output, 0o600); err != nil {
+			return Result{}, fmt.Errorf("write manifest %s: %w", edit.clean, err)
+		}
+		if _, err := workingTree.Add(edit.clean); err != nil {
+			return Result{}, fmt.Errorf("stage manifest %s: %w", edit.clean, err)
+		}
 	}
 	commitHash, err := workingTree.Commit(w.commitMessage(), &git.CommitOptions{Author: w.signature(time.Now())})
 	if errors.Is(err, git.ErrEmptyCommit) {
@@ -134,7 +152,7 @@ func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoUR
 		return Result{CommitSHA: head.Hash().String()}, nil
 	}
 	if err != nil {
-		return Result{}, fmt.Errorf("commit manifest %s: %w", w.Spec.Path, err)
+		return Result{}, fmt.Errorf("commit manifest %s: %w", strings.Join(cleanPaths, ", "), err)
 	}
 	if err := repo.PushContext(ctx, &git.PushOptions{Auth: auth}); err != nil {
 		return Result{}, err
@@ -142,8 +160,85 @@ func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoUR
 	return Result{Committed: true, CommitSHA: commitHash.String()}, nil
 }
 
+// manifestFile is one manifest in the write-back repository and every target
+// that edits it.
+type manifestFile struct {
+	// path is cleaned, slash-separated and repository-relative.
+	path    string
+	targets []v1alpha1.TargetSpec
+}
+
+// TargetPath is the manifest a target edits: its own path, or else the
+// write-back path.
+func TargetPath(spec v1alpha1.WriteBackSpec, target v1alpha1.TargetSpec) string {
+	if strings.TrimSpace(target.Path) != "" {
+		return target.Path
+	}
+	return spec.Path
+}
+
+// ValidatePaths requires exactly one way of naming manifests: either
+// writeBack.path with no target paths (one file), or a path on every target
+// and no writeBack.path (one or more files).
+func ValidatePaths(spec v1alpha1.WriteBackSpec, targets []v1alpha1.TargetSpec) error {
+	specPath := strings.TrimSpace(spec.Path) != ""
+	var withPath []string
+	without := 0
+	for index, target := range targets {
+		if strings.TrimSpace(target.Path) != "" {
+			withPath = append(withPath, fmt.Sprintf("spec.targets[%d].path", index))
+		} else {
+			without++
+		}
+	}
+	switch {
+	case specPath && len(withPath) > 0:
+		return fmt.Errorf("spec.writeBack.path and per-target paths are mutually exclusive; remove spec.writeBack.path or %s", strings.Join(withPath, ", "))
+	case !specPath && len(withPath) == 0:
+		return fmt.Errorf("spec.writeBack.path is empty and no target sets path")
+	case !specPath && without > 0:
+		return fmt.Errorf("spec.writeBack.path is empty, so every target must set path; %d target(s) do not", without)
+	}
+	return nil
+}
+
+// manifestFiles groups targets by the file they edit, in path order. Paths are
+// compared after cleaning, so "./a.yaml" and "a.yaml" are the same file and
+// one UpdateManifest call sees all of its edits.
+func manifestFiles(spec v1alpha1.WriteBackSpec, targets []v1alpha1.TargetSpec) ([]manifestFile, error) {
+	if err := ValidatePaths(spec, targets); err != nil {
+		return nil, err
+	}
+	if len(targets) == 0 {
+		// Nothing to edit, but the configured file must still exist and be
+		// readable, as before per-target paths existed.
+		_, clean, err := safeManifestPath(".", spec.Path)
+		if err != nil {
+			return nil, err
+		}
+		return []manifestFile{{path: clean}}, nil
+	}
+	byPath := map[string]int{}
+	var files []manifestFile
+	for _, target := range targets {
+		_, clean, err := safeManifestPath(".", TargetPath(spec, target))
+		if err != nil {
+			return nil, err
+		}
+		index, found := byPath[clean]
+		if !found {
+			index = len(files)
+			byPath[clean] = index
+			files = append(files, manifestFile{path: clean})
+		}
+		files[index].targets = append(files[index].targets, target)
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
+	return files, nil
+}
+
 // cloneBranchForWriteback uses go-git's path-prefix sparse checkout; a tracked
-// path beginning with the manifest path may also be materialized. Depth limits
+// path beginning with a manifest path may also be materialized. Depth limits
 // commit history, but go-git still fetches all blobs from the branch tip.
 func cloneBranchForWriteback(
 	ctx context.Context,
@@ -151,7 +246,7 @@ func cloneBranchForWriteback(
 	repoURL string,
 	auth transport.AuthMethod,
 	branchName string,
-	manifestPath string,
+	manifestPaths []string,
 ) (*git.Repository, *git.Worktree, error) {
 	branch := plumbing.NewBranchReferenceName(branchName)
 	repo, err := git.PlainCloneContext(ctx, cloneDirectoryPath, false, &git.CloneOptions{
@@ -166,9 +261,9 @@ func cloneBranchForWriteback(
 		return nil, nil, fmt.Errorf("open worktree: %w", err)
 	}
 	if err := workingTree.Checkout(&git.CheckoutOptions{
-		Branch: branch, SparseCheckoutDirectories: []string{manifestPath},
+		Branch: branch, SparseCheckoutDirectories: manifestPaths,
 	}); err != nil {
-		return nil, nil, fmt.Errorf("checkout manifest %s: %w", manifestPath, err)
+		return nil, nil, fmt.Errorf("checkout manifest %s: %w", strings.Join(manifestPaths, ", "), err)
 	}
 	return repo, workingTree, nil
 }
@@ -273,8 +368,14 @@ func (w Writer) commitMessage() string {
 	}
 	fields := make([]string, 0)
 	for _, target := range w.Targets {
+		// A per-target path names the file too, since one commit can now
+		// touch several; single-path messages are unchanged.
+		prefix := ""
+		if strings.TrimSpace(target.Path) != "" {
+			prefix = filepath.ToSlash(filepath.Clean(target.Path)) + ":"
+		}
 		for _, patch := range target.Patches {
-			fields = append(fields, target.Kind+"/"+target.Name+":"+patch.Field)
+			fields = append(fields, prefix+target.Kind+"/"+target.Name+":"+patch.Field)
 		}
 	}
 	sort.Strings(fields)

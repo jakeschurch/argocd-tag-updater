@@ -86,6 +86,13 @@ type PatchSpec struct {
 }
 
 type TargetSpec struct {
+	// Path is the repository-relative path, inside writeBack.repo, of the YAML
+	// manifest holding this target. Set it on every target, and leave
+	// writeBack.path empty, to update several files from one tag: all files
+	// are edited in a single commit and pushed once, and if any target fails
+	// nothing is written. Leave it empty on every target to use writeBack.path.
+	// Setting both writeBack.path and a target path is rejected.
+	Path       string `json:"path,omitempty"`
 	APIVersion string `json:"apiVersion"`
 	Kind       string `json:"kind"`
 	// Name selects a specific CR by name. Mutually exclusive with Selector.
@@ -113,7 +120,8 @@ type RollbackSpec struct {
 	Timeout metav1.Duration `json:"timeout,omitempty"`
 }
 
-// WriteBackSpec identifies the git manifest that is the sole update target.
+// WriteBackSpec identifies the git repository and manifest file(s) that are the
+// sole update target.
 type WriteBackSpec struct {
 	// Repo is the git repository containing the target manifest. It is independent
 	// of source.repo, which is only the tag source.
@@ -121,8 +129,10 @@ type WriteBackSpec struct {
 	// Branch is the branch cloned and pushed by the controller.
 	Branch string `json:"branch"`
 	// Path is the repository-relative path to a YAML manifest. Multi-document YAML
-	// is supported; target identity selects the document to edit.
-	Path string `json:"path"`
+	// is supported; target identity selects the document to edit. Exactly one of
+	// path and per-target spec.targets[].path is required: leave this empty
+	// when every target names its own file.
+	Path string `json:"path,omitempty"`
 	// CredentialsSecretRef optionally names a Secret in the TagUpdater namespace.
 	// It takes precedence over the controller's mounted Git credentials. Supported
 	// authentication keys are token (optionally with username), username/password,
