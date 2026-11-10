@@ -1,0 +1,33 @@
+# Native checks qualified before queue activation; every selected check blocks landing.
+apiVersion: ci.foundrybox.dev/v1alpha1
+kind: CheckSuite
+metadata:
+  name: argocd-tag-updater-checks
+  namespace: argo
+spec:
+  repositoryRef:
+    name: argocd-tag-updater
+    namespace: forgejo
+  context: margo/argocd-tag-updater-checks
+  checkout:
+    url: ssh://git@forgejo-ssh.forgejo.svc.cluster.local:22/jake/argocd-tag-updater.git
+    deployKeySecret: argocd-tag-updater-margo-readonly
+  checks:
+    - name: go:test
+      template: go-test
+      kind: test
+    - name: go:vet
+      template: go-vet
+    - name: gofmt
+      template: gofmt-check
+    - name: vendor:drift
+      template: generate-drift
+      params:
+        command: go mod vendor
+    - name: nix:bundle
+      template: nix-build
+      required: true
+      params:
+        # The bundle is what the main build tags and the type:nix TagUpdater
+        # deploys, so the check builds the same attribute.
+        attr: .#argocd-tag-updater-bundle
