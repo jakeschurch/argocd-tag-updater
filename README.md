@@ -119,7 +119,40 @@ By default, write-back uses the controller's mounted `GIT_SSH_KEY_FILE` and
 `credentialsSecretRef`; the Secret must be in the TagUpdater namespace and
 contain `token`, `username` plus `password`, or `sshPrivateKey`. SSH credentials
 must also contain a `knownHosts` entry; `insecureIgnoreHostKey: "true"` is
-available only as an explicit opt-in. The manifest may contain
+available only as an explicit opt-in.
+
+**HTTPS token write-back (robot identity).** SSH deploy keys make the git host
+record the key's repo owner as the pusher. To push as a dedicated robot account
+instead, set `writeBack.repo` to an `http://` or `https://` URL and put
+`token` plus `username` (the robot's login) in the Secret; the controller
+authenticates with HTTP basic auth `username:token`. SSH remains the default;
+if the Secret also holds `sshPrivateKey`, SSH wins, so remove it when
+migrating. A token without `username` authenticates as `x-access-token`.
+An `ssh://` or scp-style repo URL is rewritten to `https://` with the SSH port
+dropped, but in-cluster hosts that serve plain HTTP on a custom port need the
+explicit `http://host:port/...` URL.
+
+```yaml
+spec:
+  writeBack:
+    repo: http://forgejo-http.forgejo.svc.cluster.local:3000/jake/homelab.git
+    branch: v1
+    path: vmetal/apps/argocd-tag-updater.yaml
+    credentialsSecretRef:
+      name: argocd-tag-updater-forgejo-writeback   # keys: token, username
+    commitAuthor:          # optional
+      name: margo-robot
+      email: margo-robot@noreply.forgejo.example
+```
+
+The commit author defaults to `argocd-tag-updater <argocd-tag-updater@localhost>`
+for SSH and username/password. With token auth and a `username` it defaults to that username and
+`<username>@noreply.<repo host>`; `commitAuthor.name`/`email` override either
+default per field. The author is informational: the git host attributes the push
+to the authenticated account, so identity checks must key on the pusher, not the
+commit author email.
+
+The manifest may contain
 multiple YAML documents; each target is selected by apiVersion, kind,
 name/namespace or label selector. Only configured scalar field tokens are
 replaced, preserving comments and unrelated formatting. No commit is created

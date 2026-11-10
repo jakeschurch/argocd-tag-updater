@@ -55,5 +55,14 @@ spec:
     credentialsSecretRef:
       name: {{ .name }}
     {{- end }}
+    {{- with .commitAuthor }}
+    commitAuthor:
+      {{- with .name }}
+      name: {{ . | quote }}
+      {{- end }}
+      {{- with .email }}
+      email: {{ . | quote }}
+      {{- end }}
+    {{- end }}
   {{- end }}
 {{- end }}

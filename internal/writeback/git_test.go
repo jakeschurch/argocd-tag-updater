@@ -239,6 +239,9 @@ spec:
 	if !strings.Contains(commit.Message, "v2") || !strings.Contains(commit.Message, "spec.sources.0.targetRevision") {
 		t.Fatalf("commit message lacks provenance: %q", commit.Message)
 	}
+	if commit.Author.Name != "argocd-tag-updater" || commit.Author.Email != "argocd-tag-updater@localhost" {
+		t.Fatalf("default author = %q <%s>, want historical argocd-tag-updater identity", commit.Author.Name, commit.Author.Email)
+	}
 	if len(commit.ParentHashes) != 1 || commit.ParentHashes[0] != latestCommit {
 		t.Fatalf("pushed commit parent %v, want branch tip %s", commit.ParentHashes, latestCommit)
 	}
