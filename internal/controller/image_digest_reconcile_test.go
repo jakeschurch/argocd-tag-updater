@@ -216,8 +216,11 @@ func TestReconcileUnverifiableDigestNeverWritesManifest(t *testing.T) {
 			updater := &v1.TagUpdater{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "argocd", Generation: 1}, Spec: v1.TagUpdaterSpec{Source: v1.SourceSpec{Type: v1.SourceTypeGit, Repo: remote, TagPattern: `^(?P<label>[AB])\.(?P<n>\d+)$`, ResolveDigest: true, DigestRepo: server.URL + "/repo"}, WriteBack: v1.WriteBackSpec{Repo: remote, Branch: "master", Path: "app.yaml", CredentialsSecretRef: v1.LocalObjectReference{Name: "test-credentials"}}, Targets: []v1.TargetSpec{{APIVersion: "argoproj.io/v1alpha1", Kind: "Application", Name: "test", Namespace: "argocd", Patches: []v1.PatchSpec{{Field: "spec.image.tag", Template: "{{ .tag }}"}, {Field: "spec.image.digest", Template: "{{ .image_digest }}"}}}}}, Status: v1.TagUpdaterStatus{LastTag: "A.1", LastImageDigest: previousDigest, LastWriteCommit: commit.String(), ObservedGeneration: 1}}
 			storage := &digestTestClient{updater: updater}
 			reconciler := &TagUpdaterReconciler{Client: storage}
-			if _, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "argocd"}}); err == nil {
-				t.Fatal("unverifiable digest must fail the reconcile")
+			// The failure is surfaced on Ready and retried on the bounded fast
+			// schedule, not returned to the workqueue's rate limiter.
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "argocd"}})
+			if err != nil || result.RequeueAfter != fastRetryInitial {
+				t.Fatalf("unverifiable digest: result=%+v err=%v, want requeue after %s", result, err, fastRetryInitial)
 			}
 			head, _ := bare.Head()
 			if head.Hash() != commit {

@@ -45,10 +45,14 @@ type TagUpdaterReconciler struct {
 	firstRevAttempt atomic.Int64
 	lastRevSuccess  atomic.Int64
 	progress        progressTracker
+	fastRetry       fastRetryTracker
 	signed          signedDigests
 
 	StaleMultiplier int
 	StaleFloor      time.Duration
+
+	// now is the clock for fast-retry windows; nil means time.Now.
+	now func() time.Time
 }
 
 const defaultRollbackTimeout = 20 * time.Minute
@@ -59,6 +63,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, req.NamespacedName, &tu); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.progress.forget(req.String())
+			r.fastRetry.reset(req.String())
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -145,7 +150,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	tags, err := src.Tags(ctx)
 	if err != nil {
-		return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, err)
+		return r.transientFailure(ctx, &tu, progressKey, "", interval, err)
 	}
 	m, err := matcher.New(tu.Spec.Source.TagPattern)
 	if err != nil {
@@ -153,6 +158,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	latest, ok := m.Latest(filterSkipped(tags, tu.Status.SkippedTags))
 	if !ok {
+		r.fastRetry.reset(progressKey)
 		// Refresh BOTH conditions before returning. This path used to return
 		// with only Stalled touched, so Ready/WriteBackReady kept whatever the
 		// last reconcile that got past here left behind — a source or
@@ -179,18 +185,18 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if resolver, ok := src.(intsource.TagResolver); ok {
 		extra, resolveErr := resolver.Resolve(ctx, latest.Tag)
 		if resolveErr != nil {
-			return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, fmt.Errorf("resolve release record for tag %s: %w", latest.Tag, resolveErr))
+			return r.transientFailure(ctx, &tu, progressKey, latest.Tag, interval, fmt.Errorf("resolve release record for tag %s: %w", latest.Tag, resolveErr))
 		}
 		for key, value := range extra {
 			data[key] = value
 		}
 	}
 	if err := r.addRev(ctx, src, latest.Tag, data); err != nil {
-		return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, err)
+		return r.transientFailure(ctx, &tu, progressKey, latest.Tag, interval, err)
 	}
 
 	if err := r.addImageDigest(ctx, &tu, latest.Tag, data); err != nil {
-		return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, err)
+		return r.transientFailure(ctx, &tu, progressKey, latest.Tag, interval, err)
 	}
 
 	if tu.Spec.Source.RequireSigned != "" {
@@ -200,7 +206,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			if r.Recorder != nil {
 				r.Recorder.Event(&tu, corev1.EventTypeWarning, "SignatureCheckFailed", signErr.Error())
 			}
-			return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, signErr)
+			return r.transientFailure(ctx, &tu, progressKey, latest.Tag, interval, signErr)
 		}
 		if !signed {
 			// Holding is a wait, not a failure: the tag is not skipped, so the
@@ -209,13 +215,19 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				return ctrl.Result{}, err
 			}
 			r.markReconcileSucceeded(ctx, &tu, progressKey)
-			return ctrl.Result{RequeueAfter: interval}, nil
+			// The marker is expected moments after the tag: poll quickly for a
+			// bounded time instead of idling a whole interval.
+			return ctrl.Result{RequeueAfter: r.fastRetry.next(progressKey, latest.Tag, r.clock(), interval)}, nil
 		}
 		markSigned(&tu, latest.Tag, digest)
 		data["signed_digest"] = digest
 	} else {
 		clearSignatureStatus(&tu)
 	}
+
+	// Past every transient gate: whatever follows is write-back, which keeps its
+	// own error handling, and steady/WrittenToGit must wait the full interval.
+	r.fastRetry.reset(progressKey)
 
 	if tu.Spec.Source.ResolveDigest && latest.Tag == tu.Status.LastTag && intsource.ValidDigest(tu.Status.LastImageDigest) && tu.Status.LastImageDigest != data["image_digest"] {
 		message := "registry digest changed for the recorded release tag; refusing to replace the known-good image"
@@ -877,6 +889,24 @@ func (r *TagUpdaterReconciler) revResolutionHealth(now time.Time) error {
 		return fmt.Errorf("git tag->rev resolution stale: %s %s ago (>%s)", anchor, age.Round(time.Second), revStaleAfter)
 	}
 	return nil
+}
+
+func (r *TagUpdaterReconciler) clock() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
+// transientFailure records cause like setFailedBeforeWriteBack but, instead of
+// returning it to controller-runtime (whose rate limiter ignores spec.interval),
+// requeues on the bounded fast-retry schedule and then on spec.interval. The
+// error is logged and shown in Ready=False/Error rather than returned.
+func (r *TagUpdaterReconciler) transientFailure(ctx context.Context, tu *v1alpha1.TagUpdater, key, tag string, interval time.Duration, cause error) (ctrl.Result, error) {
+	_ = r.setFailedBeforeWriteBack(ctx, tu, cause)
+	after := r.fastRetry.next(key, tag, r.clock(), interval)
+	log.FromContext(ctx).Error(cause, "transient source error; will retry", "tag", tag, "after", after.String())
+	return ctrl.Result{RequeueAfter: after}, nil
 }
 
 // setWriteBackNotAttempted records that this reconcile ended before the

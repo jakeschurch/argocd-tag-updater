@@ -12,6 +12,15 @@ Inspired by [ArgoCD Image Updater](https://github.com/argoproj-labs/argocd-image
 4. The rendered value is written surgically into the configured manifest.
 5. The controller commits and pushes the manifest; ArgoCD converges from git.
 
+### Requeue timing
+
+A steady updater, or one whose tag was written to git, waits the full `spec.interval` between polls (a webhook can still wake it earlier). A wake can arrive before the newest tag is usable, though, and idling a whole interval after the missing piece appears is slow. So while the newest candidate is in a transient state, the controller requeues on a short doubling backoff (15s, 30s, 1m, then 2m, never above `spec.interval`) instead:
+
+- the tag is `AwaitingSignature` (no signed marker yet);
+- a source or registry lookup failed: the git fetch or tag listing, the nix-cache release record, the registry digest lookup, or the signature check.
+
+The fast phase lasts at most 15 minutes from when that state first appeared for the tag (kept in memory; a controller restart starts a new window). After that the updater falls back to `spec.interval` until the state clears. Failures in this set are logged and shown as `Ready=False` / `Error` but are not returned to controller-runtime, so its workqueue rate limiter does not apply and `controller_runtime_reconcile_errors_total` does not count them. No CRD change.
+
 ## Example use case — Nix flake refs
 
 Push a git tag from CI:
@@ -359,8 +368,8 @@ targets:
 
 **Upgrade order:** roll out a controller that has this feature before setting `requireSigned` on any TagUpdater. An older controller ignores the field and keeps writing unsigned tags without any error. Once enabled, a `SignatureVerified` condition on the CR confirms the gate is active.
 
-- **Unsigned:** nothing is written. `status.awaitingSignatureTag` names the held tag, the `SignatureVerified` and `Ready` conditions are False with reason `AwaitingSignature`, and one `AwaitingSignature` Warning event is recorded per held tag. The tag is not added to `skippedTags`; it is checked again every `interval` and written once its marker appears.
-- **Registry error** (anything but 200 or 404 on the tag or the marker): nothing is written, the reconcile fails as for any pre-write-back error, `SignatureVerified` becomes Unknown with reason `SignatureCheckFailed`, and a `SignatureCheckFailed` Warning event is recorded.
+- **Unsigned:** nothing is written. `status.awaitingSignatureTag` names the held tag, the `SignatureVerified` and `Ready` conditions are False with reason `AwaitingSignature`, and one `AwaitingSignature` Warning event is recorded per held tag. The tag is not added to `skippedTags`; it is rechecked on the fast-retry schedule (see Requeue timing) and written once its marker appears.
+- **Registry error** (anything but 200 or 404 on the tag or the marker): nothing is written, the reconcile fails as for any pre-write-back error (retried on the fast-retry schedule), `SignatureVerified` becomes Unknown with reason `SignatureCheckFailed`, and a `SignatureCheckFailed` Warning event is recorded.
 - **Rollback** renders `{{ .signed_digest }}` from `status.previousSignedDigest`, the digest verified when that tag deployed, without asking the registry again. Written digests are kept in `status.lastSignedDigest` / `previousSignedDigest`. If a template uses `signed_digest` and no previous digest is recorded (the tag deployed before the gate was enabled), rollback fails closed with `RollbackWriteFailed`; restore that image by hand.
 - **No fallback:** an older signed tag is never written in place of an unsigned newer one, so enabling the gate cannot roll a deployment back. A tag already in git that is unsigned is held there, reported as `AwaitingSignature`, until a newer signed tag arrives.
 - **Repository:** `source.repo` for an OCI source; `source.digestRepo` for a git source (required). Nix sources are rejected. With `resolveDigest` the resolved `image_digest` must equal the verified digest.

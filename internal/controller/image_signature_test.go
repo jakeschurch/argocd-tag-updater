@@ -155,6 +155,7 @@ func TestReconcileRequireSignedMarker(t *testing.T) {
 			defer server.Close()
 			remote, repository, initial := signatureManifestRepo(t, oldTag)
 			updater := signatureUpdater(server.URL+"/foundry/app", remote, tc.requireSigned, oldTag, initial)
+			updater.Spec.Interval = metav1.Duration{Duration: 10 * time.Minute}
 			storage := &digestTestClient{updater: updater}
 			reconciler := &TagUpdaterReconciler{Client: storage}
 			request := ctrl.Request{NamespacedName: types.NamespacedName{Name: "app", Namespace: "argocd"}}
@@ -162,9 +163,13 @@ func TestReconcileRequireSignedMarker(t *testing.T) {
 				if current.before != nil {
 					current.before(registry) // no request is in flight between reconciles
 				}
-				_, err := reconciler.Reconcile(context.Background(), request)
-				if (err != nil) != current.wantError {
-					t.Fatalf("step %d: error %v, want error %v", index, err, current.wantError)
+				result, err := reconciler.Reconcile(context.Background(), request)
+				// Registry errors are transient: surfaced on Ready, retried fast, never returned.
+				if err != nil {
+					t.Fatalf("step %d: unexpected error %v", index, err)
+				}
+				if fast := result.RequeueAfter < updater.Spec.Interval.Duration; fast != (current.wantError || current.wantHold) {
+					t.Fatalf("step %d: requeue %s with interval %s; fast=%v, want %v", index, result.RequeueAfter, updater.Spec.Interval.Duration, fast, current.wantError || current.wantHold)
 				}
 				if got := manifestTag(t, repository); got != current.wantTag {
 					t.Fatalf("step %d: manifest tag %s, want %s", index, got, current.wantTag)
