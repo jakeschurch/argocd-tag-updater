@@ -1,6 +1,7 @@
 package writeback
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -116,9 +117,7 @@ func TestPrepareWritebackTempDirRejectsSymlinkRoot(t *testing.T) {
 
 func TestPrepareWritebackTempDirUnderSetgidParent(t *testing.T) {
 	parent := t.TempDir()
-	if err := os.Chmod(parent, 0o700|os.ModeSetgid); err != nil {
-		t.Fatal(err)
-	}
+	chmodSetgidOrSkip(t, parent, 0o700)
 	t.Setenv("TMPDIR", parent)
 	release, err := PrepareWritebackTempDir()
 	if err != nil {
@@ -149,11 +148,22 @@ func TestPrepareWritebackTempDirRejectsGroupAccessWithSetgid(t *testing.T) {
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(root, 0o770|os.ModeSetgid); err != nil {
-		t.Fatal(err)
-	}
+	chmodSetgidOrSkip(t, root, 0o770)
 	if release, err := PrepareWritebackTempDir(); err == nil {
 		release()
 		t.Fatal("group-writable root accepted")
+	}
+}
+
+// chmodSetgidOrSkip sets the setgid bit on path, skipping the test where the
+// environment forbids it (for example the Nix build sandbox seccomp filter
+// rejects S_ISGID with EPERM).
+func chmodSetgidOrSkip(t *testing.T, path string, perm os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(path, perm|os.ModeSetgid); err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			t.Skipf("setgid not permitted in this environment: %v", err)
+		}
+		t.Fatal(err)
 	}
 }
