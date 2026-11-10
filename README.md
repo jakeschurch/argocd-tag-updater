@@ -158,6 +158,54 @@ name/namespace or label selector. Only configured scalar field tokens are
 replaced, preserving comments and unrelated formatting. No commit is created
 when every rendered value is already present.
 
+#### Several files from one tag
+
+When one tag stream pins values in more than one manifest file, give every
+target its own `path` and leave `writeBack.path` empty. All files are edited
+in one commit and pushed once, instead of one commit per TagUpdater:
+
+```yaml
+spec:
+  targets:
+    - path: apps/nix-farm.yaml
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      name: nix-farm
+      namespace: argocd
+      patches:
+        - field: spec.sources.0.helm.valuesObject.image.tag
+          template: '{{ .tag }}'
+    - path: apps/nix-csi-go.yaml
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      name: nix-csi-go
+      namespace: argocd
+      patches:
+        - field: spec.sources.0.helm.valuesObject.farmSubmitters.image
+          template: harbor.example/foundry/nix-farm@{{ .image_digest }}
+  writeBack:
+    repo: ssh://git@forgejo.example:22/foundry-labs/foundrybox.git
+    branch: main
+    # no path: each target names its file
+```
+
+- Use one form only. Either set `writeBack.path` and no target `path`, or set
+  a `path` on every target and leave `writeBack.path` empty. Mixing the two is
+  rejected with `WriteBackReady=False` (reason `MissingWriteBackConfig`).
+- Targets that name the same file (after path cleaning, so `./a.yaml` is
+  `a.yaml`) are applied together.
+- The write is all or nothing. Every file is edited in memory first. If any
+  target is missing from its file, or any file is missing, nothing is
+  committed.
+- A rejected push is retried by recloning the branch and re-applying every
+  file, as with a single path.
+- Rollback rewrites every file in one commit. `status.lastWriteCommit` is that
+  single commit.
+- `argoCDApp` still observes one Application. For health gating and rollback,
+  pick the Application that is slowest or riskiest to roll out.
+
+Existing TagUpdaters that set only `writeBack.path` are unaffected.
+
 ### Health-gated rollback
 
 After each commit it writes, the controller sets

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -101,7 +103,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	if err := validateWriteBack(tu.Spec.WriteBack); err != nil {
+	if err := validateWriteBack(tu.Spec.WriteBack, tu.Spec.Targets); err != nil {
 		message := err.Error()
 		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "WriteBackReady", Status: metav1.ConditionFalse, Reason: "MissingWriteBackConfig", Message: message})
 		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "MissingWriteBackConfig", Message: message})
@@ -246,7 +248,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			reason, message := "UpToDate", "manifest already contains the rendered values; no commit created"
 			if writeResult.Committed {
 				reason = "Committed"
-				message = fmt.Sprintf("committed tag %s to %s on branch %s", latest.Tag, tu.Spec.WriteBack.Path, tu.Spec.WriteBack.Branch)
+				message = fmt.Sprintf("committed tag %s to %s on branch %s", latest.Tag, strings.Join(writeBackPaths(tu.Spec), ", "), tu.Spec.WriteBack.Branch)
 				if r.Recorder != nil {
 					r.Recorder.Event(&tu, corev1.EventTypeNormal, "WriteBackCommitted", message)
 				}
@@ -713,7 +715,9 @@ func appendUnique(values []string, value string) []string {
 	return append(values, value)
 }
 
-func validateWriteBack(spec v1alpha1.WriteBackSpec) error {
+// validateWriteBack requires a destination repository and branch, and exactly
+// one way of naming manifests: spec.writeBack.path, or a path on every target.
+func validateWriteBack(spec v1alpha1.WriteBackSpec, targets []v1alpha1.TargetSpec) error {
 	var missing []string
 	if strings.TrimSpace(spec.Repo) == "" {
 		missing = append(missing, "repo")
@@ -721,13 +725,37 @@ func validateWriteBack(spec v1alpha1.WriteBackSpec) error {
 	if strings.TrimSpace(spec.Branch) == "" {
 		missing = append(missing, "branch")
 	}
-	if strings.TrimSpace(spec.Path) == "" {
+	anyTargetPath := false
+	for _, target := range targets {
+		if strings.TrimSpace(target.Path) != "" {
+			anyTargetPath = true
+		}
+	}
+	if strings.TrimSpace(spec.Path) == "" && !anyTargetPath {
 		missing = append(missing, "path")
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("spec.writeBack is required with non-empty repo, branch, and path; add missing field(s): %s", strings.Join(missing, ", "))
+		return fmt.Errorf("spec.writeBack is required with non-empty repo, branch, and path (or a path on every target); add missing field(s): %s", strings.Join(missing, ", "))
 	}
-	return nil
+	return writeback.ValidatePaths(spec, targets)
+}
+
+// writeBackPaths lists the distinct manifest files the spec writes, sorted.
+func writeBackPaths(spec v1alpha1.TagUpdaterSpec) []string {
+	seen := map[string]struct{}{}
+	var paths []string
+	for _, target := range spec.Targets {
+		path := filepath.ToSlash(filepath.Clean(writeback.TargetPath(spec.WriteBack, target)))
+		if _, found := seen[path]; !found {
+			seen[path] = struct{}{}
+			paths = append(paths, path)
+		}
+	}
+	if len(paths) == 0 {
+		paths = append(paths, spec.WriteBack.Path)
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 // validateFieldOwnership ensures one updater is the sole writer for a scalar
@@ -744,7 +772,8 @@ func validateFieldOwnership(updaters []v1alpha1.TagUpdater) error {
 			}
 			for _, patch := range target.Patches {
 				key := strings.Join([]string{
-					updater.Spec.WriteBack.Repo, updater.Spec.WriteBack.Branch, updater.Spec.WriteBack.Path,
+					updater.Spec.WriteBack.Repo, updater.Spec.WriteBack.Branch,
+					filepath.ToSlash(filepath.Clean(writeback.TargetPath(updater.Spec.WriteBack, target))),
 					target.APIVersion, target.Kind, target.Namespace, target.Name, string(selector), patch.Field,
 				}, "\x00")
 				owner := updater.Namespace + "/" + updater.Name

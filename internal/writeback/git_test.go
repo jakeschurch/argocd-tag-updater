@@ -169,7 +169,7 @@ spec:
 	}
 	defer os.RemoveAll(cloneDirectoryPath)
 	cloneRepository, _, err := cloneBranchForWriteback(
-		context.Background(), cloneDirectoryPath, bareDir, nil, "master", "apps/app.yaml",
+		context.Background(), cloneDirectoryPath, bareDir, nil, "master", []string{"apps/app.yaml"},
 	)
 	if err != nil {
 		t.Fatal(err)
