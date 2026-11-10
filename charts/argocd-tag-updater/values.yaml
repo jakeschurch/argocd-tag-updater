@@ -79,6 +79,9 @@ selfUpdate:
   #  path: vmetal/apps/argocd-tag-updater.yaml
   #  credentialsSecretRef:
   #    name: argocd-tag-updater-forgejo-writeback
+  #    # Secret keys: sshPrivateKey+knownHosts (default, SSH), or token+username
+  #    # (HTTPS; repo must then be an http(s):// URL, pushes carry the robot identity).
+  #  commitAuthor: {name: "", email: ""}   # optional override
 
 # ExternalName alias pointing the conventional `argocd-server` name at the
 # Service the ArgoCD release actually created. Off by default: it collides

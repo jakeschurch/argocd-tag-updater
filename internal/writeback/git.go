@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -124,9 +125,7 @@ func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoUR
 	if _, err := workingTree.Add(cleanPath); err != nil {
 		return Result{}, fmt.Errorf("stage manifest %s: %w", cleanPath, err)
 	}
-	commitHash, err := workingTree.Commit(w.commitMessage(), &git.CommitOptions{Author: &object.Signature{
-		Name: "argocd-tag-updater", Email: "argocd-tag-updater@localhost", When: time.Now(),
-	}})
+	commitHash, err := workingTree.Commit(w.commitMessage(), &git.CommitOptions{Author: w.signature(time.Now())})
 	if errors.Is(err, git.ErrEmptyCommit) {
 		head, headErr := repo.Head()
 		if headErr != nil {
@@ -189,12 +188,65 @@ func (w Writer) auth() (transport.AuthMethod, string, func(), error) {
 		return auth, w.Spec.Repo, callbackCleanup, nil
 	}
 	if w.Credentials.Token != "" {
-		return &githttp.BasicAuth{Username: "x-access-token", Password: w.Credentials.Token}, toHTTPS(w.Spec.Repo), cleanup, nil
+		// A token with a username authenticates as that account (a robot user),
+		// which is what Forgejo records as the pusher. Without one, keep the
+		// GitHub-style placeholder the token-only path always used.
+		username := w.Credentials.Username
+		if username == "" {
+			username = "x-access-token"
+		}
+		return &githttp.BasicAuth{Username: username, Password: w.Credentials.Token}, toHTTPS(w.Spec.Repo), cleanup, nil
 	}
 	if w.Credentials.Username != "" || w.Credentials.Password != "" {
 		return &githttp.BasicAuth{Username: w.Credentials.Username, Password: w.Credentials.Password}, toHTTPS(w.Spec.Repo), cleanup, nil
 	}
 	return nil, w.Spec.Repo, cleanup, nil
+}
+
+const (
+	defaultAuthorName  = "argocd-tag-updater"
+	defaultAuthorEmail = "argocd-tag-updater@localhost"
+)
+
+// signature returns the commit author. Precedence per field: spec.commitAuthor,
+// then (HTTP(S) auth with a username only) the robot identity derived from that
+// username, then the historical SSH default. The author is cosmetic: the git
+// host attributes the push to the authenticated account, not to this value.
+func (w Writer) signature(when time.Time) *object.Signature {
+	name, email := defaultAuthorName, defaultAuthorEmail
+	if username := w.httpUsername(); username != "" {
+		name, email = username, username+"@noreply."+hostOf(w.Spec.Repo)
+	}
+	if w.Spec.CommitAuthor.Name != "" {
+		name = w.Spec.CommitAuthor.Name
+	}
+	if w.Spec.CommitAuthor.Email != "" {
+		email = w.Spec.CommitAuthor.Email
+	}
+	return &object.Signature{Name: name, Email: email, When: when}
+}
+
+// httpUsername is the robot account name presented with token auth, or "" for
+// SSH, anonymous, username/password (unchanged default author) and token-only
+// (x-access-token placeholder) writes.
+func (w Writer) httpUsername() string {
+	if len(w.Credentials.SSHPrivateKey) > 0 || w.Credentials.Token == "" {
+		return ""
+	}
+	return w.Credentials.Username
+}
+
+// hostOf returns the hostname (no port) of an ssh://, http(s):// or scp-style
+// repo URL.
+func hostOf(repo string) string {
+	if u, err := url.Parse(repo); err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	rest := strings.TrimPrefix(repo, "git@")
+	if i := strings.IndexAny(rest, ":/"); i >= 0 {
+		rest = rest[:i]
+	}
+	return rest
 }
 
 func safeManifestPath(root, path string) (string, string, error) {
@@ -272,11 +324,12 @@ func toHTTPS(repo string) string {
 	case strings.HasPrefix(repo, "https://"):
 		return repo
 	case strings.HasPrefix(repo, "ssh://"):
-		rest := strings.TrimPrefix(repo, "ssh://")
-		if i := strings.IndexByte(rest, '@'); i >= 0 {
-			rest = rest[i+1:]
+		// The ssh port is not the https port, so it is dropped.
+		u, err := url.Parse(repo)
+		if err != nil || u.Hostname() == "" {
+			return repo
 		}
-		return "https://" + rest
+		return "https://" + u.Hostname() + u.EscapedPath()
 	case strings.HasPrefix(repo, "git@"):
 		rest := strings.TrimPrefix(repo, "git@")
 		return "https://" + strings.Replace(rest, ":", "/", 1)

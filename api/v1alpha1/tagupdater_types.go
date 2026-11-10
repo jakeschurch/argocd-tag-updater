@@ -125,10 +125,26 @@ type WriteBackSpec struct {
 	Path string `json:"path"`
 	// CredentialsSecretRef optionally names a Secret in the TagUpdater namespace.
 	// It takes precedence over the controller's mounted Git credentials. Supported
-	// authentication keys are token, username/password, and sshPrivateKey. SSH
-	// additionally requires knownHosts, or insecureIgnoreHostKey=true as an
-	// explicit opt-in.
+	// authentication keys are token (optionally with username), username/password,
+	// and sshPrivateKey. SSH additionally requires knownHosts, or
+	// insecureIgnoreHostKey=true as an explicit opt-in.
+	//
+	// Token auth pushes over HTTP(S) as the Secret's username (a dedicated robot
+	// account), so the git host records that account as the pusher; set repo to an
+	// http:// or https:// URL. A token without username authenticates as
+	// "x-access-token". If sshPrivateKey is also present, SSH wins.
 	CredentialsSecretRef LocalObjectReference `json:"credentialsSecretRef,omitempty"`
+	// CommitAuthor overrides the git author identity of the write-back commit.
+	// By default SSH writes use argocd-tag-updater / argocd-tag-updater@localhost,
+	// while token writes authenticated with a username use that username and
+	// <username>@noreply.<repo host>.
+	CommitAuthor CommitAuthorSpec `json:"commitAuthor,omitempty"`
+}
+
+// CommitAuthorSpec is a git author identity. Unset fields keep the default.
+type CommitAuthorSpec struct {
+	Name  string `json:"name,omitempty"`
+	Email string `json:"email,omitempty"`
 }
 
 // +kubebuilder:object:root=true
