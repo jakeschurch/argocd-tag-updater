@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -29,12 +28,11 @@ func (s revSource) TagRevs(context.Context) (map[string]string, error) {
 
 func TestAddRev(t *testing.T) {
 	tests := []struct {
-		name     string
-		src      intsource.Source
-		tag      string
-		wantErr  bool
-		wantRev  string
-		wantHTTP bool // expect lastRevSuccess set (healthy)
+		name    string
+		src     intsource.Source
+		tag     string
+		wantErr bool
+		wantRev string
 	}{
 		{
 			name: "non-rev source is inert",
@@ -42,11 +40,10 @@ func TestAddRev(t *testing.T) {
 			tag:  "platform.main.20260708052110.280baa",
 		},
 		{
-			name:     "resolves rev",
-			src:      revSource{revs: map[string]string{"t": "0123456789abcdef0123456789abcdef01234567"}},
-			tag:      "t",
-			wantRev:  "0123456789abcdef0123456789abcdef01234567",
-			wantHTTP: true,
+			name:    "resolves rev",
+			src:     revSource{revs: map[string]string{"t": "0123456789abcdef0123456789abcdef01234567"}},
+			tag:     "t",
+			wantRev: "0123456789abcdef0123456789abcdef01234567",
 		},
 		{
 			name:    "resolver error fails closed",
@@ -72,18 +69,13 @@ func TestAddRev(t *testing.T) {
 			if data["rev"] != tc.wantRev {
 				t.Fatalf("rev=%q want %q", data["rev"], tc.wantRev)
 			}
-			if tc.wantHTTP && r.lastRevSuccess.Load() == 0 {
-				t.Fatal("lastRevSuccess not recorded on success")
-			}
-			_, resolvesRev := tc.src.(intsource.TagRevResolver)
-			if resolvesRev != (r.firstRevAttempt.Load() != 0) {
-				t.Fatalf("firstRevAttempt=%d resolvesRev=%v", r.firstRevAttempt.Load(), resolvesRev)
+			if tc.wantErr != (r.revFailingSince.Load() != 0) {
+				t.Fatalf("failingSince=%d wantErr=%v", r.revFailingSince.Load(), tc.wantErr)
 			}
 			if tc.wantErr {
-				if r.lastRevSuccess.Load() != 0 {
-					t.Fatal("failed resolution recorded a success")
-				}
-				assertRevHealthDeadline(t, r, time.Unix(0, r.firstRevAttempt.Load()))
+				assertRevHealthDeadline(t, r, time.Unix(0, r.revFailingSince.Load()))
+			} else if err := r.revResolutionHealth(time.Now().Add(10 * revStaleAfter)); err != nil {
+				t.Fatalf("completed calls must have no pending deadline: %v", err)
 			}
 		})
 	}
@@ -101,22 +93,9 @@ func TestRevResolutionHealthz(t *testing.T) {
 	if err := r.revResolutionHealth(time.Unix(1, 0).Add(10 * revStaleAfter)); err != nil {
 		t.Fatalf("inert check should have no deadline, got %v", err)
 	}
-	for _, anchor := range []string{"first attempt", "last success"} {
-		t.Run(anchor, func(t *testing.T) {
-			r := &TagUpdaterReconciler{}
-			started := time.Unix(1, 0)
-			r.firstRevAttempt.Store(started.UnixNano())
-			if anchor == "last success" {
-				started = started.Add(revStaleAfter + time.Second)
-				r.lastRevSuccess.Store(started.UnixNano())
-			}
-			assertRevHealthDeadline(t, r, started)
-			err := r.revResolutionHealth(started.Add(revStaleAfter + time.Nanosecond))
-			if !strings.Contains(err.Error(), anchor) {
-				t.Fatalf("error should identify %s, got %v", anchor, err)
-			}
-		})
-	}
+	started := time.Unix(1, 0)
+	r.revFailingSince.Store(started.UnixNano())
+	assertRevHealthDeadline(t, r, started)
 }
 
 func assertRevHealthDeadline(t *testing.T, r *TagUpdaterReconciler, anchor time.Time) {
@@ -155,21 +134,23 @@ func TestAddRevPendingAndConcurrentRetries(t *testing.T) {
 		result <- r.addRev(context.Background(), source, "t", map[string]string{})
 	}()
 	<-source.entered
-	first := r.firstRevAttempt.Load()
-	if first == 0 {
-		t.Fatal("first attempt was not recorded before resolver started")
+	if r.revFailingSince.Load() != 0 {
+		t.Fatal("pending resolution recorded a failure")
 	}
-	if r.lastRevSuccess.Load() != 0 {
-		t.Fatal("pending resolution recorded a success")
+	var started time.Time
+	r.revPending.Range(func(_, value any) bool {
+		started = value.(time.Time)
+		return false
+	})
+	if started.IsZero() {
+		t.Fatal("pending resolution did not record its start")
 	}
-	assertRevHealthDeadline(t, r, time.Unix(0, first))
-	if err := r.RevResolutionHealthz()(httptest.NewRequest("GET", "/healthz", nil)); err != nil {
-		t.Fatalf("pending first resolution should pass, got %v", err)
-	}
+	assertRevHealthDeadline(t, r, started)
 	failingSource := revSource{err: errors.New("retry failed")}
 	if err := r.addRev(context.Background(), failingSource, "t", map[string]string{}); err == nil {
 		t.Fatal("retry should fail")
 	}
+	first := r.revFailingSince.Load()
 	const retries = 16
 	retryResults := make(chan error, retries)
 	for attempt := 0; attempt < retries; attempt++ {
@@ -182,43 +163,36 @@ func TestAddRevPendingAndConcurrentRetries(t *testing.T) {
 			t.Fatal("concurrent retry should fail")
 		}
 	}
-	if got := r.firstRevAttempt.Load(); got != first {
+	if got := r.revFailingSince.Load(); got != first {
 		t.Fatalf("retries changed first attempt from %d to %d", first, got)
 	}
-	assertRevHealthDeadline(t, r, time.Unix(0, first))
+	assertRevHealthDeadline(t, r, started)
 }
 
 func TestAddRevSuccessAndLaterFailure(t *testing.T) {
-	r := &TagUpdaterReconciler{}
-	first := time.Unix(1, 0)
-	r.firstRevAttempt.Store(first.UnixNano())
+	current := time.Unix(1, 0)
+	r := &TagUpdaterReconciler{now: func() time.Time { return current }}
 	failingSource := revSource{err: errors.New("resolution failed")}
 	if err := r.addRev(context.Background(), failingSource, "t", map[string]string{}); err == nil {
 		t.Fatal("first resolution should fail")
 	}
-	assertRevHealthDeadline(t, r, first)
-	if err := r.RevResolutionHealthz()(httptest.NewRequest("GET", "/healthz", nil)); err == nil {
-		t.Fatal("stale initial resolution should fail")
-	}
+	assertRevHealthDeadline(t, r, current)
+	current = current.Add(2 * revStaleAfter)
 	if err := r.addRev(context.Background(), revSource{revs: map[string]string{"t": "deadbeef"}}, "t", map[string]string{}); err != nil {
 		t.Fatal(err)
 	}
-	success := r.lastRevSuccess.Load()
-	if success == 0 {
-		t.Fatal("success was not recorded")
+	if r.revFailingSince.Load() != 0 {
+		t.Fatal("success did not clear failure deadline")
 	}
-	if err := r.RevResolutionHealthz()(httptest.NewRequest("GET", "/healthz", nil)); err != nil {
-		t.Fatalf("success should restore health, got %v", err)
+	current = current.Add(6 * time.Minute)
+	if err := r.revResolutionHealth(current); err != nil {
+		t.Fatalf("successful idle stream must stay healthy beyond five minutes: %v", err)
 	}
-	assertRevHealthDeadline(t, r, time.Unix(0, success))
 	if err := r.addRev(context.Background(), failingSource, "t", map[string]string{}); err == nil {
 		t.Fatal("later resolution should fail")
 	}
-	if got := r.lastRevSuccess.Load(); got != success {
-		t.Fatalf("failure changed last success from %d to %d", success, got)
+	if got := r.revFailingSince.Load(); got != current.UnixNano() {
+		t.Fatalf("failure deadline=%d want fresh deadline=%d", got, current.UnixNano())
 	}
-	if got := r.firstRevAttempt.Load(); got != first.UnixNano() {
-		t.Fatalf("resolution changed first attempt from %d to %d", first.UnixNano(), got)
-	}
-	assertRevHealthDeadline(t, r, time.Unix(0, success))
+	assertRevHealthDeadline(t, r, current)
 }

@@ -14,7 +14,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -109,24 +108,12 @@ func main() {
 		fail("setup controller: %v", err)
 	}
 
-	_ = mgr.AddHealthzCheck("healthz", healthz.Ping)
-	// Liveness also fails when git tag->rev resolution has been broken past its
-	// staleness window, so a sustained resolver outage restarts the pod and
-	// migrates leadership instead of silently pinning targets at a stale tag.
-	_ = mgr.AddHealthzCheck("tag-resolution", reconciler.RevResolutionHealthz())
-	// Liveness also fails when EVERY TagUpdater's reconcile progress is stale —
-	// a systemic freeze of the reconcile pipeline (which once silently pinned
-	// all deploys for ~1.5h) — restarting the pod and migrating leadership. A
-	// single stale updater does NOT trip this: one broken repo is surfaced via
-	// the tagupdater_reconcile_stale metric and the Stalled condition instead
-	// of restarting the shared controller.
-	_ = mgr.AddHealthzCheck("reconcile-progress", reconciler.ReconcileProgressHealthz())
-	_ = mgr.AddReadyzCheck("readyz", healthz.Ping)
-	// 2026-11-11: deployment preflights probe each ready pod, so a CRD/chart
-	// update cannot be mistaken for a running checkpoint-capable controller.
-	_ = mgr.AddReadyzCheck("gated-promotion-v2", healthz.Ping)
+	ctx := ctrl.SetupSignalHandler()
+	if err := registerProbes(ctx, mgr, mgr.GetCache(), reconciler.RevResolutionHealthz(), reconciler.ReconcileProgressHealthz()); err != nil {
+		fail("register probes: %v", err)
+	}
 
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		fail("start manager: %v", err)
 	}
 }

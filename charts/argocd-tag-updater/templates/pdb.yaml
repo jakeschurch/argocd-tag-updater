@@ -1,0 +1,13 @@
+{{- if gt (int .Values.replicaCount) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "argocd-tag-updater.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "argocd-tag-updater.selectorLabels" . | nindent 6 }}
+{{- end }}

@@ -393,7 +393,16 @@ Two layers detect this:
    pod restarts and leadership migrates. A single stale updater (one broken
    repo) never restarts the shared controller; use layer 1 to alert on it.
    The `tag-resolution` healthz check similarly restarts the pod when git
-   tag→rev resolution has been failing past its staleness window.
+   tag→rev resolution has been failing for five minutes since its first error.
+   A success clears that deadline; idle streams remain healthy between polls.
+   In-flight tag-to-revision lookups retain their own five-minute deadline
+   to catch stuck calls. The earlier Git.Tags() lookup is covered by the
+   reconcile-progress watchdog when every updater is stalled. Both checks
+   read in-process state. The chart sets a 24h reconcile floor to let a newly
+   elected leader heal old records. Readiness (`/readyz`) checks cache sync and
+   shutdown only, so a git outage cannot consume the PDB's healthy-pod budget.
+   The startup probe covers the probe listener binding; pre-container CSI mounts
+   are bounded by the Deployment progress deadline instead.
 
 Suggested alert: `tagupdater_reconcile_stale == 1`.
 

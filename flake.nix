@@ -141,6 +141,15 @@
       };
 
       checks.${system} = {
+        chart = pkgs.runCommand "argocd-tag-updater-chart"
+          {
+            nativeBuildInputs = [ pkgs.kubernetes-helm (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
+          } ''
+          helm lint ${./charts/argocd-tag-updater}
+          python3 ${./charts/argocd-tag-updater}/rollout_test.py
+          touch $out
+        '';
+
         # testReport always builds; this is the check that fails when vet or a
         # test did.
         test-report = pkgs.runCommand "argocd-tag-updater-test-report-check" { } ''
