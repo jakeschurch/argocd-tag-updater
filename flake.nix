@@ -81,6 +81,10 @@
     in
     {
       packages.${system} = rec {
+        # Vet and tests as data (go.json, vet.log, exit-code). The ci/margo
+        # nix-go-test check builds this attribute directly.
+        inherit testReport;
+
         argocd-tag-updater = pkgs.buildGoModule {
           pname = "argocd-tag-updater";
           version = "0.1.0";
