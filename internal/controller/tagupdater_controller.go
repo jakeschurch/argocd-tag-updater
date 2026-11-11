@@ -87,11 +87,10 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, r.Update(ctx, &tu)
 	}
 	if tu.Status.PendingWriteStatus != "" {
-		credentials, err := r.resolveWriteBackCredentials(ctx, &tu)
+		writer, err := r.preparedWriter(ctx, &tu)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		writer := writeback.Writer{Spec: tu.Spec.WriteBack, Credentials: credentials}
 		if err := r.settleWrite(ctx, &tu, writer, nil); err != nil {
 			return ctrl.Result{}, err
 		}

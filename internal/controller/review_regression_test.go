@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	v1 "github.com/jakeschurch/argocd-tag-updater/api/v1alpha1"
 	"github.com/jakeschurch/argocd-tag-updater/internal/gate"
@@ -426,8 +427,6 @@ func TestProductionMonitoringErrorDoesNotBlameReleaseOrHideIndependentFailure(t 
 			})
 			reconcileSafety(t, r, tu)
 			if scenario == "monitoring-error" {
-				// Acknowledge the commit before advancing the observation clock.
-				reconcileSafety(t, r, tu)
 				for _, delay := range []time.Duration{2 * time.Minute, 24 * time.Hour} {
 					now := time.Now().Add(delay)
 					r.now = func() time.Time { return now }
@@ -560,6 +559,8 @@ func TestProductionComparisonUnavailableNeverBlamesReleaseAndRecovers(t *testing
 	for _, recovery := range []string{"Progressing", "Healthy"} {
 		t.Run(recovery, func(t *testing.T) {
 			r, tu, remote := productionSafetyHarness(t)
+			pendingTooLong.DeleteLabelValues(tu.Namespace, tu.Name)
+			t.Cleanup(func() { pendingTooLong.DeleteLabelValues(tu.Namespace, tu.Name) })
 			promoteProduction(t, r, tu)
 			productionHealth(t, r, tu, "Progressing")
 			for _, name := range []string{"workload", "first", "second"} {
@@ -584,6 +585,9 @@ func TestProductionComparisonUnavailableNeverBlamesReleaseAndRecovers(t *testing
 				state, err := r.releaseHealth(context.Background(), tu)
 				return err == nil && state.Sync == "Unknown" && r.applicationPinsApplied(context.Background(), tu)
 			})
+			if value := metricValue(pendingTooLong.WithLabelValues(tu.Namespace, tu.Name)); value != 0 {
+				t.Fatalf("pending gauge before timeout: %v", value)
+			}
 			// Acknowledge the commit before advancing the observation clock.
 			reconcileSafety(t, r, tu)
 			for _, delay := range []time.Duration{2 * time.Minute, 24 * time.Hour} {
@@ -687,6 +691,10 @@ func TestProductionRestartSettlesPreparedWriteAgainstRemoteReachability(t *testi
 					t.Fatal(err)
 				}
 			}
+			// A restart can follow thousands of unrelated commits, including more
+			// than the old confirmation cap, whether our push succeeded or failed.
+			appendConfirmationHistory(t, remote, 5200)
+
 			restart := &TagUpdaterReconciler{Client: original, APIReader: r.APIReader, Dynamic: r.Dynamic, Gates: r.Gates, Recorder: r.Recorder}
 			_, err := restart.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tu)})
 			loadSafety(t, restart, tu)
@@ -707,49 +715,92 @@ func TestProductionRestartSettlesPreparedWriteAgainstRemoteReachability(t *testi
 }
 
 func TestPreparedWriteSettlesBeforeSpecDrain(t *testing.T) {
-	for _, rollback := range []bool{false, true} {
-		t.Run(fmt.Sprint(rollback), func(t *testing.T) {
-			r, tu, remote := productionSafetyHarness(t)
-			if rollback {
-				promoteProduction(t, r, tu)
-				productionHealth(t, r, tu, "Degraded")
-			} else {
-				syncProduction(t, r, tu)
-			}
-			checkpoint := tu.DeepCopy().Status
-			prepareWrite(tu)
-			tu.Status.LastTag = "never-pushed"
-			tu.Status.LastWriteCommit = strings.Repeat("a", 40)
-			tu.Status.WatchingTag = "never-pushed"
-			tu.Status.WatchingCommit = strings.Repeat("a", 40)
-			if err := r.Status().Update(context.Background(), tu); err != nil {
-				t.Fatal(err)
-			}
-			// A changed target must not discard the pre-push checkpoint.
-			tu.Spec.Targets = nil
-			if err := r.Update(context.Background(), tu); err != nil {
-				t.Fatal(err)
-			}
-			_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tu)})
-			loadSafety(t, r, tu)
-			if err == nil || !reflect.DeepEqual(tu.Status, checkpoint) {
-				t.Fatalf("spec drain discarded rejected write checkpoint: got %+v want %+v err=%v", tu.Status, checkpoint, err)
-			}
-			if !strings.Contains(safetyFile(t, remote, "apps/first.yaml"), "image: "+checkpoint.LastTag) {
-				t.Fatal("settle changed Git")
-			}
-			if rollback {
-				lease := &coordinationv1.Lease{}
-				if err := r.Get(context.Background(), leaseKey(tu), lease); err != nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != holder(tu) {
-					t.Fatal("settle released active watch before draining")
+	for _, change := range []string{"targets", "repo", "branch", "credentials"} {
+		for _, rollback := range []bool{false, true} {
+			t.Run(fmt.Sprint(change, rollback), func(t *testing.T) {
+				r, tu, remote := productionSafetyHarness(t)
+				if rollback {
+					promoteProduction(t, r, tu)
+					productionHealth(t, r, tu, "Degraded")
+				} else {
+					syncProduction(t, r, tu)
 				}
-				// The next reconcile deliberately drains the restored old watch.
-				reconcileSafety(t, r, tu)
-				if tu.Status.WatchingTag != "" {
-					t.Fatal("restored watch did not drain")
+				checkpoint := tu.DeepCopy().Status
+				prepareWrite(tu)
+				tu.Status.LastTag = "never-pushed"
+				tu.Status.LastWriteCommit = strings.Repeat("a", 40)
+				tu.Status.WatchingTag = "never-pushed"
+				tu.Status.WatchingCommit = strings.Repeat("a", 40)
+				if err := r.Status().Update(context.Background(), tu); err != nil {
+					t.Fatal(err)
 				}
-			}
-			assertLeasesReleased(t, r, tu)
-		})
+				// Recovery must use the saved remote identity before draining.
+				switch change {
+				case "targets":
+					tu.Spec.Targets = nil
+				case "repo":
+					tu.Spec.WriteBack.Repo = filepath.Join(t.TempDir(), "missing-remote")
+				case "branch":
+					tu.Spec.WriteBack.Branch = "missing-branch"
+				case "credentials":
+					tu.Spec.WriteBack.CredentialsSecretRef.Name = "missing-secret"
+				}
+				if err := r.Update(context.Background(), tu); err != nil {
+					t.Fatal(err)
+				}
+				_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tu)})
+				loadSafety(t, r, tu)
+				if err == nil || !reflect.DeepEqual(tu.Status, checkpoint) {
+					t.Fatalf("spec drain discarded rejected write checkpoint: got %+v want %+v err=%v", tu.Status, checkpoint, err)
+				}
+				if !strings.Contains(safetyFile(t, remote, "apps/first.yaml"), "image: "+checkpoint.LastTag) {
+					t.Fatal("settle changed Git")
+				}
+				if rollback {
+					lease := &coordinationv1.Lease{}
+					if err := r.Get(context.Background(), leaseKey(tu), lease); err != nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != holder(tu) {
+						t.Fatal("settle released active watch before draining")
+					}
+					// The next reconcile deliberately drains the restored old watch.
+					reconcileSafety(t, r, tu)
+					if tu.Status.WatchingTag != "" {
+						t.Fatal("restored watch did not drain")
+					}
+				}
+				assertLeasesReleased(t, r, tu)
+			})
+		}
+	}
+}
+
+func appendConfirmationHistory(t *testing.T, remote string, count int) {
+	t.Helper()
+	repo, err := git.PlainOpen(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := repo.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := repo.CommitObject(ref.Hash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := ref.Hash()
+	for i := 0; i < count; i++ {
+		c := &object.Commit{TreeHash: parent.TreeHash, ParentHashes: []plumbing.Hash{hash}, Message: fmt.Sprint(i), Author: object.Signature{Name: "other", Email: "other@example.com", When: time.Now()}}
+		c.Committer = c.Author
+		encoded := repo.Storer.NewEncodedObject()
+		if err := c.Encode(encoded); err != nil {
+			t.Fatal(err)
+		}
+		hash, err = repo.Storer.SetEncodedObject(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(ref.Name(), hash)); err != nil {
+		t.Fatal(err)
 	}
 }

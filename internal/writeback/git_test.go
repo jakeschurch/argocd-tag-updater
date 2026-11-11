@@ -16,6 +16,7 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/storage/memory"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 
@@ -354,53 +355,96 @@ func assertNoCloneDirectories(t *testing.T) {
 	}
 }
 
-// Recovery confirms recent ancestors, proves true absence on a complete small
-// branch, and fails closed when an old intent exceeds the bounded history.
-func TestContainsCommitBoundsHistoryAndDeepensForRecentAncestors(t *testing.T) {
-	for _, count := range []int{initialConfirmationDepth + 5, maxConfirmationDepth + 1} {
-		t.Run(fmt.Sprint(count), func(t *testing.T) {
+// Thousands of old commits must not prevent recent rejected writes from settling.
+// A dense recent window must also work beyond the former depth/visit caps.
+func TestContainsCommitTimeBoundOnDeepHistory(t *testing.T) {
+	for _, dense := range []bool{false, true} {
+		t.Run(fmt.Sprint(dense), func(t *testing.T) {
 			dir := t.TempDir()
-			repo, err := git.PlainInit(dir, false)
+			repo, err := git.PlainInit(dir, true)
 			if err != nil {
 				t.Fatal(err)
 			}
-			wt, err := repo.Worktree()
+			tree := repo.Storer.NewEncodedObject()
+			if err := (&object.Tree{}).Encode(tree); err != nil {
+				t.Fatal(err)
+			}
+			treeHash, err := repo.Storer.SetEncodedObject(tree)
 			if err != nil {
 				t.Fatal(err)
 			}
-			var first, head plumbing.Hash
-			for i := 0; i < count; i++ {
-				if err := os.WriteFile(filepath.Join(dir, "pin.yaml"), []byte(fmt.Sprint(i)), 0o600); err != nil {
+			now := time.Now().Truncate(time.Second)
+			var head, wanted plumbing.Hash
+			for i := 0; i < 5500; i++ {
+				when := now.Add(time.Duration(i-5500) * time.Minute)
+				if dense {
+					when = now.Add(time.Duration(i-5500) * time.Millisecond)
+				}
+				c := &object.Commit{TreeHash: treeHash, Message: fmt.Sprint(i), Author: object.Signature{Name: "test", Email: "test@example.com", When: when}}
+				c.Committer = c.Author
+				if i > 0 {
+					c.ParentHashes = []plumbing.Hash{head}
+				}
+				encoded := repo.Storer.NewEncodedObject()
+				if err := c.Encode(encoded); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := wt.Add("pin.yaml"); err != nil {
-					t.Fatal(err)
-				}
-				head, err = wt.Commit(fmt.Sprint(i), &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.com", When: time.Unix(int64(i), 0)}})
+				head, err = repo.Storer.SetEncodedObject(encoded)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if i == 0 {
-					first = head
+				if (dense && i == 100) || (!dense && i == 5460) {
+					wanted = head
 				}
+			}
+			if err := repo.Storer.SetReference(plumbing.NewHashReference(plumbing.NewBranchReferenceName("master"), head)); err != nil {
+				t.Fatal(err)
 			}
 			writer := Writer{Spec: v1alpha1.WriteBackSpec{Repo: dir, Branch: "master"}}
-			if found, err := writer.ContainsCommit(context.Background(), head.String()); !found || err != nil {
-				t.Fatalf("tip not confirmed: %v %v", found, err)
-			}
-			found, err := writer.ContainsCommit(context.Background(), first.String())
-			if count > maxConfirmationDepth {
-				if found || err == nil || !strings.Contains(err.Error(), "retaining prepared write") {
-					t.Fatalf("history cap must remain inconclusive: %v %v", found, err)
+			for _, sha := range []string{head.String(), wanted.String()} {
+				if found, err := writer.ContainsCommit(context.Background(), sha, now); !found || err != nil {
+					t.Fatalf("reachable commit %s: %v %v", sha, found, err)
 				}
-				return
 			}
-			if !found || err != nil {
-				t.Fatalf("ancestor beyond first shallow fetch not confirmed: %v %v", found, err)
-			}
-			if found, err := writer.ContainsCommit(context.Background(), strings.Repeat("a", 40)); found || err != nil {
-				t.Fatalf("absent commit not disproved by complete history: %v %v", found, err)
+			if found, err := writer.ContainsCommit(context.Background(), strings.Repeat("a", 40), now); found || err != nil {
+				t.Fatalf("absent commit did not settle: %v %v", found, err)
 			}
 		})
+	}
+}
+
+func TestConfirmationVisitsMergeSiblingPastShallowBoundary(t *testing.T) {
+	repo, err := git.Init(memory.NewStorage(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	store := func(parents ...plumbing.Hash) plumbing.Hash {
+		c := &object.Commit{Author: object.Signature{When: now}, Committer: object.Signature{When: now}, ParentHashes: parents}
+		encoded := repo.Storer.NewEncodedObject()
+		if err := c.Encode(encoded); err != nil {
+			t.Fatal(err)
+		}
+		hash, err := repo.Storer.SetEncodedObject(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return hash
+	}
+	wanted := store()
+	missing := plumbing.NewHash(strings.Repeat("b", 40))
+	// The last parent is visited first by the stack; it must not hide the sibling.
+	head := store(wanted, missing)
+	found, _, err := containsRecentCommit(context.Background(), repo, head, wanted, now.Add(-time.Hour))
+	if !found || err != nil {
+		t.Fatalf("shallow merge sibling was skipped: %v %v", found, err)
+	}
+	_, complete, err := containsRecentCommit(context.Background(), repo, head, plumbing.NewHash(strings.Repeat("a", 40)), now.Add(-time.Hour))
+	if complete || err != nil {
+		t.Fatalf("recent missing frontier must require deepening: %v %v", complete, err)
+	}
+	_, complete, err = containsRecentCommit(context.Background(), repo, head, plumbing.NewHash(strings.Repeat("a", 40)), now.Add(time.Minute))
+	if !complete || err != nil {
+		t.Fatalf("old frontier must prove absence: %v %v", complete, err)
 	}
 }
