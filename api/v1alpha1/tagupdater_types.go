@@ -121,9 +121,9 @@ type ArgoCDAppRef struct {
 // boolean CEL expressions; object and tag are the available variables.
 // +kubebuilder:validation:XValidation:rule="has(self.name) != has(self.selector)",message="exactly one of name or selector is required"
 // +kubebuilder:validation:XValidation:rule="has(self.preset) ? !(has(self.apiVersion) || has(self.kind) || has(self.deployed) || has(self.healthy) || has(self.failed)) : (has(self.apiVersion) && has(self.kind) && has(self.deployed) && has(self.healthy) && has(self.failed))",message="use a preset or a complete custom CEL source"
-// +kubebuilder:validation:XValidation:rule="has(self.preset) || (has(self.apiVersion) && has(self.kind) && ((self.apiVersion == 'argoproj.io/v1alpha1' && self.kind in ['Application', 'Rollout', 'AnalysisRun']) || (self.apiVersion == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet']) || (self.apiVersion == 'kargo.akuity.io/v1alpha1' && self.kind == 'Promotion')))",message="gate GVK must be allowlisted"
+// +kubebuilder:validation:XValidation:rule="has(self.preset) || (has(self.apiVersion) && has(self.kind) && ((self.apiVersion == 'argoproj.io/v1alpha1' && self.kind in ['Application', 'Rollout', 'AnalysisRun']) || (self.apiVersion == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet', 'DaemonSet']) || (self.apiVersion == 'kargo.akuity.io/v1alpha1' && self.kind == 'Promotion')))",message="gate GVK must be allowlisted"
 type GateSpec struct {
-	// +kubebuilder:validation:Enum=argocd-application;argo-rollout;analysisrun;deployment;statefulset;kargo-promotion
+	// +kubebuilder:validation:Enum=argocd-application;argo-rollout;analysisrun;deployment;statefulset;daemonset;kargo-promotion
 	Preset     string `json:"preset,omitempty"`
 	APIVersion string `json:"apiVersion,omitempty"`
 	Kind       string `json:"kind,omitempty"`
@@ -245,9 +245,16 @@ type RollbackField struct {
 	Field      string  `json:"field"`
 	Before     *string `json:"before,omitempty"`
 	After      *string `json:"after,omitempty"`
+	BeforeType string  `json:"beforeType,omitempty"`
+	AfterType  string  `json:"afterType,omitempty"`
 }
 
 type TagUpdaterStatus struct {
+	// PendingWriteStatus is the pre-push status checkpoint. A prepared watch is
+	// confirmed only after its commit is reachable on the manifest branch.
+	PendingWriteStatus string `json:"pendingWriteStatus,omitempty"`
+	// WatchingSpecHash detects spec changes that must drain old lease ownership.
+	WatchingSpecHash string `json:"watchingSpecHash,omitempty"`
 	// WatchingGate freezes the gate definition across spec edits during a release.
 	WatchingGate *Gate `json:"watchingGate,omitempty"`
 	// WatchingDeployed is sticky: timeout cannot blame a release after deployment.

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 
@@ -31,6 +32,7 @@ const holdAnnotation = "updater.argocd.io/hold"
 var rollbackCount = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tagupdater_rollbacks_total", Help: "Whole-release rollback writes."}, []string{"namespace", "name"})
 var suppressedCount = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tagupdater_rollback_suppressed_total", Help: "Rollback suppression transitions."}, []string{"namespace", "name", "reason"})
 var ambiguousGate = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tagupdater_rollback_ambiguous", Help: "Multiple pending changes make rollback blame ambiguous."}, []string{"namespace", "name"})
+var pendingTooLong = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tagupdater_gate_pending_too_long", Help: "A deployed release has exceeded its health observation window without a terminal failure."}, []string{"namespace", "name"})
 
 func appKey(tu *v1.TagUpdater) string {
 	if tu.Spec.ArgoCDApp == nil {
@@ -116,7 +118,7 @@ func (r *TagUpdaterReconciler) appAmbiguous(ctx context.Context, tu *v1.TagUpdat
 }
 
 func (r *TagUpdaterReconciler) appAmbiguousForIntent(ctx context.Context, tu *v1.TagUpdater, pendingIntent bool) (bool, error) {
-	if appKey(tu) == "" {
+	if !gated(tu) || appKey(tu) == "" {
 		return false, nil
 	}
 	var all v1.TagUpdaterList
@@ -209,9 +211,6 @@ func (r *TagUpdaterReconciler) enqueuePeers(ctx context.Context, obj client.Obje
 				match = true
 			}
 		}
-		if item, ok := obj.(*unstructured.Unstructured); ok && item.GetKind() == "StatefulSet" && tu.Status.WatchingTag != "" {
-			match = true
-		}
 		if match {
 			requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&tu)})
 		}
@@ -232,7 +231,9 @@ func (r *TagUpdaterReconciler) controllerBuilder(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).Named("tagupdater").
 		Watches(&v1.TagUpdater{}, handler.EnqueueRequestsFromMapFunc(r.enqueuePeers), builder.WithPredicates(updaterEvents)).
 		WatchesRawSource(r.Gates).
-		Watches(&coordinationv1.Lease{}, handler.EnqueueRequestsFromMapFunc(r.enqueuePeers), builder.WithPredicates(predicate.ResourceVersionChangedPredicate{})).Complete(r)
+		Watches(&coordinationv1.Lease{}, handler.EnqueueRequestsFromMapFunc(r.enqueuePeers), builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}, predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetLabels()["updater.argocd.io/app-lease"] == "true"
+		}))).Complete(r)
 }
 
 // Every named Application target is part of the release, including multi-file
@@ -316,14 +317,21 @@ func (r *TagUpdaterReconciler) acquireApp(ctx context.Context, tu *v1.TagUpdater
 	return true, nil
 }
 func (r *TagUpdaterReconciler) releaseApp(ctx context.Context, tu *v1.TagUpdater) error {
-	if !gated(tu) {
+	if !gated(tu) && tu.Status.WatchingTag == "" && !slices.Contains(tu.Finalizers, gateFinalizer) {
 		return nil
 	}
-	for _, ref := range coordinationRefs(tu) {
-		copy := tu.DeepCopy()
-		copy.Spec.ArgoCDApp = &ref
-		if err := r.releaseOneApp(ctx, copy); err != nil {
-			return err
+	var leases coordinationv1.LeaseList
+	if err := r.reader().List(ctx, &leases, client.MatchingLabels{"updater.argocd.io/app-lease": "true"}); err != nil {
+		return err
+	}
+	for i := range leases.Items {
+		lease := &leases.Items[i]
+		if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity == holder(tu) {
+			empty := ""
+			lease.Spec.HolderIdentity = &empty
+			if err := r.Update(ctx, lease); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

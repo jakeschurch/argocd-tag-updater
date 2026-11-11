@@ -97,6 +97,7 @@ spec:
                           - analysisrun
                           - deployment
                           - statefulset
+                          - daemonset
                           - kargo-promotion
                           type: string
                         selector:
@@ -163,7 +164,7 @@ spec:
                         rule: has(self.preset) || (has(self.apiVersion) && has(self.kind)
                           && ((self.apiVersion == 'argoproj.io/v1alpha1' && self.kind
                           in ['Application', 'Rollout', 'AnalysisRun']) || (self.apiVersion
-                          == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet'])
+                          == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet', 'DaemonSet'])
                           || (self.apiVersion == 'kargo.akuity.io/v1alpha1' && self.kind
                           == 'Promotion')))
                     maxItems: 16
@@ -635,6 +636,12 @@ spec:
                       type: string
                     apiVersion:
                       type: string
+                    beforeType:
+                      type: string
+                      enum: ["", "!!int", "!!float", "!!bool", "!!null"]
+                    afterType:
+                      type: string
+                      enum: ["", "!!int", "!!float", "!!bool", "!!null"]
                     before:
                       type: string
                     field:
@@ -684,6 +691,10 @@ spec:
                 description: 'WatchingDeployed is sticky: timeout cannot blame a release
                   after deployment.'
                 type: boolean
+              pendingWriteStatus:
+                type: string
+              watchingSpecHash:
+                type: string
               watchingGate:
                 description: WatchingGate freezes the gate definition across spec
                   edits during a release.
@@ -723,6 +734,7 @@ spec:
                           - analysisrun
                           - deployment
                           - statefulset
+                          - daemonset
                           - kargo-promotion
                           type: string
                         selector:
@@ -789,7 +801,7 @@ spec:
                         rule: has(self.preset) || (has(self.apiVersion) && has(self.kind)
                           && ((self.apiVersion == 'argoproj.io/v1alpha1' && self.kind
                           in ['Application', 'Rollout', 'AnalysisRun']) || (self.apiVersion
-                          == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet'])
+                          == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet', 'DaemonSet'])
                           || (self.apiVersion == 'kargo.akuity.io/v1alpha1' && self.kind
                           == 'Promotion')))
                     maxItems: 16

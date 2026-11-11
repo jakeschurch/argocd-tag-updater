@@ -23,7 +23,9 @@ func activeGate(tu *v1.TagUpdater) *v1.Gate {
 	}
 	return tu.Spec.Gate
 }
-func gated(tu *v1.TagUpdater) bool { return tu.Spec.ArgoCDApp != nil || activeGate(tu) != nil }
+func gated(tu *v1.TagUpdater) bool {
+	return activeGate(tu) != nil || (tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Spec.ArgoCDApp != nil)
+}
 
 // Without an Application identity, serialize the entire namespace/kind. This
 // conservatively covers overlapping selectors and named gates on the same kind.

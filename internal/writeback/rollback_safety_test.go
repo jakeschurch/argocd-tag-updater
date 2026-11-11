@@ -119,3 +119,36 @@ func TestSnapshotRestoresEmptyAbsentAndRemovedFields(t *testing.T) {
 	}
 }
 func strptr(value string) *string { return &value }
+
+func TestNumericSnapshotRestoresTypeAndProtectsExternalTypes(t *testing.T) {
+	before := []byte("apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: nix-farm\n  namespace: argocd\nspec:\n  tag: 20261111\n")
+	targets := safetyTarget("spec.tag", "release-v2")
+	after, _, err := UpdateManifest(before, targets, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields, err := snapshotManifest(before, after, "app.yaml", targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, changed, err := restoreManifest(after, "app.yaml", fields)
+	if err != nil || !changed || string(restored) != string(before) {
+		t.Fatalf("numeric restore: %s %v", restored, err)
+	}
+	_, changed, err = restoreManifest(restored, "app.yaml", fields)
+	if err != nil || changed {
+		t.Fatalf("numeric retry: changed=%v err=%v", changed, err)
+	}
+	external := strings.ReplaceAll(string(restored), "20261111", "\"20261111\"")
+	if _, _, err := restoreManifest([]byte(external), "app.yaml", fields); err == nil {
+		t.Fatal("external scalar type change ignored")
+	}
+}
+
+func TestRefFailuresAreNotPushConflicts(t *testing.T) {
+	for _, message := range []string{"failed to update ref: permission denied", "failed to update ref: locked"} {
+		if retryablePushConflict(errors.New(message)) {
+			t.Fatal(message)
+		}
+	}
+}

@@ -65,6 +65,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	var tu v1alpha1.TagUpdater
 	if err := r.Get(ctx, req.NamespacedName, &tu); err != nil {
 		if apierrors.IsNotFound(err) {
+			pendingTooLong.DeleteLabelValues(req.Namespace, req.Name)
 			if r.Gates != nil {
 				r.Gates.Unsubscribe(req.NamespacedName)
 			}
@@ -74,18 +75,35 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !tu.DeletionTimestamp.IsZero() {
+		pendingTooLong.DeleteLabelValues(tu.Namespace, tu.Name)
 		if r.Gates != nil {
 			r.Gates.Unsubscribe(req.NamespacedName)
 		}
-		// A pending Git write cannot safely be attributed after deletion. Keep
-		// its non-expiring lease fenced for explicit recovery by the operator.
-		if tu.Status.WatchingTag == "" {
-			if err := r.releaseApp(ctx, &tu); err != nil {
-				return ctrl.Result{}, err
-			}
+		if err := r.releaseApp(ctx, &tu); err != nil {
+			return ctrl.Result{}, err
 		}
 		removeGateFinalizer(&tu)
 		return ctrl.Result{}, r.Update(ctx, &tu)
+	}
+	// 2026-11-11: drain old ownership before observing a changed spec. Search
+	// leases by holder, since removed targets are absent from the current spec.
+	if tu.Status.WatchingTag != "" && (!gated(&tu) || (tu.Status.WatchingSpecHash != "" && tu.Status.WatchingSpecHash != specHash(&tu)) || len(tu.Status.RollbackFields) == 0) {
+		if err := r.releaseApp(ctx, &tu); err != nil {
+			return ctrl.Result{}, err
+		}
+		clearWatch(&tu)
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "WatchDrained", Message: "spec changed or legacy watch lacks a verifiable baseline; drained old leases without changing Git"})
+		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, &tu)
+	}
+	if tu.Status.PendingWriteStatus != "" {
+		credentials, err := r.resolveWriteBackCredentials(ctx, &tu)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		writer := writeback.Writer{Spec: tu.Spec.WriteBack, Credentials: credentials}
+		if err := r.settleWrite(ctx, &tu, writer, nil); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	if r.Gates != nil {
 		if err := r.Gates.Subscribe(req.NamespacedName, tu.Generation, r.gateSubscriptions(&tu)); err != nil {
@@ -96,6 +114,12 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		if !r.Gates.Synced(req.NamespacedName) {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
+
+	if r.Gates == nil && gated(&tu) && addGateFinalizer(&tu) {
+		if err := r.Update(ctx, &tu); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
@@ -349,6 +373,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				if ambiguous {
 					return fmt.Errorf("ambiguous pending changes; refusing push")
 				}
+				prepareWrite(&tu)
 				now := metav1.NewTime(r.clock())
 				tu.Status.PreviousTag, tu.Status.PreviousImageDigest, tu.Status.PreviousSignedDigest = previousTag, previousDigest, previousSigned
 				tu.Status.LastTag = latest.Tag
@@ -357,6 +382,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				tu.Status.WatchingTag, tu.Status.WatchingCommit = latest.Tag, result.CommitSHA
 				tu.Status.WatchingArmedAt, tu.Status.WatchingSince = &now, nil
 				tu.Status.WatchingGate = tu.Spec.Gate.DeepCopy()
+				tu.Status.WatchingSpecHash = specHash(&tu)
 				tu.Status.WatchingDeployed = false
 				baseline := r.baselineHealthy(ctx, &tu)
 				tu.Status.BaselineHealthy = baseline
@@ -369,6 +395,12 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			}
 		}
 		writeResult, err = writer.Apply(ctx)
+		if tu.Status.PendingWriteStatus != "" {
+			err = r.settleWrite(ctx, &tu, writer, err)
+			if err == nil && writeResult.CommitSHA == "" {
+				writeResult = writeback.Result{Committed: true, CommitSHA: tu.Status.WatchingCommit}
+			}
+		}
 		if err == nil {
 			reason, message := "UpToDate", "manifest already contains the rendered values; no commit created"
 			if writeResult.Committed {
@@ -461,6 +493,7 @@ func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, 
 	deployed := fresh && state.Sync == "Synced" && r.applicationPinsApplied(ctx, tu)
 	healthy := deployed && state.Health == "Healthy" && !state.syncInFlight()
 	failed := deployed && state.Health == "Degraded" && !state.syncInFlight()
+	analysisUnavailable := false
 	if explicit := activeGate(tu); explicit != nil {
 		if r.Gates == nil {
 			return r.blockedWatch(ctx, tu, "GateUnavailable", "gate registry is unavailable")
@@ -469,7 +502,11 @@ func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, 
 		if tu.Status.WatchingRollback {
 			tag = tu.Status.PreviousTag
 		}
-		d, h, f, _ := r.Gates.Evaluate(explicit.Sources, tag)
+		d, h, f, why := r.Gates.Evaluate(explicit.Sources, tag)
+		analysisUnavailable = why == gate.AnalysisInfrastructureError
+		if analysisUnavailable {
+			failed = failed && r.failureOutsideAnalysis(ctx, tu)
+		}
 		// The explicit source fences stale aggregate Application failures. Once
 		// it acknowledges this release, failures elsewhere in the same unit
 		// (for example its operator Deployment) must still roll back the unit.
@@ -482,12 +519,19 @@ func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, 
 		}
 	}
 	if healthy {
+		pendingTooLong.WithLabelValues(tu.Namespace, tu.Name).Set(0)
 		clearWatch(tu)
 		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionTrue, Reason: "DeploymentHealthy", Message: "ArgoCD reports the written release Synced and Healthy"})
 		if err := r.Status().Update(ctx, tu); err != nil {
 			return 0, err
 		}
 		return 0, r.releaseApp(ctx, tu)
+	}
+	if analysisUnavailable && !failed {
+		if r.clock().Sub(tu.Status.WatchingSince.Time) >= rollbackTimeout(tu) {
+			pendingTooLong.WithLabelValues(tu.Namespace, tu.Name).Set(1)
+		}
+		return r.blockedWatch(ctx, tu, "AnalysisUnavailable", "analysis infrastructure errored; awaiting recovery without blaming the release")
 	}
 	// 2026-11-11: after deployment only a terminal source failure can blame a
 	// release. Long drains and low-traffic analysis must not race a wall clock.
@@ -504,10 +548,16 @@ func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, 
 		}
 		return r.watchDelay(tu), r.rollbackWithStatus(ctx, tu)
 	}
+	if tu.Status.WatchingDeployed && r.clock().Sub(tu.Status.WatchingSince.Time) >= rollbackTimeout(tu) {
+		pendingTooLong.WithLabelValues(tu.Namespace, tu.Name).Set(1)
+		return r.blockedWatch(ctx, tu, "PendingTooLong", "deployed release is still waiting for health; inspect workload rotation or analysis; no failure has been attributed")
+	}
 	return r.watchDelay(tu), nil
 }
 
 func clearWatch(tu *v1alpha1.TagUpdater) {
+	pendingTooLong.WithLabelValues(tu.Namespace, tu.Name).Set(0)
+	tu.Status.PendingWriteStatus, tu.Status.WatchingSpecHash = "", ""
 	tu.Status.WatchingTag, tu.Status.WatchingCommit = "", ""
 	tu.Status.WatchingSince, tu.Status.WatchingArmedAt = nil, nil
 	tu.Status.WatchingRollback = false
@@ -706,8 +756,8 @@ func (r *TagUpdaterReconciler) argoCDAppState(ctx context.Context, ref *v1alpha1
 	state.Health, _, _ = unstructured.NestedString(obj.Object, "status", "health", "status")
 	state.Operation, _, _ = unstructured.NestedString(obj.Object, "status", "operationState", "phase")
 	state.Deployments = deploymentsFrom(obj.Object)
-	// 2026-11-11: Argo CD considers ready OnDelete StatefulSets Healthy even
-	// while all pods still run the previous revision. Do not certify that release.
+	// 2026-11-11: OnDelete pod rotation is operator-owned. Exclude its revision
+	// convergence from Application gating; Argo health still checks ready pods.
 	resources, _, _ := unstructured.NestedSlice(obj.Object, "status", "resources")
 	for _, resource := range resources {
 		item, ok := resource.(map[string]interface{})
@@ -724,14 +774,7 @@ func (r *TagUpdaterReconciler) argoCDAppState(ctx context.Context, ref *v1alpha1
 		if strategy != "OnDelete" {
 			continue
 		}
-		replicas, found, _ := unstructured.NestedInt64(sts.Object, "spec", "replicas")
-		if !found {
-			replicas = 1
-		}
-		updated, _, _ := unstructured.NestedInt64(sts.Object, "status", "updatedReplicas")
-		if updated < replicas && state.Health == "Healthy" {
-			state.Health = "Progressing"
-		}
+		// No updatedReplicas requirement for OnDelete.
 	}
 	return state, nil
 }
@@ -1215,7 +1258,7 @@ func (r *TagUpdaterReconciler) resolveDockerAuth(ctx context.Context, namespace,
 func (r *TagUpdaterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.progress.multiplier = r.StaleMultiplier
 	r.progress.floor = r.StaleFloor
-	metrics.Registry.MustRegister(progressCollector{tracker: &r.progress}, rollbackCount, suppressedCount, ambiguousGate)
+	metrics.Registry.MustRegister(progressCollector{tracker: &r.progress}, rollbackCount, suppressedCount, ambiguousGate, pendingTooLong)
 	return r.controllerBuilder(mgr)
 }
 

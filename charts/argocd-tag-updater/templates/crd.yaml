@@ -98,6 +98,7 @@ spec:
                           - analysisrun
                           - deployment
                           - statefulset
+                          - daemonset
                           - kargo-promotion
                           type: string
                         selector:
@@ -631,6 +632,12 @@ spec:
                       type: string
                     apiVersion:
                       type: string
+                    beforeType:
+                      type: string
+                      enum: ["", "!!int", "!!float", "!!bool", "!!null"]
+                    afterType:
+                      type: string
+                      enum: ["", "!!int", "!!float", "!!bool", "!!null"]
                     before:
                       type: string
                     field:
@@ -680,6 +687,10 @@ spec:
                 description: 'WatchingDeployed is sticky: timeout cannot blame a release
                   after deployment.'
                 type: boolean
+              pendingWriteStatus:
+                type: string
+              watchingSpecHash:
+                type: string
               watchingGate:
                 description: WatchingGate freezes the gate definition across spec
                   edits during a release.
@@ -719,6 +730,7 @@ spec:
                           - analysisrun
                           - deployment
                           - statefulset
+                          - daemonset
                           - kargo-promotion
                           type: string
                         selector:

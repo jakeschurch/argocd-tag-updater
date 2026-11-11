@@ -18,7 +18,7 @@ rules:
     resources: ["applications", "rollouts", "analysisruns"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
-    resources: ["deployments", "statefulsets"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["kargo.akuity.io"]
     resources: ["promotions"]

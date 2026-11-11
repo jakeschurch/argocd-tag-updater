@@ -40,6 +40,7 @@ func (r *TagUpdaterReconciler) restoreRelease(ctx context.Context, tu *v1.TagUpd
 	badTag := tu.Status.WatchingTag
 	writer := writeback.Writer{Spec: spec, Credentials: credentials, Targets: targets, Restore: tu.Status.RollbackFields, Data: map[string]string{"tag": tu.Status.PreviousTag}}
 	writer.BeforePush = func(result writeback.Result) error {
+		prepareWrite(tu)
 		now := metav1.NewTime(r.clock())
 		tu.Status.LastTag = tu.Status.PreviousTag
 		tu.Status.LastImageDigest, tu.Status.LastSignedDigest = tu.Status.PreviousImageDigest, tu.Status.PreviousSignedDigest
@@ -52,6 +53,12 @@ func (r *TagUpdaterReconciler) restoreRelease(ctx context.Context, tu *v1.TagUpd
 		return r.Status().Update(ctx, tu)
 	}
 	result, err := writer.Apply(ctx)
+	if tu.Status.PendingWriteStatus != "" {
+		err = r.settleWrite(ctx, tu, writer, err)
+		if err == nil && result.CommitSHA == "" {
+			result.CommitSHA = tu.Status.WatchingCommit
+		}
+	}
 	if err != nil {
 		return err
 	}

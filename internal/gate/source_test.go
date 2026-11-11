@@ -79,12 +79,129 @@ func TestCELCompilationEvaluationAndFailClosed(t *testing.T) {
 	}
 }
 
-func TestOnDeleteOldPodsCannotBeHealthy(t *testing.T) {
+func TestOnDeleteAcknowledgesDesiredRevisionWithoutRequiringPodRotation(t *testing.T) {
 	s, _ := Compile(v1.GateSpec{Preset: "statefulset", Name: "web", Namespace: "web"})
 	obj := workload("StatefulSet", "", "v2", 2, int64(2))
-	obj.Object["status"].(map[string]interface{})["currentRevision"] = "old"
-	obj.Object["status"].(map[string]interface{})["updateRevision"] = "new"
-	if d, h, _, _ := s.Evaluate(obj, "v2"); !d || h {
-		t.Fatal("old ready OnDelete pods passed")
+	_ = unstructured.SetNestedField(obj.Object, "OnDelete", "spec", "updateStrategy", "type")
+	_ = unstructured.SetNestedField(obj.Object, "old", "status", "currentRevision")
+	_ = unstructured.SetNestedField(obj.Object, "desired-revision", "status", "updateRevision")
+	_ = unstructured.SetNestedField(obj.Object, int64(0), "status", "updatedReplicas")
+	if d, h, f, _ := s.Evaluate(obj, "v2"); !d || !h || f {
+		t.Fatal("ready OnDelete pods waiting for operator rotation blocked acknowledgement")
+	}
+	if _, h, _, _ := s.Evaluate(obj, ""); !h {
+		t.Fatal("ready OnDelete baseline incorrectly unhealthy")
+	}
+	if d, h, f, _ := s.Evaluate(obj, "v1"); d || h || f {
+		t.Fatal("OnDelete acknowledged a tag absent from its desired template")
+	}
+	_ = unstructured.SetNestedField(obj.Object, int64(1), "status", "readyReplicas")
+	if d, h, f, _ := s.Evaluate(obj, "v2"); !d || h || f {
+		t.Fatal("OnDelete availability loss was reported healthy or as release failure")
+	}
+	_ = unstructured.SetNestedField(obj.Object, int64(2), "status", "readyReplicas")
+	unstructured.RemoveNestedField(obj.Object, "status", "updateRevision")
+	if d, h, f, _ := s.Evaluate(obj, "v2"); d || h || f {
+		t.Fatal("OnDelete acknowledged before the StatefulSet controller computed a revision")
+	}
+	_ = unstructured.SetNestedField(obj.Object, "desired-revision", "status", "updateRevision")
+	_ = unstructured.SetNestedField(obj.Object, int64(1), "status", "observedGeneration")
+	if d, h, f, _ := s.Evaluate(obj, "v2"); d || h || f {
+		t.Fatal("OnDelete acknowledged stale status")
+	}
+}
+
+func TestStatefulSetRollingUpdateWaitsForReadyNewReplicas(t *testing.T) {
+	s, _ := Compile(v1.GateSpec{Preset: "statefulset", Name: "web", Namespace: "web"})
+	obj := workload("StatefulSet", "", "v2", 2, int64(2))
+	_ = unstructured.SetNestedField(obj.Object, "old", "status", "currentRevision")
+	_ = unstructured.SetNestedField(obj.Object, "new", "status", "updateRevision")
+	_ = unstructured.SetNestedField(obj.Object, int64(1), "status", "updatedReplicas")
+	if d, h, f, _ := s.Evaluate(obj, "v2"); d || h || f {
+		t.Fatal("stalled StatefulSet rollout disabled its deployment timeout")
+	}
+	_ = unstructured.SetNestedField(obj.Object, int64(2), "status", "updatedReplicas")
+	_ = unstructured.SetNestedField(obj.Object, "new", "status", "currentRevision")
+	_ = unstructured.SetNestedField(obj.Object, int64(1), "status", "readyReplicas")
+	if d, h, f, _ := s.Evaluate(obj, "v2"); d || h || f {
+		t.Fatal("unready updated StatefulSet acknowledged deployment")
+	}
+	_ = unstructured.SetNestedField(obj.Object, int64(2), "status", "readyReplicas")
+	if d, h, f, _ := s.Evaluate(obj, "v2"); !d || !h || f {
+		t.Fatal("ready complete StatefulSet rollout not acknowledged")
+	}
+	if d, h, f, _ := s.Evaluate(obj, ""); d || !h || f {
+		t.Fatal("ready StatefulSet baseline did not pass health independently of a tag")
+	}
+	unstructured.RemoveNestedField(obj.Object, "status", "currentRevision")
+	unstructured.RemoveNestedField(obj.Object, "status", "updateRevision")
+	if d, h, f, _ := s.Evaluate(obj, ""); d || h || f {
+		t.Fatal("missing StatefulSet revisions were treated as a healthy baseline")
+	}
+}
+
+func TestRolloutAnalysisErrorIsPendingWhileFailedAnalysisRejectsRelease(t *testing.T) {
+	s, _ := Compile(v1.GateSpec{Preset: "argo-rollout", Name: "web", Namespace: "web"})
+	for _, phase := range []string{"Degraded", "Healthy"} {
+		t.Run(phase, func(t *testing.T) {
+			obj := workload("Rollout", phase, "v2", 2, int64(2))
+			_ = unstructured.SetNestedField(obj.Object, true, "status", "abort")
+			_ = unstructured.SetNestedField(obj.Object, "Error", "status", "currentStepAnalysisRunStatus", "status")
+			_ = unstructured.SetNestedSlice(obj.Object, []interface{}{map[string]interface{}{"type": "Progressing", "status": "False", "reason": "RolloutAborted"}}, "status", "conditions")
+			if d, h, f, _ := s.Evaluate(obj, "v2"); !d || h || f {
+				t.Fatal("analysis infrastructure failure was healthy or blamed the release")
+			}
+			if d, h, f, _ := s.Evaluate(obj, "v1"); d || h || f {
+				t.Fatal("analysis error acknowledged a different tag")
+			}
+			_ = unstructured.SetNestedField(obj.Object, "Failed", "status", "currentStepAnalysisRunStatus", "status")
+			_ = unstructured.SetNestedField(obj.Object, "Degraded", "status", "phase")
+			if d, h, f, _ := s.Evaluate(obj, "v2"); !d || h || !f {
+				t.Fatal("explicit failed analysis no longer rejects release")
+			}
+		})
+	}
+}
+
+func TestDaemonSetAcknowledgesOnlyObservedCompleteRollouts(t *testing.T) {
+	s, err := Compile(v1.GateSpec{Preset: "daemonset", Name: "web", Namespace: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := PresetGVK("daemonset"); got != "apps/v1/DaemonSet" {
+		t.Fatalf("wrong DaemonSet GVK: %s", got)
+	}
+	for _, test := range []struct {
+		name                               string
+		desired, updated, ready, available int64
+		generation, observed               int64
+		tag                                string
+		wantDeployed, wantHealthy          bool
+	}{
+		{name: "complete", desired: 2, updated: 2, ready: 2, available: 2, generation: 2, observed: 2, tag: "v2", wantDeployed: true, wantHealthy: true},
+		{name: "old-pods", desired: 2, updated: 1, ready: 2, available: 2, generation: 2, observed: 2, tag: "v2"},
+		{name: "unready", desired: 2, updated: 2, ready: 1, available: 1, generation: 2, observed: 2, tag: "v2"},
+		{name: "not-yet-available", desired: 2, updated: 2, ready: 2, available: 1, generation: 2, observed: 2, tag: "v2"},
+		{name: "never-observed", desired: 2, updated: 2, ready: 2, available: 2, generation: 2, observed: 0, tag: "v2"},
+		{name: "stale-observation", desired: 2, updated: 2, ready: 2, available: 2, generation: 2, observed: 1, tag: "v2"},
+		{name: "zero-generation", desired: 2, updated: 2, ready: 2, available: 2, generation: 0, observed: 0, tag: "v2"},
+		{name: "different-tag", desired: 2, updated: 2, ready: 2, available: 2, generation: 2, observed: 2, tag: "v1"},
+		{name: "empty-schedule", generation: 2, observed: 2, tag: "v2"},
+		{name: "healthy-baseline", desired: 2, updated: 2, ready: 2, available: 2, generation: 2, observed: 2, tag: "", wantHealthy: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			obj := workload("DaemonSet", "", "v2", test.generation, test.observed)
+			for field, value := range map[string]int64{
+				"desiredNumberScheduled": test.desired,
+				"updatedNumberScheduled": test.updated,
+				"numberReady":            test.ready,
+				"numberAvailable":        test.available,
+			} {
+				_ = unstructured.SetNestedField(obj.Object, value, "status", field)
+			}
+			if d, h, f, _ := s.Evaluate(obj, test.tag); d != test.wantDeployed || h != test.wantHealthy || f {
+				t.Fatalf("DaemonSet gate = deployed:%v healthy:%v failed:%v; want deployed:%v healthy:%v", d, h, f, test.wantDeployed, test.wantHealthy)
+			}
+		})
 	}
 }

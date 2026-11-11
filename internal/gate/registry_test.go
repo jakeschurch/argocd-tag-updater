@@ -2,6 +2,7 @@ package gate
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -158,4 +159,171 @@ func TestWorkloadRefRequiresDeploymentGenerationAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventually(t, func() bool { d, _, f, _ := r.Evaluate([]v1.GateSpec{spec}, "v2"); return d && f })
+}
+
+func TestRegistryCreationFailureKeepsPreviousSubscriptionAndIndexes(t *testing.T) {
+	obj := workload("Deployment", "", "v2", 2, int64(2))
+	r, _, q := registryHarness(t, obj)
+	key := types.NamespacedName{Namespace: "web", Name: "updater"}
+	original := v1.GateSpec{Preset: "deployment", Name: "web", Namespace: "web"}
+	if err := r.Subscribe(key, 1, []v1.GateSpec{original}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, func() bool { return r.Synced(key) })
+	before := r.observers[key].signature
+	originalSubject := r.subjects[obj.GroupVersionKind()]
+	// Force the subject-creation error after processing an existing GVK. The
+	// old implementation detached its observer and published new indexes first.
+	r.ctx = nil
+	replacement := original
+	replacement.Name = "replacement"
+	newKind := v1.GateSpec{Preset: "statefulset", Name: "db", Namespace: "web"}
+	if err := r.Subscribe(key, 2, []v1.GateSpec{replacement, newKind}); err == nil {
+		t.Fatal("creation before registry startup unexpectedly succeeded")
+	}
+	if len(r.subjects) != 1 || r.subjects[obj.GroupVersionKind()] != originalSubject {
+		t.Fatal("failed replacement changed subjects")
+	}
+	if r.observers[key].signature != before || r.compiled(original) == nil || r.compiled(replacement) != nil {
+		t.Fatal("failed replacement changed the observer")
+	}
+	oldIndex := types.NamespacedName{Namespace: "web", Name: "web"}
+	newIndex := types.NamespacedName{Namespace: "web", Name: "replacement"}
+	if len(originalSubject.index[oldIndex][key]) != 1 || len(originalSubject.index[newIndex]) != 0 {
+		t.Fatal("failed replacement changed name indexes")
+	}
+	if d, h, f, _ := r.Evaluate([]v1.GateSpec{original}, "v2"); !d || !h || f {
+		t.Fatal("previous generation stopped evaluating after failed replacement")
+	}
+	for q.Len() > 0 {
+		item, _ := q.Get()
+		q.Done(item)
+	}
+	r.notify(obj.GroupVersionKind(), obj)
+	if q.Len() != 1 {
+		t.Fatal("previous generation stopped receiving notifications")
+	}
+}
+
+func TestRegistrySubscribeFailureLeavesNoPartialState(t *testing.T) {
+	for _, started := range []bool{false, true} {
+		t.Run(map[bool]string{false: "not-started", true: "invalid-later-source"}[started], func(t *testing.T) {
+			r, _, _ := registryHarness(t)
+			key := types.NamespacedName{Namespace: "web", Name: "updater"}
+			specs := []v1.GateSpec{{Preset: "deployment", Name: "web", Namespace: "web"}}
+			if !started {
+				r.ctx = nil
+			} else {
+				specs = append(specs, v1.GateSpec{Preset: "does-not-exist", Namespace: "web", Name: "web"})
+			}
+			if err := r.Subscribe(key, 1, specs); err == nil {
+				t.Fatal("invalid subscription unexpectedly succeeded")
+			}
+			if len(r.subjects) != 0 || len(r.observers) != 0 {
+				t.Fatal("failed subscription left subjects or observers")
+			}
+		})
+	}
+}
+
+func TestRegistryTransformsApplicationCacheWithoutLosingObservationOrCELFields(t *testing.T) {
+	source := map[string]interface{}{"repoURL": "ssh://git/repo", "targetRevision": "v2", "helm": map[string]interface{}{"values": "large repeated values"}}
+	obj := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+		"metadata": map[string]interface{}{"name": "web", "namespace": "web", "managedFields": []interface{}{map[string]interface{}{"manager": "argocd"}}},
+		"spec":     map[string]interface{}{"sources": []interface{}{source}},
+		"status": map[string]interface{}{
+			"health":    map[string]interface{}{"status": "Healthy"},
+			"sync":      map[string]interface{}{"status": "Synced", "comparedTo": map[string]interface{}{"sources": []interface{}{source}}},
+			"resources": []interface{}{map[string]interface{}{"group": "apps", "kind": "StatefulSet", "name": "db", "namespace": "web"}},
+			"history": []interface{}{map[string]interface{}{
+				"id": int64(7), "revision": "commit-a", "revisions": []interface{}{"commit-a", "commit-b"},
+				"deployStartedAt": "2026-11-11T10:00:00Z", "deployedAt": "2026-11-11T10:01:00Z",
+				"source": source, "sources": []interface{}{source},
+			}},
+			"operationState": map[string]interface{}{
+				"phase": "Succeeded", "startedAt": "2026-11-11T10:00:00Z", "finishedAt": "2026-11-11T10:01:00Z",
+				"operation": map[string]interface{}{"sync": map[string]interface{}{"revision": "commit-a", "source": source, "sources": []interface{}{source}}},
+				"syncResult": map[string]interface{}{
+					"revision": "commit-a", "revisions": []interface{}{"commit-a", "commit-b"}, "source": source, "sources": []interface{}{source},
+					"resources": []interface{}{map[string]interface{}{"kind": "StatefulSet", "status": "Synced"}},
+				},
+			},
+		},
+	}}
+	r, _, _ := registryHarness(t, obj)
+	key := types.NamespacedName{Namespace: "web", Name: "updater"}
+	app := v1.GateSpec{Preset: "argocd-application", Namespace: "web", Name: "web"}
+	custom := v1.GateSpec{
+		APIVersion: "argoproj.io/v1alpha1", Kind: "Application", Namespace: "web", Name: "web",
+		Deployed: "object.spec.sources[0].targetRevision == tag",
+		Healthy:  "object.status.history[0].id == 7 && object.status.operationState.syncResult.resources[0].status == 'Synced'",
+		Failed:   "false",
+	}
+	if err := r.Subscribe(key, 1, []v1.GateSpec{app, custom}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, func() bool { return r.Synced(key) })
+	cached, err := r.Object(obj.GroupVersionKind(), types.NamespacedName{Namespace: "web", Name: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := unstructured.NestedFieldNoCopy(cached.Object, "metadata", "managedFields"); found {
+		t.Fatal("managedFields retained in cache")
+	}
+	history, _, _ := unstructured.NestedSlice(cached.Object, "status", "history")
+	entry := history[0].(map[string]interface{})
+	if entry["source"] != nil || entry["sources"] != nil {
+		t.Fatal("full source snapshots retained in application history")
+	}
+	if !reflect.DeepEqual(entry, map[string]interface{}{
+		"id": int64(7), "revision": "commit-a", "revisions": []interface{}{"commit-a", "commit-b"},
+		"deployStartedAt": "2026-11-11T10:00:00Z", "deployedAt": "2026-11-11T10:01:00Z",
+	}) {
+		t.Fatalf("deployment observation history changed: %#v", entry)
+	}
+	for _, path := range [][]string{{"status", "operationState", "syncResult"}, {"status", "operationState", "operation", "sync"}} {
+		for _, field := range []string{"source", "sources"} {
+			if _, found, _ := unstructured.NestedFieldNoCopy(cached.Object, append(path, field)...); found {
+				t.Fatalf("repeated sources retained under %v", path)
+			}
+		}
+	}
+	for _, field := range []string{"phase", "startedAt", "finishedAt"} {
+		before, _, _ := unstructured.NestedFieldNoCopy(obj.Object, "status", "operationState", field)
+		after, _, _ := unstructured.NestedFieldNoCopy(cached.Object, "status", "operationState", field)
+		if !reflect.DeepEqual(before, after) {
+			t.Fatalf("operation observation field %s changed", field)
+		}
+	}
+	for _, field := range []string{"revision", "revisions", "resources"} {
+		before, _, _ := unstructured.NestedFieldNoCopy(obj.Object, "status", "operationState", "syncResult", field)
+		after, _, _ := unstructured.NestedFieldNoCopy(cached.Object, "status", "operationState", "syncResult", field)
+		if !reflect.DeepEqual(before, after) {
+			t.Fatalf("syncResult observation field %s changed", field)
+		}
+	}
+	for _, path := range [][]string{{"spec"}, {"status", "sync"}, {"status", "resources"}} {
+		before, _, _ := unstructured.NestedFieldNoCopy(obj.Object, path...)
+		after, _, _ := unstructured.NestedFieldNoCopy(cached.Object, path...)
+		if !reflect.DeepEqual(before, after) {
+			t.Fatalf("current desired state or resource health changed at %v", path)
+		}
+	}
+	for _, spec := range []v1.GateSpec{app, custom} {
+		if d, h, f, reason := r.Evaluate([]v1.GateSpec{spec}, "v2"); !d || !h || f {
+			t.Fatalf("transformed cache failed evaluation: %v %v %v %s", d, h, f, reason)
+		}
+	}
+}
+
+func TestRegistryTransformPreservesNonApplicationFields(t *testing.T) {
+	obj := workload("Deployment", "", "v2", 2, int64(2))
+	obj.SetManagedFields([]metav1.ManagedFieldsEntry{{Manager: "argocd"}})
+	before := obj.DeepCopy()
+	unstructured.RemoveNestedField(before.Object, "metadata", "managedFields")
+	transformed, err := trimGateObject(obj)
+	if err != nil || !reflect.DeepEqual(transformed, before) {
+		t.Fatal("non-Application data beyond managedFields changed")
+	}
 }

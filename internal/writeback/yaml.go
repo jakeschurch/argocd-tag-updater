@@ -316,6 +316,10 @@ func applyYAMLEdits(input []byte, values map[*yaml.Node]string, insertions map[*
 			return nil, err
 		}
 		rendered, err := renderScalar(value, node.Style)
+		if node.Tag != "!!str" {
+			encoded, encodeErr := yaml.Marshal(&yaml.Node{Kind: yaml.ScalarNode, Tag: node.Tag, Value: value})
+			rendered, err = strings.TrimSpace(string(encoded)), encodeErr
+		}
 		if err != nil {
 			return nil, err
 		}

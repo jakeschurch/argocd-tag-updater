@@ -107,31 +107,51 @@ func (r *Registry) Subscribe(key types.NamespacedName, generation int64, specs [
 			subscriptions = append(subscriptions, subscription{source: dep, matcher: Matcher{Namespace: spec.Namespace, Selector: labels.Everything()}})
 		}
 	}
-	// Detach only after the new generation validates and compiles successfully.
-	// Preserve shared subjects while changing matchers to avoid cache churn.
-	r.detachLocked(key, false)
+	// 2026-11-11: prepare every subject before replacing the observer. A later
+	// creation failure must preserve its old matchers and leave no orphan cache.
+	created := map[schema.GroupVersionKind]*subject{}
+	var starts []func()
+	committed := false
+	defer func() {
+		if !committed {
+			for _, s := range created {
+				s.cancel()
+			}
+		}
+	}()
 	for _, sub := range subscriptions {
 		gvk := sub.source.GVK()
-		s := r.subjects[gvk]
-		if s == nil {
-			if r.ctx == nil {
-				return fmt.Errorf("gate registry has not started")
-			}
-			ctx, cancel := context.WithCancel(r.ctx)
-			informer := dynamicinformer.NewFilteredDynamicInformer(r.dynamic, r.allowed[gvk], "", 30*time.Minute, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, nil).Informer()
-			s = &subject{informer: informer, cancel: cancel, index: map[types.NamespacedName]map[types.NamespacedName][]Matcher{}}
-			r.subjects[gvk] = s
-			_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-				AddFunc:    func(obj interface{}) { r.notify(gvk, obj) },
-				UpdateFunc: func(old, current interface{}) { r.notify(gvk, old); r.notify(gvk, current) },
-				DeleteFunc: func(obj interface{}) { r.notify(gvk, obj) },
-			})
-			if err != nil {
-				cancel()
-				return err
-			}
-			go informer.Run(ctx.Done())
+		if r.subjects[gvk] != nil || created[gvk] != nil {
+			continue
 		}
+		if r.ctx == nil {
+			return fmt.Errorf("gate registry has not started")
+		}
+		ctx, cancel := context.WithCancel(r.ctx)
+		informer := dynamicinformer.NewFilteredDynamicInformer(r.dynamic, r.allowed[gvk], "", 30*time.Minute, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, nil).Informer()
+		s := &subject{informer: informer, cancel: cancel, index: map[types.NamespacedName]map[types.NamespacedName][]Matcher{}}
+		created[gvk] = s
+		if err := informer.SetTransform(trimGateObject); err != nil {
+			return err
+		}
+		_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(obj interface{}) { r.notify(gvk, obj) },
+			UpdateFunc: func(old, current interface{}) { r.notify(gvk, old); r.notify(gvk, current) },
+			DeleteFunc: func(obj interface{}) { r.notify(gvk, obj) },
+		})
+		if err != nil {
+			return err
+		}
+		starts = append(starts, func() { go informer.Run(ctx.Done()) })
+	}
+	// No fallible operations follow: publish subjects and replace indexes as
+	// one transaction while holding the lock, preserving existing cache state.
+	for gvk, s := range created {
+		r.subjects[gvk] = s
+	}
+	r.detachLocked(key, false)
+	for _, sub := range subscriptions {
+		s := r.subjects[sub.source.GVK()]
 		matchKey := types.NamespacedName{Namespace: sub.matcher.Namespace, Name: sub.matcher.Name}
 		if s.index[matchKey] == nil {
 			s.index[matchKey] = map[types.NamespacedName][]Matcher{}
@@ -140,7 +160,47 @@ func (r *Registry) Subscribe(key types.NamespacedName, generation int64, specs [
 	}
 	r.observers[key] = observer{signature, subscriptions}
 	r.pruneLocked()
+	committed = true
+	for _, start := range starts {
+		start()
+	}
 	return nil
+}
+
+// trimGateObject bounds shared-cache payload without projecting workload specs
+// or health fields that custom CEL sources can inspect. The informer owns obj.
+func trimGateObject(raw interface{}) (interface{}, error) {
+	obj, ok := raw.(*unstructured.Unstructured)
+	if !ok {
+		return raw, nil
+	}
+	unstructured.RemoveNestedField(obj.Object, "metadata", "managedFields")
+	if obj.GetAPIVersion() != "argoproj.io/v1alpha1" || obj.GetKind() != "Application" {
+		return obj, nil
+	}
+	// 2026-11-11: Argo repeats entire Helm values in every deployment-history
+	// entry and sync result. Keep revision(s), deployedAt and operation times
+	// for deployment observation, plus other fields (IDs, results, conditions)
+	// for CEL. Current desired sources remain available under spec/comparedTo.
+	if rawHistory, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "status", "history"); found {
+		if history, ok := rawHistory.([]interface{}); ok {
+			for _, item := range history {
+				if entry, ok := item.(map[string]interface{}); ok {
+					delete(entry, "source")
+					delete(entry, "sources")
+				}
+			}
+		}
+	}
+	for _, path := range [][]string{
+		{"status", "operationState", "syncResult"},
+		{"status", "operationState", "operation", "sync"},
+	} {
+		for _, field := range []string{"source", "sources"} {
+			unstructured.RemoveNestedField(obj.Object, append(path, field)...)
+		}
+	}
+	return obj, nil
 }
 
 func (r *Registry) Unsubscribe(key types.NamespacedName) {
@@ -288,7 +348,7 @@ func (r *Registry) Evaluate(specs []v1.GateSpec, tag string) (deployed, healthy,
 			}
 			d, h, f, why := source.Evaluate(obj, tag)
 			deployed, healthy, failed = deployed && d, healthy && h, failed || (d && f)
-			if !h {
+			if !h && reason != AnalysisInfrastructureError {
 				reason = why
 			}
 		}

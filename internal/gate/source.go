@@ -16,6 +16,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
+const AnalysisInfrastructureError = "analysis infrastructure error"
+
 type Matcher struct {
 	Namespace, Name string
 	Selector        labels.Selector
@@ -45,11 +47,12 @@ var Defaults = []Kind{
 	{"apps/v1", "Deployment", "deployments"},
 	{"apps/v1", "StatefulSet", "statefulsets"},
 	{"kargo.akuity.io/v1alpha1", "Promotion", "promotions"},
+	{"apps/v1", "DaemonSet", "daemonsets"},
 }
 
 var presets = map[string]Kind{
 	"argocd-application": Defaults[0], "argo-rollout": Defaults[1], "analysisrun": Defaults[2],
-	"deployment": Defaults[3], "statefulset": Defaults[4], "kargo-promotion": Defaults[5],
+	"deployment": Defaults[3], "statefulset": Defaults[4], "kargo-promotion": Defaults[5], "daemonset": Defaults[6],
 }
 
 func PresetGVK(preset string) string {
@@ -213,10 +216,33 @@ func (s *source) Evaluate(obj *unstructured.Unstructured, tag string) (bool, boo
 		if s.preset == "deployment" {
 			healthy = healthy && number(obj, "status", "availableReplicas") == replicas && number(obj, "status", "replicas") == replicas
 			failed = condition(obj, "Progressing", "False", "ProgressDeadlineExceeded") || condition(obj, "ReplicaFailure", "True", "")
+		} else if text(obj, "spec", "updateStrategy", "type") == "OnDelete" {
+			// 2026-11-11: OnDelete pod rotation belongs to the operator. An
+			// observed desired template plus a computed updateRevision acknowledges
+			// deployment; ready existing pods provide availability health. Updated
+			// replicas/currentRevision cannot validate an intentionally deferred roll.
+			deployed = deployed && text(obj, "status", "updateRevision") != ""
+			healthy = observed && number(obj, "status", "readyReplicas") == replicas && text(obj, "status", "updateRevision") != ""
 		} else {
 			healthy = healthy && text(obj, "status", "currentRevision") == text(obj, "status", "updateRevision") && text(obj, "status", "updateRevision") != ""
+			// StatefulSets have no Deployment progress deadline. Keep an incomplete
+			// rolling update unacknowledged so the deployment timeout can bound it.
+			deployed = deployed && healthy
 		}
+	case "daemonset":
+		// 2026-11-11: DaemonSets have no progress-deadline failure condition.
+		// A partial roll stays unacknowledged so the deployment timeout bounds
+		// it; an empty schedule provides no evidence that the image can run.
+		desired := number(obj, "status", "desiredNumberScheduled")
+		healthy = observed && desired > 0 && number(obj, "status", "updatedNumberScheduled") == desired && number(obj, "status", "numberReady") == desired && number(obj, "status", "numberAvailable") == desired
+		deployed = deployed && healthy
 	case "argo-rollout":
+		// 2026-11-11: an unavailable analysis provider is no evidence against
+		// the release. Argo can abort and mark Degraded after metric errors;
+		// leave that state pending for recovery rather than rolling Git back.
+		if text(obj, "status", "currentStepAnalysisRunStatus", "status") == "Error" {
+			return deployed, false, false, AnalysisInfrastructureError
+		}
 		phase := text(obj, "status", "phase")
 		healthy = observed && phase == "Healthy" && text(obj, "status", "stableRS") == text(obj, "status", "currentPodHash") && text(obj, "status", "stableRS") != ""
 		failed = phase == "Degraded" || text(obj, "status", "abort") == "true" || condition(obj, "Progressing", "False", "RolloutAborted")

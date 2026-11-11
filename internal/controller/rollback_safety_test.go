@@ -129,11 +129,8 @@ func TestRollbackRestoresWholeUnitAndWaitsForHealthy(t *testing.T) {
 	if !tu.Status.BaselineHealthy {
 		t.Fatal("Healthy baseline lost")
 	}
-	// Changes to templates after promotion cannot alter the recorded Healthy set.
-	tu.Spec.Targets[0].Patches[0].Template = "changed-template"
-	if err := r.Update(context.Background(), tu); err != nil {
-		t.Fatal(err)
-	}
+	// Keep the watched spec unchanged: spec edits deliberately drain its watch.
+	// Rollback must restore the recorded values across the whole release unit.
 	changeSafetyApp(t, r, "Degraded", tu.Status.WatchingCommit)
 	reconcileSafety(t, r, tu)
 	if !tu.Status.WatchingRollback || tu.Status.LastTag != "v1" || len(tu.Status.SkippedTags) != 1 || tu.Status.SkippedTags[0] != "v2" {
@@ -409,7 +406,7 @@ func TestManagedAppRequiresFreshChildComparison(t *testing.T) {
 	}
 }
 
-func TestOnDeleteMustUpdatePodsBeforeHealthy(t *testing.T) {
+func TestOnDeleteUsesArgoReadyPodHealthWithoutWaitingForRotation(t *testing.T) {
 	r, tu, _ := safetyHarness(t, "Healthy")
 	app := safetyApp("Healthy", "pin")
 	_ = unstructured.SetNestedSlice(app.Object, []interface{}{map[string]interface{}{"group": "apps", "kind": "StatefulSet", "name": "worker", "namespace": "nix-csi"}}, "status", "resources")
@@ -422,16 +419,21 @@ func TestOnDeleteMustUpdatePodsBeforeHealthy(t *testing.T) {
 		t.Fatal(err)
 	}
 	state, err := r.argoCDAppState(context.Background(), tu.Spec.ArgoCDApp)
-	if err != nil || state.Health == "Healthy" {
-		t.Fatalf("old OnDelete pods certified release: %+v %v", state, err)
+	if err != nil || state.Health != "Healthy" {
+		t.Fatalf("ready OnDelete pods were blocked on operator-owned rotation: %+v %v", state, err)
 	}
-	_ = unstructured.SetNestedField(sts.Object, int64(2), "status", "updatedReplicas")
+	_ = unstructured.SetNestedField(sts.Object, int64(1), "status", "readyReplicas")
 	if _, err := r.Dynamic.Resource(gvr).Namespace("nix-csi").Update(context.Background(), sts, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	// Argo's aggregate StatefulSet health still reports unavailable pods.
+	_ = unstructured.SetNestedField(app.Object, "Progressing", "status", "health", "status")
+	if _, err := r.Dynamic.Resource(appResource).Namespace("argocd").Update(context.Background(), app, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
 	state, err = r.argoCDAppState(context.Background(), tu.Spec.ArgoCDApp)
-	if err != nil || state.Health != "Healthy" {
-		t.Fatalf("updated OnDelete pods were rejected: %+v %v", state, err)
+	if err != nil || state.Health != "Progressing" {
+		t.Fatalf("unavailable OnDelete pods lost Argo health: %+v %v", state, err)
 	}
 }
 

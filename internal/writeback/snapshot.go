@@ -34,7 +34,7 @@ func manifestRoots(input []byte) ([]*yaml.Node, error) {
 	}
 }
 
-func snapshotScalarAt(root *yaml.Node, field string) (*string, error) {
+func snapshotNodeAt(root *yaml.Node, field string) (*yaml.Node, error) {
 	node := root
 	for _, part := range strings.Split(field, ".") {
 		if node == nil {
@@ -56,11 +56,27 @@ func snapshotScalarAt(root *yaml.Node, field string) (*string, error) {
 	if node == nil {
 		return nil, nil
 	}
-	if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
-		return nil, fmt.Errorf("rollback field %s must be a string scalar", field)
+	if node.Kind != yaml.ScalarNode || node.Anchor != "" || (node.Tag != "!!str" && node.Tag != "!!int" && node.Tag != "!!float" && node.Tag != "!!bool" && node.Tag != "!!null") {
+		return nil, fmt.Errorf("rollback field %s must be a plain scalar", field)
+	}
+	return node, nil
+}
+
+func snapshotScalarAt(root *yaml.Node, field string) (*string, error) {
+	node, err := snapshotNodeAt(root, field)
+	if err != nil || node == nil {
+		return nil, err
 	}
 	value := node.Value
 	return &value, nil
+}
+
+func scalarTypeAt(root *yaml.Node, field string) string {
+	node, _ := snapshotNodeAt(root, field)
+	if node == nil || node.Tag == "!!str" {
+		return ""
+	}
+	return node.Tag
 }
 
 func snapshotManifest(before, after []byte, path string, targets []v1.TargetSpec) ([]v1.RollbackField, error) {
@@ -92,10 +108,12 @@ func snapshotManifest(before, after []byte, path string, targets []v1.TargetSpec
 				if err != nil {
 					return nil, err
 				}
-				if sameScalar(oldValue, newValue) {
+				beforeType, afterType := scalarTypeAt(root, patch.Field), scalarTypeAt(newRoots[i], patch.Field)
+				if sameScalar(oldValue, newValue) && beforeType == afterType {
 					continue
 				}
 				field := v1.RollbackField{Path: path, APIVersion: target.APIVersion, Kind: target.Kind, Name: mapValue(metadata, "name").Value, Field: patch.Field, Before: oldValue, After: newValue}
+				field.BeforeType, field.AfterType = beforeType, afterType
 				if ns := mapValue(metadata, "namespace"); ns != nil {
 					field.Namespace = ns.Value
 				}
@@ -136,10 +154,11 @@ func restoreManifest(input []byte, path string, fields []v1.RollbackField) ([]by
 			if err != nil {
 				return nil, false, err
 			}
-			if sameScalar(current, field.Before) {
+			currentType := scalarTypeAt(root, field.Field)
+			if sameScalar(current, field.Before) && currentType == field.BeforeType {
 				continue
 			}
-			if !sameScalar(current, field.After) {
+			if !sameScalar(current, field.After) || currentType != field.AfterType {
 				return nil, false, fmt.Errorf("rollback conflict: %s %s/%s field %s changed externally", path, field.Kind, field.Name, field.Field)
 			}
 			patch := v1.PatchSpec{Field: field.Field}
@@ -158,5 +177,39 @@ func restoreManifest(input []byte, path string, fields []v1.RollbackField) ([]by
 			return nil, false, fmt.Errorf("rollback target %s/%s missing", field.Kind, field.Name)
 		}
 	}
-	return updateManifest(input, targets, data, nil, true)
+	output, changed, err := updateManifest(input, targets, data, nil, true)
+	if err != nil {
+		return nil, false, err
+	}
+	// 2026-11-11: tag: 20261111 is legal YAML. Preserve its scalar type on
+	// rollback while retaining compare guards against external type changes.
+	restoredRoots, err := manifestRoots(output)
+	if err != nil {
+		return nil, false, err
+	}
+	typed := map[*yaml.Node]string{}
+	for _, field := range fields {
+		if field.Path != path || field.Before == nil || field.BeforeType == "" {
+			continue
+		}
+		for _, root := range restoredRoots {
+			match, _ := matchesTarget(root, v1.TargetSpec{APIVersion: field.APIVersion, Kind: field.Kind, Name: field.Name, Namespace: field.Namespace})
+			if !match {
+				continue
+			}
+			node, err := snapshotNodeAt(root, field.Field)
+			if err != nil || node == nil {
+				return nil, false, fmt.Errorf("restore typed scalar %s", field.Field)
+			}
+			if node.Tag != field.BeforeType {
+				node.Tag = field.BeforeType
+				typed[node] = *field.Before
+			}
+		}
+	}
+	if len(typed) != 0 {
+		output, err = applyYAMLEdits(output, typed, nil, nil)
+		changed = true
+	}
+	return output, changed, err
 }

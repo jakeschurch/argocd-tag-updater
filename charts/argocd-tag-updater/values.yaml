@@ -58,6 +58,7 @@ gateKinds:
   - {apiVersion: argoproj.io/v1alpha1, kind: AnalysisRun, resource: analysisruns}
   - {apiVersion: apps/v1, kind: Deployment, resource: deployments}
   - {apiVersion: apps/v1, kind: StatefulSet, resource: statefulsets}
+  - {apiVersion: apps/v1, kind: DaemonSet, resource: daemonsets}
   - {apiVersion: kargo.akuity.io/v1alpha1, kind: Promotion, resource: promotions}
 
 # The controller's own TagUpdater — watches this repo's tags and repins

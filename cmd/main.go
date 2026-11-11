@@ -122,6 +122,9 @@ func main() {
 	// of restarting the shared controller.
 	_ = mgr.AddHealthzCheck("reconcile-progress", reconciler.ReconcileProgressHealthz())
 	_ = mgr.AddReadyzCheck("readyz", healthz.Ping)
+	// 2026-11-11: deployment preflights probe each ready pod, so a CRD/chart
+	// update cannot be mistaken for a running checkpoint-capable controller.
+	_ = mgr.AddReadyzCheck("gated-promotion-v2", healthz.Ping)
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		fail("start manager: %v", err)

@@ -15,6 +15,7 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/storer"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
@@ -89,6 +90,41 @@ func (w Writer) RemoteHead(ctx context.Context) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("branch %s not found in %s", w.Spec.Branch, repoURL)
+}
+
+// ContainsCommit verifies ancestry on the configured remote branch, including
+// when another writer has already advanced its tip past our commit.
+func (w Writer) ContainsCommit(ctx context.Context, commit string) (bool, error) {
+	auth, repoURL, cleanup, err := w.auth()
+	if err != nil {
+		return false, err
+	}
+	defer cleanup()
+	repo, err := git.CloneContext(ctx, memory.NewStorage(), nil, &git.CloneOptions{
+		URL: repoURL, Auth: auth, ReferenceName: plumbing.NewBranchReferenceName(w.Spec.Branch),
+		SingleBranch: true, NoCheckout: true, Tags: git.NoTags,
+	})
+	if err != nil {
+		return false, fmt.Errorf("read manifest branch: %w", err)
+	}
+	head, err := repo.Head()
+	if err != nil {
+		return false, err
+	}
+	iter, err := repo.Log(&git.LogOptions{From: head.Hash()})
+	if err != nil {
+		return false, err
+	}
+	defer iter.Close()
+	found := false
+	err = iter.ForEach(func(c *object.Commit) error {
+		if c.Hash.String() == commit {
+			found = true
+			return storer.ErrStop
+		}
+		return nil
+	})
+	return found, err
 }
 
 func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoURL string) (Result, error) {
@@ -478,5 +514,5 @@ func toHTTPS(repo string) string {
 // 2026-11-11: go-git also formats non-fast-forward rejection as a plain
 // error (remote.go checkFastForwardUpdate), rather than its exported sentinel.
 func retryablePushConflict(err error) bool {
-	return err != nil && (errors.Is(err, git.ErrNonFastForwardUpdate) || strings.Contains(err.Error(), "non-fast-forward") || strings.Contains(err.Error(), "failed to update ref"))
+	return err != nil && (errors.Is(err, git.ErrNonFastForwardUpdate) || strings.Contains(err.Error(), "non-fast-forward"))
 }
