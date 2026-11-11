@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -109,24 +111,28 @@ func main() {
 		fail("setup controller: %v", err)
 	}
 
+	// 2026-11-11: readiness includes cache initialization and shutdown, including
+	// healthy election standbys; liveness must survive remote dependency outages.
+	ctx := ctrl.SetupSignalHandler()
+	ready := func(request *http.Request) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		probeCtx, cancel := context.WithTimeout(request.Context(), time.Second)
+		defer cancel()
+		if !mgr.GetCache().WaitForCacheSync(probeCtx) {
+			return fmt.Errorf("cache not synchronized")
+		}
+		return ctx.Err()
+	}
 	_ = mgr.AddHealthzCheck("healthz", healthz.Ping)
-	// Liveness also fails when git tag->rev resolution has been broken past its
-	// staleness window, so a sustained resolver outage restarts the pod and
-	// migrates leadership instead of silently pinning targets at a stale tag.
-	_ = mgr.AddHealthzCheck("tag-resolution", reconciler.RevResolutionHealthz())
-	// Liveness also fails when EVERY TagUpdater's reconcile progress is stale —
-	// a systemic freeze of the reconcile pipeline (which once silently pinned
-	// all deploys for ~1.5h) — restarting the pod and migrating leadership. A
-	// single stale updater does NOT trip this: one broken repo is surfaced via
-	// the tagupdater_reconcile_stale metric and the Stalled condition instead
-	// of restarting the shared controller.
-	_ = mgr.AddHealthzCheck("reconcile-progress", reconciler.ReconcileProgressHealthz())
-	_ = mgr.AddReadyzCheck("readyz", healthz.Ping)
-	// 2026-11-11: deployment preflights probe each ready pod, so a CRD/chart
-	// update cannot be mistaken for a running checkpoint-capable controller.
-	_ = mgr.AddReadyzCheck("gated-promotion-v2", healthz.Ping)
+	// 2026-11-11: remote git and reconcile staleness remove readiness without
+	// restarting every replica during an upstream outage.
+	_ = mgr.AddReadyzCheck("tag-resolution", reconciler.RevResolutionHealthz())
+	_ = mgr.AddReadyzCheck("reconcile-progress", reconciler.ReconcileProgressHealthz())
+	_ = mgr.AddReadyzCheck("readyz", ready)
 
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		fail("start manager: %v", err)
 	}
 }
