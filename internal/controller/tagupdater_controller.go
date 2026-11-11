@@ -340,6 +340,15 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				if !result.Committed {
 					return nil
 				}
+				// Validate intent before arming status: a refused push must never
+				// persist a watch without its baseline and complete field snapshot.
+				ambiguous, err := r.appAmbiguousForIntent(ctx, &tu, true)
+				if err != nil {
+					return err
+				}
+				if ambiguous {
+					return fmt.Errorf("ambiguous pending changes; refusing push")
+				}
 				now := metav1.NewTime(r.clock())
 				tu.Status.PreviousTag, tu.Status.PreviousImageDigest, tu.Status.PreviousSignedDigest = previousTag, previousDigest, previousSigned
 				tu.Status.LastTag = latest.Tag
@@ -349,13 +358,6 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				tu.Status.WatchingArmedAt, tu.Status.WatchingSince = &now, nil
 				tu.Status.WatchingGate = tu.Spec.Gate.DeepCopy()
 				tu.Status.WatchingDeployed = false
-				ambiguous, err := r.appAmbiguous(ctx, &tu)
-				if err != nil {
-					return err
-				}
-				if ambiguous {
-					return fmt.Errorf("ambiguous pending changes; refusing push")
-				}
 				baseline := r.baselineHealthy(ctx, &tu)
 				tu.Status.BaselineHealthy = baseline
 				tu.Status.RollbackFields = result.RollbackFields

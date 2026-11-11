@@ -449,3 +449,21 @@ func TestLeaseIncludesSecondaryApplication(t *testing.T) {
 		t.Fatalf("secondary app admitted another writer: %v %v", acquired, err)
 	}
 }
+
+func TestAmbiguousPrePushIntentDoesNotArmAnIncompleteWatch(t *testing.T) {
+	r, tu, _ := safetyHarness(t, "Healthy")
+	other := tu.DeepCopy()
+	other.Name, other.UID, other.ResourceVersion = "legacy-pending", "legacy", ""
+	other.Status.WatchingTag = "older-release"
+	if err := r.Create(context.Background(), other); err != nil {
+		t.Fatal(err)
+	}
+	ambiguous, err := r.appAmbiguousForIntent(context.Background(), tu, true)
+	if err != nil || !ambiguous {
+		t.Fatalf("pre-push intent did not fence a pending peer: %v %v", ambiguous, err)
+	}
+	loadSafety(t, r, tu)
+	if tu.Status.WatchingTag != "" || tu.Status.BaselineHealthy || len(tu.Status.RollbackFields) != 0 || len(tu.Status.SkippedTags) != 0 {
+		t.Fatal("refused intent persisted an incomplete release watch")
+	}
+}

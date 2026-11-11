@@ -112,6 +112,10 @@ func (r *TagUpdaterReconciler) releaseOneApp(ctx context.Context, tu *v1.TagUpda
 }
 
 func (r *TagUpdaterReconciler) appAmbiguous(ctx context.Context, tu *v1.TagUpdater) (bool, error) {
+	return r.appAmbiguousForIntent(ctx, tu, tu.Status.WatchingTag != "")
+}
+
+func (r *TagUpdaterReconciler) appAmbiguousForIntent(ctx context.Context, tu *v1.TagUpdater, pendingIntent bool) (bool, error) {
 	if appKey(tu) == "" {
 		return false, nil
 	}
@@ -129,7 +133,7 @@ func (r *TagUpdaterReconciler) appAmbiguous(ctx context.Context, tu *v1.TagUpdat
 			}
 		}
 	}
-	if tu.Status.WatchingTag != "" && !selfPending {
+	if pendingIntent && !selfPending {
 		pending++
 	}
 	ambiguous := pending > 1
