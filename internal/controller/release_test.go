@@ -2,6 +2,11 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -9,12 +14,61 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	v1 "github.com/jakeschurch/argocd-tag-updater/api/v1alpha1"
 	source "github.com/jakeschurch/argocd-tag-updater/internal/source"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func addReleaseTag(t *testing.T, repo *git.Repository, tag string, sha plumbing.Hash) {
 	t.Helper()
 	if _, err := repo.CreateTag(tag, sha, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReleaseComponentSignatureUsesItsPrivateRegistryCredentials(t *testing.T) {
+	remote, repo, initial := multiPathRemote(t)
+	for _, tag := range []string{"unit.main.1.abcdef", "part.main.1.abcdef"} {
+		addReleaseTag(t, repo, tag, plumbing.NewHash(initial))
+	}
+	auth := base64.StdEncoding.EncodeToString([]byte("robot:private"))
+	digest := "sha256:" + strings.Repeat("a", 64)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != "Basic "+auth {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if req.URL.Path == "/v2/private/part/tags/list" {
+			_, _ = w.Write([]byte(`{"tags":["part.main.1.abcdef"]}`))
+			return
+		}
+		if req.Method == http.MethodHead && strings.HasPrefix(req.URL.Path, "/v2/private/part/manifests/") {
+			w.Header().Set("Docker-Content-Digest", digest)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	registryURL, _ := url.Parse(server.URL)
+	config, _ := json.Marshal(map[string]interface{}{"auths": map[string]interface{}{registryURL.Host: map[string]string{"auth": auth}}})
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "component-pull", Namespace: "argocd"}, Data: map[string][]byte{corev1.DockerConfigJsonKey: config}}
+	r := &TagUpdaterReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()}
+	tu := multiPathUpdater(remote, initial, "")
+	tu.Spec.Source.TagPattern = `^unit\.(?P<branch>main)\.(?P<n>\d+)\.(?P<sha>[0-9a-f]{6})$`
+	tu.Spec.ReleaseSources = map[string]v1.SourceSpec{"part": {Type: v1.SourceTypeOCI, Repo: server.URL + "/private/part", RevisionRepo: remote, TagPattern: strings.ReplaceAll(tu.Spec.Source.TagPattern, "unit", "part"), RequireSigned: v1.SignatureModeMarker, ImagePullSecretRef: &v1.LocalObjectReference{Name: secret.Name}}}
+	tu.Spec.Targets[1].Source = "part"
+	src := &source.Git{Repo: remote}
+	tags, err := src.Tags(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, data, ok, err := r.selectRelease(context.Background(), tu, tags, src)
+	if err != nil || !ok || data["part"]["signed_digest"] != digest {
+		t.Fatalf("private component signature gate failed: %v %v %+v", ok, err, data)
 	}
 }
 func TestReleaseSelectionRequiresSamePipelineAndFullCommit(t *testing.T) {

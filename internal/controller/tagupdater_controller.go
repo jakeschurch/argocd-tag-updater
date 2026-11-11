@@ -468,7 +468,10 @@ func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, 
 			tag = tu.Status.PreviousTag
 		}
 		d, h, f, _ := r.Gates.Evaluate(explicit.Sources, tag)
-		deployed, healthy, failed = deployed && d, healthy && h, f
+		// The explicit source fences stale aggregate Application failures. Once
+		// it acknowledges this release, failures elsewhere in the same unit
+		// (for example its operator Deployment) must still roll back the unit.
+		deployed, healthy, failed = deployed && d, healthy && h, f || (d && failed)
 	}
 	if deployed && !tu.Status.WatchingDeployed {
 		tu.Status.WatchingDeployed = true

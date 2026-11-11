@@ -134,7 +134,11 @@ func (r *TagUpdaterReconciler) selectRelease(ctx context.Context, tu *v1.TagUpda
 				return matcher.Match{}, nil, false, err
 			}
 			if componentTU.Spec.Source.RequireSigned != "" {
-				signed, digest, err := r.verifySigned(ctx, componentTU, "", data["tag"], data)
+				authentication := ""
+				if registry, ok := components[name].source.(*source.OCI); ok {
+					authentication = registry.BasicAuth
+				}
+				signed, digest, err := r.verifySigned(ctx, componentTU, authentication, data["tag"], data)
 				if err != nil {
 					return matcher.Match{}, nil, false, err
 				}
