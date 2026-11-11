@@ -11,14 +11,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/cache"
 	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/plumbing/storer"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
+	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/go-git/go-git/v5/storage/memory"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -94,7 +96,7 @@ func (w Writer) RemoteHead(ctx context.Context) (string, error) {
 
 // ContainsCommit verifies ancestry on the configured remote branch, including
 // when another writer has already advanced its tip past our commit.
-func (w Writer) ContainsCommit(ctx context.Context, commit string) (bool, error) {
+func (w Writer) ContainsCommit(ctx context.Context, commit string, armedAt time.Time) (bool, error) {
 	headSHA, err := w.RemoteHead(ctx)
 	if err != nil {
 		return false, err
@@ -107,40 +109,91 @@ func (w Writer) ContainsCommit(ctx context.Context, commit string) (bool, error)
 		return false, err
 	}
 	defer cleanup()
-	// 2026-11-11: the common case needs only ls-remote. Rare descendant
-	// recovery uses disk-backed history so large manifest repos do not retain
-	// their entire object packs in controller memory.
+	// 2026-11-11: bound confirmation by the prepared commit's time, not a
+	// fixed depth. An absent push must settle even on a long-lived branch.
+	// Disk storage and a small object cache keep blobs out of the Go heap.
 	directory, err := newCloneDirectory()
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = os.RemoveAll(directory) }()
-	repo, err := git.PlainCloneContext(ctx, directory, true, &git.CloneOptions{
-		URL: repoURL, Auth: auth, ReferenceName: plumbing.NewBranchReferenceName(w.Spec.Branch),
-		SingleBranch: true, NoCheckout: true, Tags: git.NoTags,
+	storage := filesystem.NewStorage(osfs.New(directory), cache.NewObjectLRU(confirmationCacheBytes))
+	defer func() { _ = storage.Close() }()
+	branch := plumbing.NewBranchReferenceName(w.Spec.Branch)
+	repo, err := git.CloneContext(ctx, storage, nil, &git.CloneOptions{
+		URL: repoURL, Auth: auth, ReferenceName: branch,
+		SingleBranch: true, NoCheckout: true, Tags: git.NoTags, Depth: initialConfirmationDepth,
 	})
 	if err != nil {
 		return false, fmt.Errorf("read manifest branch: %w", err)
 	}
-	head, err := repo.Head()
-	if err != nil {
-		return false, err
+	cutoff := time.Time{}
+	if !armedAt.IsZero() {
+		cutoff = armedAt.Add(-confirmationClockSkew)
 	}
-	iter, err := repo.Log(&git.LogOptions{From: head.Hash()})
-	if err != nil {
-		return false, err
-	}
-	defer iter.Close()
-	found := false
-	err = iter.ForEach(func(c *object.Commit) error {
-		if c.Hash.String() == commit {
-			found = true
-			return storer.ErrStop
+	for depth := initialConfirmationDepth; ; depth *= 2 {
+		ref, err := repo.Reference(branch, true)
+		if err != nil {
+			return false, err
 		}
-		return nil
-	})
-	return found, err
+		found, complete, err := containsRecentCommit(ctx, repo, ref.Hash(), plumbing.NewHash(commit), cutoff)
+		if err != nil || found {
+			return found, err
+		}
+		if complete {
+			return false, nil
+		}
+		err = repo.FetchContext(ctx, &git.FetchOptions{
+			Auth: auth, Depth: depth * 2, Tags: git.NoTags,
+			RefSpecs: []config.RefSpec{config.RefSpec("+" + branch.String() + ":" + branch.String())},
+		})
+		if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+			return false, fmt.Errorf("deepen manifest branch: %w", err)
+		}
+	}
 }
+
+// Walk every merge parent, including siblings of a missing shallow parent.
+// A frontier older than the skew-adjusted arm time cannot contain our newly
+// created commit. Legacy intents without an arm time require complete history.
+func containsRecentCommit(ctx context.Context, repo *git.Repository, head, want plumbing.Hash, cutoff time.Time) (found, complete bool, err error) {
+	pending := []plumbing.Hash{head}
+	seen := make(map[plumbing.Hash]bool)
+	complete = true
+	for len(pending) > 0 {
+		if err := ctx.Err(); err != nil {
+			return false, false, err
+		}
+		hash := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if seen[hash] {
+			continue
+		}
+		seen[hash] = true
+		c, err := repo.CommitObject(hash)
+		if errors.Is(err, plumbing.ErrObjectNotFound) {
+			complete = false
+			continue
+		}
+		if err != nil {
+			return false, false, err
+		}
+		if hash == want {
+			return true, true, nil
+		}
+		if !cutoff.IsZero() && c.Committer.When.Before(cutoff) {
+			continue
+		}
+		pending = append(pending, c.ParentHashes...)
+	}
+	return false, complete, nil
+}
+
+const (
+	initialConfirmationDepth = 32
+	confirmationClockSkew    = time.Hour
+	confirmationCacheBytes   = 4 * 1024 * 1024
+)
 
 func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoURL string) (Result, error) {
 	files, err := manifestFiles(w.Spec, w.Targets)

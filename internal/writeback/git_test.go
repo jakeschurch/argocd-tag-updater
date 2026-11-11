@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/storage/memory"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 
@@ -350,5 +352,99 @@ func assertNoCloneDirectories(t *testing.T) {
 		if strings.HasPrefix(entry.Name(), writebackClonePrefix) {
 			t.Errorf("clone directory leaked after Apply: %s", entry.Name())
 		}
+	}
+}
+
+// Thousands of old commits must not prevent recent rejected writes from settling.
+// A dense recent window must also work beyond the former depth/visit caps.
+func TestContainsCommitTimeBoundOnDeepHistory(t *testing.T) {
+	for _, dense := range []bool{false, true} {
+		t.Run(fmt.Sprint(dense), func(t *testing.T) {
+			dir := t.TempDir()
+			repo, err := git.PlainInit(dir, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tree := repo.Storer.NewEncodedObject()
+			if err := (&object.Tree{}).Encode(tree); err != nil {
+				t.Fatal(err)
+			}
+			treeHash, err := repo.Storer.SetEncodedObject(tree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().Truncate(time.Second)
+			var head, wanted plumbing.Hash
+			for i := 0; i < 5500; i++ {
+				when := now.Add(time.Duration(i-5500) * time.Minute)
+				if dense {
+					when = now.Add(time.Duration(i-5500) * time.Millisecond)
+				}
+				c := &object.Commit{TreeHash: treeHash, Message: fmt.Sprint(i), Author: object.Signature{Name: "test", Email: "test@example.com", When: when}}
+				c.Committer = c.Author
+				if i > 0 {
+					c.ParentHashes = []plumbing.Hash{head}
+				}
+				encoded := repo.Storer.NewEncodedObject()
+				if err := c.Encode(encoded); err != nil {
+					t.Fatal(err)
+				}
+				head, err = repo.Storer.SetEncodedObject(encoded)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if (dense && i == 100) || (!dense && i == 5460) {
+					wanted = head
+				}
+			}
+			if err := repo.Storer.SetReference(plumbing.NewHashReference(plumbing.NewBranchReferenceName("master"), head)); err != nil {
+				t.Fatal(err)
+			}
+			writer := Writer{Spec: v1alpha1.WriteBackSpec{Repo: dir, Branch: "master"}}
+			for _, sha := range []string{head.String(), wanted.String()} {
+				if found, err := writer.ContainsCommit(context.Background(), sha, now); !found || err != nil {
+					t.Fatalf("reachable commit %s: %v %v", sha, found, err)
+				}
+			}
+			if found, err := writer.ContainsCommit(context.Background(), strings.Repeat("a", 40), now); found || err != nil {
+				t.Fatalf("absent commit did not settle: %v %v", found, err)
+			}
+		})
+	}
+}
+
+func TestConfirmationVisitsMergeSiblingPastShallowBoundary(t *testing.T) {
+	repo, err := git.Init(memory.NewStorage(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	store := func(parents ...plumbing.Hash) plumbing.Hash {
+		c := &object.Commit{Author: object.Signature{When: now}, Committer: object.Signature{When: now}, ParentHashes: parents}
+		encoded := repo.Storer.NewEncodedObject()
+		if err := c.Encode(encoded); err != nil {
+			t.Fatal(err)
+		}
+		hash, err := repo.Storer.SetEncodedObject(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return hash
+	}
+	wanted := store()
+	missing := plumbing.NewHash(strings.Repeat("b", 40))
+	// The last parent is visited first by the stack; it must not hide the sibling.
+	head := store(wanted, missing)
+	found, _, err := containsRecentCommit(context.Background(), repo, head, wanted, now.Add(-time.Hour))
+	if !found || err != nil {
+		t.Fatalf("shallow merge sibling was skipped: %v %v", found, err)
+	}
+	_, complete, err := containsRecentCommit(context.Background(), repo, head, plumbing.NewHash(strings.Repeat("a", 40)), now.Add(-time.Hour))
+	if complete || err != nil {
+		t.Fatalf("recent missing frontier must require deepening: %v %v", complete, err)
+	}
+	_, complete, err = containsRecentCommit(context.Background(), repo, head, plumbing.NewHash(strings.Repeat("a", 40)), now.Add(time.Minute))
+	if !complete || err != nil {
+		t.Fatalf("old frontier must prove absence: %v %v", complete, err)
 	}
 }

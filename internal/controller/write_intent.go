@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	v1 "github.com/jakeschurch/argocd-tag-updater/api/v1alpha1"
 	"github.com/jakeschurch/argocd-tag-updater/internal/writeback"
@@ -15,10 +16,30 @@ func specHash(tu *v1.TagUpdater) string {
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
 
+// The opaque checkpoint also saves the remote identity, including the credential
+// reference (never credential contents), so spec edits cannot redirect recovery.
+type writeCheckpoint struct {
+	v1.TagUpdaterStatus
+	WriteBack *v1.WriteBackSpec `json:"preparedWriteBack,omitempty"`
+}
+
+func (r *TagUpdaterReconciler) preparedWriter(ctx context.Context, tu *v1.TagUpdater) (writeback.Writer, error) {
+	var previous writeCheckpoint
+	if err := json.Unmarshal([]byte(tu.Status.PendingWriteStatus), &previous); err != nil {
+		return writeback.Writer{}, fmt.Errorf("decode write checkpoint: %w", err)
+	}
+	original := tu.DeepCopy()
+	if previous.WriteBack != nil {
+		original.Spec.WriteBack = *previous.WriteBack
+	}
+	credentials, err := r.resolveWriteBackCredentials(ctx, original)
+	return writeback.Writer{Spec: original.Spec.WriteBack, Credentials: credentials}, err
+}
+
 func prepareWrite(tu *v1.TagUpdater) {
 	// 2026-11-11: retries replace the prepared intent, never its checkpoint.
 	if tu.Status.PendingWriteStatus == "" {
-		previous, _ := json.Marshal(tu.Status)
+		previous, _ := json.Marshal(writeCheckpoint{TagUpdaterStatus: tu.Status, WriteBack: &tu.Spec.WriteBack})
 		tu.Status.PendingWriteStatus = string(previous)
 	}
 }
@@ -30,7 +51,11 @@ func (r *TagUpdaterReconciler) settleWrite(ctx context.Context, tu *v1.TagUpdate
 	if tu.Status.PendingWriteStatus == "" {
 		return pushErr
 	}
-	reachable, err := writer.ContainsCommit(ctx, tu.Status.WatchingCommit)
+	armedAt := time.Time{}
+	if tu.Status.WatchingArmedAt != nil {
+		armedAt = tu.Status.WatchingArmedAt.Time
+	}
+	reachable, err := writer.ContainsCommit(ctx, tu.Status.WatchingCommit, armedAt)
 	if err != nil {
 		return fmt.Errorf("confirm prepared write (push: %v): %w", pushErr, err)
 	}
@@ -46,8 +71,12 @@ func (r *TagUpdaterReconciler) settleWrite(ctx context.Context, tu *v1.TagUpdate
 	if err := r.Status().Update(ctx, tu); err != nil {
 		return err
 	}
-	if err := r.releaseApp(ctx, tu); err != nil {
-		return err
+	// 2026-11-11: a rejected rollback restores an active forward watch.
+	// Keep its ownership until that release is resolved or explicitly drained.
+	if tu.Status.WatchingTag == "" {
+		if err := r.releaseApp(ctx, tu); err != nil {
+			return err
+		}
 	}
 	if pushErr != nil {
 		return pushErr
