@@ -481,6 +481,9 @@ func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, 
 	if err != nil {
 		return r.blockedWatch(ctx, tu, "HealthReadFailed", err.Error())
 	}
+	if state.Sync == "Unknown" {
+		return r.blockedWatch(ctx, tu, "ComparisonUnavailable", "Argo comparison is unavailable; this is not evidence of a release failure")
+	}
 	// An app-of-apps can acknowledge the pin before the child has compared its
 	// new spec. Require a fresh child comparison before accepting its health.
 	fresh := tu.Status.WatchingArmedAt == nil || !state.ReconciledAt.Before(tu.Status.WatchingArmedAt.Time)

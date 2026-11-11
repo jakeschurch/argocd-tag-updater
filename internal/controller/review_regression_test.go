@@ -546,6 +546,76 @@ func TestProductionPendingTooLongIsObservableAndClearsWhenHealthy(t *testing.T) 
 	assertLeasesReleased(t, r, tu)
 }
 
+func TestProductionComparisonUnavailableNeverBlamesReleaseAndRecovers(t *testing.T) {
+	for _, recovery := range []string{"Progressing", "Healthy"} {
+		t.Run(recovery, func(t *testing.T) {
+			r, tu, remote := productionSafetyHarness(t)
+			promoteProduction(t, r, tu)
+			productionHealth(t, r, tu, "Progressing")
+			for _, name := range []string{"workload", "first", "second"} {
+				app, err := r.Dynamic.Resource(appResource).Namespace("argocd").Get(context.Background(), name, metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Argo knows the new revision and desired pin, but generation of
+				// its manifests failed. Fresh timestamps cannot certify deployment.
+				source := map[string]interface{}{"repoURL": tu.Spec.WriteBack.Repo, "targetRevision": tu.Spec.WriteBack.Branch}
+				_ = unstructured.SetNestedMap(app.Object, source, "spec", "source")
+				_ = unstructured.SetNestedMap(app.Object, source, "status", "sync", "comparedTo", "source")
+				_ = unstructured.SetNestedField(app.Object, "Unknown", "status", "sync", "status")
+				_ = unstructured.SetNestedSlice(app.Object, []interface{}{map[string]interface{}{
+					"type": "ComparisonError", "message": "manifest renderer temporarily unavailable",
+				}}, "status", "conditions")
+				if _, err := r.Dynamic.Resource(appResource).Namespace("argocd").Update(context.Background(), app, metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			awaitGate(t, func() bool {
+				state, err := r.releaseHealth(context.Background(), tu)
+				return err == nil && state.Sync == "Unknown" && r.applicationPinsApplied(context.Background(), tu)
+			})
+			for _, delay := range []time.Duration{2 * time.Minute, 24 * time.Hour} {
+				now := time.Now().Add(delay)
+				r.now = func() time.Time { return now }
+				reconcileSafety(t, r, tu)
+				condition := meta.FindStatusCondition(tu.Status.Conditions, "RollbackReady")
+				if tu.Status.WatchingSince == nil || tu.Status.WatchingTag != "v2" || tu.Status.WatchingDeployed || tu.Status.WatchingRollback || len(tu.Status.SkippedTags) != 0 || tu.Status.LastTag != "v2" || condition == nil || condition.Reason != "ComparisonUnavailable" {
+					t.Fatalf("comparison outage blamed an acknowledged release after %v: %+v", delay, tu.Status)
+				}
+				lease := &coordinationv1.Lease{}
+				if err := r.Get(context.Background(), leaseKey(tu), lease); err != nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != holder(tu) {
+					t.Fatalf("comparison outage admitted another writer: %+v %v", lease.Spec, err)
+				}
+			}
+			if !strings.Contains(safetyFile(t, remote, "apps/first.yaml"), "image: v2") {
+				t.Fatal("comparison outage rewrote Git")
+			}
+			productionHealth(t, r, tu, recovery)
+			awaitGate(t, func() bool {
+				state, err := r.releaseHealth(context.Background(), tu)
+				return err == nil && state.Sync == "Synced"
+			})
+			reconcileSafety(t, r, tu)
+			if recovery == "Healthy" {
+				if tu.Status.WatchingTag != "" || len(tu.Status.SkippedTags) != 0 {
+					t.Fatalf("healthy comparison recovery did not complete: %+v", tu.Status)
+				}
+				assertLeasesReleased(t, r, tu)
+				return
+			}
+			condition := meta.FindStatusCondition(tu.Status.Conditions, "RollbackReady")
+			if !tu.Status.WatchingDeployed || tu.Status.WatchingRollback || condition == nil || condition.Reason != "PendingTooLong" {
+				t.Fatalf("comparison recovery did not resume deployed health observation: %+v", tu.Status)
+			}
+			productionHealth(t, r, tu, "Degraded")
+			reconcileSafety(t, r, tu)
+			if !tu.Status.WatchingRollback || tu.Status.LastTag != "v1" || len(tu.Status.SkippedTags) != 1 || !strings.Contains(safetyFile(t, remote, "apps/first.yaml"), "image: v1") {
+				t.Fatalf("recovered comparison hid a real deployment failure: %+v", tu.Status)
+			}
+		})
+	}
+}
+
 func TestProductionRestartSettlesPreparedWriteAgainstRemoteReachability(t *testing.T) {
 	for _, pushed := range []bool{false, true} {
 		name := "rejected"

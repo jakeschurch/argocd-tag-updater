@@ -95,12 +95,27 @@ func (w Writer) RemoteHead(ctx context.Context) (string, error) {
 // ContainsCommit verifies ancestry on the configured remote branch, including
 // when another writer has already advanced its tip past our commit.
 func (w Writer) ContainsCommit(ctx context.Context, commit string) (bool, error) {
+	headSHA, err := w.RemoteHead(ctx)
+	if err != nil {
+		return false, err
+	}
+	if headSHA == commit {
+		return true, nil
+	}
 	auth, repoURL, cleanup, err := w.auth()
 	if err != nil {
 		return false, err
 	}
 	defer cleanup()
-	repo, err := git.CloneContext(ctx, memory.NewStorage(), nil, &git.CloneOptions{
+	// 2026-11-11: the common case needs only ls-remote. Rare descendant
+	// recovery uses disk-backed history so large manifest repos do not retain
+	// their entire object packs in controller memory.
+	directory, err := newCloneDirectory()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = os.RemoveAll(directory) }()
+	repo, err := git.PlainCloneContext(ctx, directory, true, &git.CloneOptions{
 		URL: repoURL, Auth: auth, ReferenceName: plumbing.NewBranchReferenceName(w.Spec.Branch),
 		SingleBranch: true, NoCheckout: true, Tags: git.NoTags,
 	})
