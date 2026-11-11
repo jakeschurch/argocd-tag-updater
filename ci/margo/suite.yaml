@@ -13,11 +13,13 @@ spec:
     url: ssh://git@forgejo-ssh.forgejo.svc.cluster.local:22/jake/argocd-tag-updater.git
     deployKeySecret: argocd-tag-updater-margo-readonly
   checks:
+    # testReport runs go vet and go test -json in one derivation and keeps the
+    # JSON when either fails, so the check covers vet as well.
     - name: go:test
-      template: go-test
+      template: nix-go-test
       kind: test
-    - name: go:vet
-      template: go-vet
+      params:
+        attr: .#testReport
     - name: gofmt
       template: gofmt-check
     - name: vendor:drift
