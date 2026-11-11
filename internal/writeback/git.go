@@ -107,40 +107,74 @@ func (w Writer) ContainsCommit(ctx context.Context, commit string) (bool, error)
 		return false, err
 	}
 	defer cleanup()
-	// 2026-11-11: the common case needs only ls-remote. Rare descendant
-	// recovery uses disk-backed history so large manifest repos do not retain
-	// their entire object packs in controller memory.
+	// 2026-11-11: recover recent writes with bounded shallow history. A very
+	// old intent stays pending for investigation rather than fetching the
+	// entire manifest repository or mistaking an unknown ancestor for absence.
 	directory, err := newCloneDirectory()
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = os.RemoveAll(directory) }()
+	branch := plumbing.NewBranchReferenceName(w.Spec.Branch)
 	repo, err := git.PlainCloneContext(ctx, directory, true, &git.CloneOptions{
-		URL: repoURL, Auth: auth, ReferenceName: plumbing.NewBranchReferenceName(w.Spec.Branch),
-		SingleBranch: true, NoCheckout: true, Tags: git.NoTags,
+		URL: repoURL, Auth: auth, ReferenceName: branch,
+		SingleBranch: true, NoCheckout: true, Tags: git.NoTags, Depth: initialConfirmationDepth,
 	})
 	if err != nil {
 		return false, fmt.Errorf("read manifest branch: %w", err)
 	}
-	head, err := repo.Head()
-	if err != nil {
-		return false, err
-	}
-	iter, err := repo.Log(&git.LogOptions{From: head.Hash()})
-	if err != nil {
-		return false, err
-	}
-	defer iter.Close()
-	found := false
-	err = iter.ForEach(func(c *object.Commit) error {
-		if c.Hash.String() == commit {
-			found = true
-			return storer.ErrStop
+	for depth := initialConfirmationDepth; ; depth *= 2 {
+		ref, err := repo.Reference(branch, true)
+		if err != nil {
+			return false, err
 		}
-		return nil
-	})
-	return found, err
+		iter, err := repo.Log(&git.LogOptions{From: ref.Hash()})
+		if err != nil {
+			return false, err
+		}
+		found := false
+		visited := 0
+		err = iter.ForEach(func(c *object.Commit) error {
+			visited++
+			if c.Hash.String() == commit {
+				found = true
+				return storer.ErrStop
+			}
+			if visited >= maxConfirmationCommits {
+				return fmt.Errorf("manifest ancestry exceeds %d commits; retaining prepared write", maxConfirmationCommits)
+			}
+			return nil
+		})
+		iter.Close()
+		if found {
+			return true, nil
+		}
+		if err == nil {
+			// Every parent was traversed, so history is complete. go-git may
+			// retain stale shallow markers even after fetching the root.
+			return false, nil
+		}
+		if !errors.Is(err, plumbing.ErrObjectNotFound) {
+			return false, err
+		}
+		if depth >= maxConfirmationDepth {
+			return false, fmt.Errorf("manifest ancestry exceeds depth %d; retaining prepared write", maxConfirmationDepth)
+		}
+		err = repo.FetchContext(ctx, &git.FetchOptions{
+			Auth: auth, Depth: depth * 2, Tags: git.NoTags,
+			RefSpecs: []config.RefSpec{config.RefSpec("+" + branch.String() + ":" + branch.String())},
+		})
+		if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+			return false, fmt.Errorf("deepen manifest branch: %w", err)
+		}
+	}
 }
+
+const (
+	initialConfirmationDepth = 32
+	maxConfirmationDepth     = 1024
+	maxConfirmationCommits   = 4096
+)
 
 func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoURL string) (Result, error) {
 	files, err := manifestFiles(w.Spec, w.Targets)

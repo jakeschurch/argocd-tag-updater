@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -185,7 +186,14 @@ func TestProductionPushFailuresRestoreCheckpointReleaseLeasesAndRetry(t *testing
 				if !reflect.DeepEqual(actual, checkpoint) {
 					t.Fatalf("failed push corrupted pre-arm status:\ngot %+v\nwant %+v", actual, checkpoint)
 				}
-				assertLeasesReleased(t, r, tu)
+				if rollback {
+					lease := &coordinationv1.Lease{}
+					if err := r.Get(context.Background(), leaseKey(tu), lease); err != nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != holder(tu) {
+						t.Fatalf("rejected rollback lost active watch ownership: %+v %v", lease.Spec, err)
+					}
+				} else {
+					assertLeasesReleased(t, r, tu)
+				}
 				want := "v1"
 				if rollback {
 					want = "v2"
@@ -418,6 +426,8 @@ func TestProductionMonitoringErrorDoesNotBlameReleaseOrHideIndependentFailure(t 
 			})
 			reconcileSafety(t, r, tu)
 			if scenario == "monitoring-error" {
+				// Acknowledge the commit before advancing the observation clock.
+				reconcileSafety(t, r, tu)
 				for _, delay := range []time.Duration{2 * time.Minute, 24 * time.Hour} {
 					now := time.Now().Add(delay)
 					r.now = func() time.Time { return now }
@@ -574,12 +584,14 @@ func TestProductionComparisonUnavailableNeverBlamesReleaseAndRecovers(t *testing
 				state, err := r.releaseHealth(context.Background(), tu)
 				return err == nil && state.Sync == "Unknown" && r.applicationPinsApplied(context.Background(), tu)
 			})
+			// Acknowledge the commit before advancing the observation clock.
+			reconcileSafety(t, r, tu)
 			for _, delay := range []time.Duration{2 * time.Minute, 24 * time.Hour} {
 				now := time.Now().Add(delay)
 				r.now = func() time.Time { return now }
 				reconcileSafety(t, r, tu)
 				condition := meta.FindStatusCondition(tu.Status.Conditions, "RollbackReady")
-				if tu.Status.WatchingSince == nil || tu.Status.WatchingTag != "v2" || tu.Status.WatchingDeployed || tu.Status.WatchingRollback || len(tu.Status.SkippedTags) != 0 || tu.Status.LastTag != "v2" || condition == nil || condition.Reason != "ComparisonUnavailable" {
+				if tu.Status.WatchingSince == nil || tu.Status.WatchingTag != "v2" || tu.Status.WatchingDeployed || tu.Status.WatchingRollback || len(tu.Status.SkippedTags) != 0 || tu.Status.LastTag != "v2" || condition == nil || condition.Reason != "ComparisonUnavailable" || metricValue(pendingTooLong.WithLabelValues(tu.Namespace, tu.Name)) != 1 {
 					t.Fatalf("comparison outage blamed an acknowledged release after %v: %+v", delay, tu.Status)
 				}
 				lease := &coordinationv1.Lease{}
@@ -690,6 +702,54 @@ func TestProductionRestartSettlesPreparedWriteAgainstRemoteReachability(t *testi
 				}
 			}
 			assertLeasesReleased(t, restart, tu)
+		})
+	}
+}
+
+func TestPreparedWriteSettlesBeforeSpecDrain(t *testing.T) {
+	for _, rollback := range []bool{false, true} {
+		t.Run(fmt.Sprint(rollback), func(t *testing.T) {
+			r, tu, remote := productionSafetyHarness(t)
+			if rollback {
+				promoteProduction(t, r, tu)
+				productionHealth(t, r, tu, "Degraded")
+			} else {
+				syncProduction(t, r, tu)
+			}
+			checkpoint := tu.DeepCopy().Status
+			prepareWrite(tu)
+			tu.Status.LastTag = "never-pushed"
+			tu.Status.LastWriteCommit = strings.Repeat("a", 40)
+			tu.Status.WatchingTag = "never-pushed"
+			tu.Status.WatchingCommit = strings.Repeat("a", 40)
+			if err := r.Status().Update(context.Background(), tu); err != nil {
+				t.Fatal(err)
+			}
+			// A changed target must not discard the pre-push checkpoint.
+			tu.Spec.Targets = nil
+			if err := r.Update(context.Background(), tu); err != nil {
+				t.Fatal(err)
+			}
+			_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tu)})
+			loadSafety(t, r, tu)
+			if err == nil || !reflect.DeepEqual(tu.Status, checkpoint) {
+				t.Fatalf("spec drain discarded rejected write checkpoint: got %+v want %+v err=%v", tu.Status, checkpoint, err)
+			}
+			if !strings.Contains(safetyFile(t, remote, "apps/first.yaml"), "image: "+checkpoint.LastTag) {
+				t.Fatal("settle changed Git")
+			}
+			if rollback {
+				lease := &coordinationv1.Lease{}
+				if err := r.Get(context.Background(), leaseKey(tu), lease); err != nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != holder(tu) {
+					t.Fatal("settle released active watch before draining")
+				}
+				// The next reconcile deliberately drains the restored old watch.
+				reconcileSafety(t, r, tu)
+				if tu.Status.WatchingTag != "" {
+					t.Fatal("restored watch did not drain")
+				}
+			}
+			assertLeasesReleased(t, r, tu)
 		})
 	}
 }

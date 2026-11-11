@@ -86,16 +86,6 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		removeGateFinalizer(&tu)
 		return ctrl.Result{}, r.Update(ctx, &tu)
 	}
-	// 2026-11-11: drain old ownership before observing a changed spec. Search
-	// leases by holder, since removed targets are absent from the current spec.
-	if tu.Status.WatchingTag != "" && (!gated(&tu) || (tu.Status.WatchingSpecHash != "" && tu.Status.WatchingSpecHash != specHash(&tu)) || len(tu.Status.RollbackFields) == 0) {
-		if err := r.releaseApp(ctx, &tu); err != nil {
-			return ctrl.Result{}, err
-		}
-		clearWatch(&tu)
-		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "WatchDrained", Message: "spec changed or legacy watch lacks a verifiable baseline; drained old leases without changing Git"})
-		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, &tu)
-	}
 	if tu.Status.PendingWriteStatus != "" {
 		credentials, err := r.resolveWriteBackCredentials(ctx, &tu)
 		if err != nil {
@@ -105,6 +95,16 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.settleWrite(ctx, &tu, writer, nil); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	// 2026-11-11: drain old ownership before observing a changed spec. Search
+	// leases by holder, since removed targets are absent from the current spec.
+	if tu.Status.WatchingTag != "" && (!gated(&tu) || (tu.Status.WatchingSpecHash != "" && tu.Status.WatchingSpecHash != specHash(&tu)) || len(tu.Status.RollbackFields) == 0) {
+		if err := r.releaseApp(ctx, &tu); err != nil {
+			return ctrl.Result{}, err
+		}
+		clearWatch(&tu)
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "WatchDrained", Message: "spec changed or legacy watch lacks a verifiable baseline; drained old leases without changing Git"})
+		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, &tu)
 	}
 	if r.Gates != nil {
 		if err := r.Gates.Subscribe(req.NamespacedName, tu.Generation, r.gateSubscriptions(&tu)); err != nil {
@@ -483,6 +483,9 @@ func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, 
 		return r.blockedWatch(ctx, tu, "HealthReadFailed", err.Error())
 	}
 	if state.Sync == "Unknown" {
+		if r.clock().Sub(tu.Status.WatchingSince.Time) >= rollbackTimeout(tu) {
+			pendingTooLong.WithLabelValues(tu.Namespace, tu.Name).Set(1)
+		}
 		return r.blockedWatch(ctx, tu, "ComparisonUnavailable", "Argo comparison is unavailable; this is not evidence of a release failure")
 	}
 	// An app-of-apps can acknowledge the pin before the child has compared its

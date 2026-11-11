@@ -46,8 +46,12 @@ func (r *TagUpdaterReconciler) settleWrite(ctx context.Context, tu *v1.TagUpdate
 	if err := r.Status().Update(ctx, tu); err != nil {
 		return err
 	}
-	if err := r.releaseApp(ctx, tu); err != nil {
-		return err
+	// 2026-11-11: a rejected rollback restores an active forward watch.
+	// Keep its ownership until that release is resolved or explicitly drained.
+	if tu.Status.WatchingTag == "" {
+		if err := r.releaseApp(ctx, tu); err != nil {
+			return err
+		}
 	}
 	if pushErr != nil {
 		return pushErr

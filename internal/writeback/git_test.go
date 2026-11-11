@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -350,5 +351,56 @@ func assertNoCloneDirectories(t *testing.T) {
 		if strings.HasPrefix(entry.Name(), writebackClonePrefix) {
 			t.Errorf("clone directory leaked after Apply: %s", entry.Name())
 		}
+	}
+}
+
+// Recovery confirms recent ancestors, proves true absence on a complete small
+// branch, and fails closed when an old intent exceeds the bounded history.
+func TestContainsCommitBoundsHistoryAndDeepensForRecentAncestors(t *testing.T) {
+	for _, count := range []int{initialConfirmationDepth + 5, maxConfirmationDepth + 1} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			dir := t.TempDir()
+			repo, err := git.PlainInit(dir, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wt, err := repo.Worktree()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var first, head plumbing.Hash
+			for i := 0; i < count; i++ {
+				if err := os.WriteFile(filepath.Join(dir, "pin.yaml"), []byte(fmt.Sprint(i)), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := wt.Add("pin.yaml"); err != nil {
+					t.Fatal(err)
+				}
+				head, err = wt.Commit(fmt.Sprint(i), &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.com", When: time.Unix(int64(i), 0)}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if i == 0 {
+					first = head
+				}
+			}
+			writer := Writer{Spec: v1alpha1.WriteBackSpec{Repo: dir, Branch: "master"}}
+			if found, err := writer.ContainsCommit(context.Background(), head.String()); !found || err != nil {
+				t.Fatalf("tip not confirmed: %v %v", found, err)
+			}
+			found, err := writer.ContainsCommit(context.Background(), first.String())
+			if count > maxConfirmationDepth {
+				if found || err == nil || !strings.Contains(err.Error(), "retaining prepared write") {
+					t.Fatalf("history cap must remain inconclusive: %v %v", found, err)
+				}
+				return
+			}
+			if !found || err != nil {
+				t.Fatalf("ancestor beyond first shallow fetch not confirmed: %v %v", found, err)
+			}
+			if found, err := writer.ContainsCommit(context.Background(), strings.Repeat("a", 40)); found || err != nil {
+				t.Fatalf("absent commit not disproved by complete history: %v %v", found, err)
+			}
+		})
 	}
 }
