@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	v1alpha1 "github.com/jakeschurch/argocd-tag-updater/api/v1alpha1"
+	"github.com/jakeschurch/argocd-tag-updater/internal/gate"
 	"github.com/jakeschurch/argocd-tag-updater/internal/matcher"
 	intsource "github.com/jakeschurch/argocd-tag-updater/internal/source"
 	"github.com/jakeschurch/argocd-tag-updater/internal/writeback"
@@ -39,8 +40,10 @@ const revStaleAfter = 5 * time.Minute
 
 type TagUpdaterReconciler struct {
 	client.Client
-	Recorder record.EventRecorder
-	Dynamic  dynamic.Interface
+	APIReader client.Reader
+	Recorder  record.EventRecorder
+	Dynamic   dynamic.Interface
+	Gates     *gate.Registry
 
 	firstRevAttempt atomic.Int64
 	lastRevSuccess  atomic.Int64
@@ -62,10 +65,38 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	var tu v1alpha1.TagUpdater
 	if err := r.Get(ctx, req.NamespacedName, &tu); err != nil {
 		if apierrors.IsNotFound(err) {
+			if r.Gates != nil {
+				r.Gates.Unsubscribe(req.NamespacedName)
+			}
 			r.progress.forget(req.String())
 			r.fastRetry.reset(req.String())
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if !tu.DeletionTimestamp.IsZero() {
+		if r.Gates != nil {
+			r.Gates.Unsubscribe(req.NamespacedName)
+		}
+		// A pending Git write cannot safely be attributed after deletion. Keep
+		// its non-expiring lease fenced for explicit recovery by the operator.
+		if tu.Status.WatchingTag == "" {
+			if err := r.releaseApp(ctx, &tu); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		removeGateFinalizer(&tu)
+		return ctrl.Result{}, r.Update(ctx, &tu)
+	}
+	if r.Gates != nil {
+		if err := r.Gates.Subscribe(req.NamespacedName, tu.Generation, r.gateSubscriptions(&tu)); err != nil {
+			return ctrl.Result{RequeueAfter: defaultInterval}, r.setFailedBeforeWriteBack(ctx, &tu, fmt.Errorf("invalid gate: %w", err))
+		}
+		if gated(&tu) && addGateFinalizer(&tu) {
+			return ctrl.Result{Requeue: true}, r.Update(ctx, &tu)
+		}
+		if !r.Gates.Synced(req.NamespacedName) {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
 	}
 
 	interval := defaultInterval
@@ -80,7 +111,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := validateRequireSigned(tu.Spec.Source); err != nil {
 		return ctrl.Result{RequeueAfter: interval}, r.setFailedBeforeWriteBack(ctx, &tu, err)
 	}
-	if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Spec.ArgoCDApp == nil {
+	if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && !gated(&tu) {
 		message := "spec.rollback.enabled requires spec.argoCDApp for read-only sync revision and health observation"
 		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "MissingArgoCDApp", Message: message})
 		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "MissingArgoCDApp", Message: message})
@@ -90,7 +121,21 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
-	if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Status.WatchingTag != "" {
+	ambiguous, err := r.appAmbiguous(ctx, &tu)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if ambiguous {
+		return ctrl.Result{RequeueAfter: interval}, nil
+	}
+	if tu.Status.WatchingTag != "" {
+		acquired, err := r.acquireApp(ctx, &tu)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !acquired {
+			return ctrl.Result{RequeueAfter: interval}, nil
+		}
 		requeue, err := r.checkHealthAndMaybeRollback(ctx, &tu)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -106,6 +151,14 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			}
 			return ctrl.Result{RequeueAfter: requeue}, nil
 		}
+		return ctrl.Result{RequeueAfter: interval}, nil
+	}
+	if strings.EqualFold(tu.Annotations[holdAnnotation], "true") {
+		condition := metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "Held", Message: "selection paused by " + holdAnnotation}
+		if meta.SetStatusCondition(&tu.Status.Conditions, condition) {
+			return ctrl.Result{RequeueAfter: interval}, r.Status().Update(ctx, &tu)
+		}
+		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
 	if err := validateWriteBack(tu.Spec.WriteBack, tu.Spec.Targets); err != nil {
@@ -156,7 +209,11 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err != nil {
 		return ctrl.Result{}, r.setFailedBeforeWriteBack(ctx, &tu, err)
 	}
-	latest, ok := m.Latest(filterSkipped(tags, tu.Status.SkippedTags))
+	_ = m
+	latest, componentData, ok, err := r.selectRelease(ctx, &tu, tags, src)
+	if err != nil {
+		return r.transientFailure(ctx, &tu, progressKey, "", interval, err)
+	}
 	if !ok {
 		r.fastRetry.reset(progressKey)
 		// Refresh BOTH conditions before returning. This path used to return
@@ -239,10 +296,32 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
+	acquired, err := r.acquireApp(ctx, &tu)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !acquired {
+		condition := metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "AppQueued", Message: "another release holds this application's health gate"}
+		if meta.SetStatusCondition(&tu.Status.Conditions, condition) {
+			return ctrl.Result{RequeueAfter: interval}, r.Status().Update(ctx, &tu)
+		}
+		return ctrl.Result{RequeueAfter: interval}, nil
+	}
+	// No pending watch means no Git mutation is in flight. Release on all
+	// pre-push failures and unchanged paths; durable watches retain the lease.
+	defer func() {
+		if tu.Status.WatchingTag == "" {
+			if err := r.releaseApp(ctx, &tu); err != nil {
+				logger.Error(err, "release app lease")
+			}
+		}
+	}()
+
+	previousTag, previousDigest, previousSigned := tu.Status.LastTag, tu.Status.LastImageDigest, tu.Status.LastSignedDigest
 	var writeResult writeback.Result
 	credentials, err := r.resolveWriteBackCredentials(ctx, &tu)
 	if err == nil {
-		writer := writeback.Writer{Spec: tu.Spec.WriteBack, Credentials: credentials, Targets: tu.Spec.Targets, Data: data}
+		writer := writeback.Writer{Spec: tu.Spec.WriteBack, Credentials: credentials, Targets: tu.Spec.Targets, Data: data, TargetData: componentData}
 		if latest.Tag == tu.Status.LastTag && tu.Status.LastWriteCommit != "" && tu.Status.ObservedGeneration == tu.Generation && (!tu.Spec.Source.ResolveDigest || tu.Status.LastImageDigest == data["image_digest"]) && tu.Status.LastSignedDigest == data["signed_digest"] {
 			remoteHead, headErr := writer.RemoteHead(ctx)
 			if headErr == nil && writeBackCurrent(latest.Tag, tu.Status, remoteHead) {
@@ -253,6 +332,38 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				}
 				r.markReconcileSucceeded(ctx, &tu, progressKey)
 				return ctrl.Result{RequeueAfter: interval}, nil
+			}
+		}
+		if gated(&tu) {
+			writer.CaptureRollback = true
+			writer.BeforePush = func(result writeback.Result) error {
+				if !result.Committed {
+					return nil
+				}
+				now := metav1.NewTime(r.clock())
+				tu.Status.PreviousTag, tu.Status.PreviousImageDigest, tu.Status.PreviousSignedDigest = previousTag, previousDigest, previousSigned
+				tu.Status.LastTag = latest.Tag
+				tu.Status.LastImageDigest, tu.Status.LastSignedDigest = data["image_digest"], data["signed_digest"]
+				tu.Status.LastWriteCommit, tu.Status.LastUpdated = result.CommitSHA, &now
+				tu.Status.WatchingTag, tu.Status.WatchingCommit = latest.Tag, result.CommitSHA
+				tu.Status.WatchingArmedAt, tu.Status.WatchingSince = &now, nil
+				tu.Status.WatchingGate = tu.Spec.Gate.DeepCopy()
+				tu.Status.WatchingDeployed = false
+				ambiguous, err := r.appAmbiguous(ctx, &tu)
+				if err != nil {
+					return err
+				}
+				if ambiguous {
+					return fmt.Errorf("ambiguous pending changes; refusing push")
+				}
+				baseline := r.baselineHealthy(ctx, &tu)
+				tu.Status.BaselineHealthy = baseline
+				tu.Status.RollbackFields = result.RollbackFields
+				tu.Status.WatchingRollback = false
+				if !baseline {
+					r.suppressed(ctx, &tu, "UnhealthyBaseline", "application was not Healthy before write-back; this release cannot be blamed automatically")
+				}
+				return r.Status().Update(ctx, &tu)
 			}
 		}
 		writeResult, err = writer.Apply(ctx)
@@ -285,14 +396,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		tu.Status.PreviousSignedDigest = tu.Status.LastSignedDigest
 		tu.Status.LastTag = latest.Tag
 		tu.Status.LastUpdated = &now
-		if tu.Spec.Rollback != nil && tu.Spec.Rollback.Enabled && tu.Spec.ArgoCDApp != nil {
-			tu.Status.WatchingTag = latest.Tag
-			tu.Status.WatchingCommit = writeResult.CommitSHA
-			tu.Status.WatchingSince = nil
-			// Bounds the wait for ArgoCD to observe WatchingCommit; without it
-			// that phase never times out. See WatchingArmedAt.
-			tu.Status.WatchingArmedAt = &now
-		}
+
 	}
 	tu.Status.LastImageDigest = data["image_digest"]
 	tu.Status.LastSignedDigest = data["signed_digest"]
@@ -311,60 +415,124 @@ func writeBackCurrent(tag string, status v1alpha1.TagUpdaterStatus, remoteHead s
 }
 
 func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, tu *v1alpha1.TagUpdater) (time.Duration, error) {
-	revisionRef := revisionObserver(tu)
-	revisionState, err := r.argoCDAppState(ctx, revisionRef)
+	ambiguous, err := r.appAmbiguous(ctx, tu)
 	if err != nil {
-		message := err.Error()
-		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "HealthReadFailed", Message: message})
-		_ = r.Status().Update(ctx, tu)
-		if r.Recorder != nil {
-			r.Recorder.Event(tu, corev1.EventTypeWarning, "HealthReadFailed", message)
-		}
-		return 15 * time.Second, nil
+		return 0, err
+	}
+	if ambiguous {
+		return 0, nil
 	}
 	if tu.Status.WatchingSince == nil {
-		if !revisionState.observes(tu.Status.WatchingCommit, tu.Status.WatchingArmedAt) {
-			// This phase MUST be bounded. Reconcile short-circuits every tag
-			// update while WatchingTag is set, so an ArgoCD that never observes
-			// the commit (app renamed or deleted, repo credentials broken,
-			// branch mismatch, controller down) would otherwise freeze the
-			// updater permanently — and, because the caller marks progress
-			// successful on this path, freeze it silently.
-			if r.observationDeadlineExceeded(tu) {
-				return 0, r.abandonWatch(ctx, tu)
+		observes := revisionObserver(tu) == nil
+		if revisionObserver(tu) != nil {
+			revisionState, err := r.argoCDAppState(ctx, revisionObserver(tu))
+			if err != nil {
+				return r.blockedWatch(ctx, tu, "HealthReadFailed", err.Error())
 			}
-			return 15 * time.Second, nil
+			observes = revisionState.observes(tu.Status.WatchingCommit, tu.Status.WatchingArmedAt)
 		}
-		now := metav1.Now()
+		if !observes {
+			if r.observationDeadlineExceeded(tu) {
+				return r.blockedWatch(ctx, tu, "CommitNeverObserved", "ArgoCD has not observed the pin commit; retaining the app lease and excluding no tags")
+			}
+			return r.watchDelay(tu), nil
+		}
+		now := metav1.NewTime(r.clock())
 		tu.Status.WatchingSince = &now
 		if err := r.Status().Update(ctx, tu); err != nil {
 			return 0, err
 		}
 	}
-	state, err := r.argoCDAppState(ctx, tu.Spec.ArgoCDApp)
+	state, err := r.releaseHealth(ctx, tu)
 	if err != nil {
-		message := err.Error()
-		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "HealthReadFailed", Message: message})
-		_ = r.Status().Update(ctx, tu)
-		return 15 * time.Second, nil
+		return r.blockedWatch(ctx, tu, "HealthReadFailed", err.Error())
 	}
+	// An app-of-apps can acknowledge the pin before the child has compared its
+	// new spec. Require a fresh child comparison before accepting its health.
+	fresh := tu.Status.WatchingArmedAt == nil || !state.ReconciledAt.Before(tu.Status.WatchingArmedAt.Time)
+	if tu.Spec.ManagingApp != nil {
+		fresh = fresh && !state.ReconciledAt.Before(tu.Status.WatchingSince.Time)
+	}
+	if len(healthApps(tu)) == 0 {
+		fresh = true
+	}
+	deployed := fresh && state.Sync == "Synced" && r.applicationPinsApplied(ctx, tu)
+	healthy := deployed && state.Health == "Healthy" && !state.syncInFlight()
+	failed := deployed && state.Health == "Degraded" && !state.syncInFlight()
+	if explicit := activeGate(tu); explicit != nil {
+		if r.Gates == nil {
+			return r.blockedWatch(ctx, tu, "GateUnavailable", "gate registry is unavailable")
+		}
+		tag := tu.Status.WatchingTag
+		if tu.Status.WatchingRollback {
+			tag = tu.Status.PreviousTag
+		}
+		d, h, f, _ := r.Gates.Evaluate(explicit.Sources, tag)
+		deployed, healthy, failed = deployed && d, healthy && h, f
+	}
+	if deployed && !tu.Status.WatchingDeployed {
+		tu.Status.WatchingDeployed = true
+		if err := r.Status().Update(ctx, tu); err != nil {
+			return 0, err
+		}
+	}
+	if healthy {
+		clearWatch(tu)
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionTrue, Reason: "DeploymentHealthy", Message: "ArgoCD reports the written release Synced and Healthy"})
+		if err := r.Status().Update(ctx, tu); err != nil {
+			return 0, err
+		}
+		return 0, r.releaseApp(ctx, tu)
+	}
+	// 2026-11-11: after deployment only a terminal source failure can blame a
+	// release. Long drains and low-traffic analysis must not race a wall clock.
+	expired := !tu.Status.WatchingDeployed && r.clock().Sub(tu.Status.WatchingSince.Time) >= rollbackTimeout(tu)
+	if failed || expired {
+		if tu.Status.WatchingRollback {
+			return r.blockedWatch(ctx, tu, "RollbackUnhealthy", "rollback has not reached Healthy; retaining the app lease")
+		}
+		if !tu.Status.BaselineHealthy {
+			return r.blockedWatch(ctx, tu, "UnhealthyBaseline", "app was unhealthy before this write; rollback suppressed and app lease retained until Healthy")
+		}
+		if tu.Spec.Rollback == nil || !tu.Spec.Rollback.Enabled {
+			return r.blockedWatch(ctx, tu, "RollbackDisabled", "release has not reached Healthy; automatic rollback is disabled")
+		}
+		return r.watchDelay(tu), r.rollbackWithStatus(ctx, tu)
+	}
+	return r.watchDelay(tu), nil
+}
 
-	if state.Health == "Healthy" {
-		tu.Status.WatchingTag = ""
-		tu.Status.WatchingCommit = ""
-		tu.Status.WatchingArmedAt = nil
-		tu.Status.WatchingSince = nil
-		tu.Status.SkippedTags = nil
-		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionTrue, Reason: "DeploymentHealthy", Message: "ArgoCD reports the written commit Healthy"})
-		return 0, r.Status().Update(ctx, tu)
+func clearWatch(tu *v1alpha1.TagUpdater) {
+	tu.Status.WatchingTag, tu.Status.WatchingCommit = "", ""
+	tu.Status.WatchingSince, tu.Status.WatchingArmedAt = nil, nil
+	tu.Status.WatchingRollback = false
+	tu.Status.RollbackFields = nil
+	tu.Status.WatchingGate = nil
+	tu.Status.WatchingDeployed = false
+}
+
+func (r *TagUpdaterReconciler) watchDelay(tu *v1alpha1.TagUpdater) time.Duration {
+	anchor := tu.Status.WatchingArmedAt
+	if tu.Status.WatchingSince != nil {
+		anchor = tu.Status.WatchingSince
 	}
-	if state.Health == "Degraded" && !state.syncInFlight() {
-		return 0, r.rollbackWithStatus(ctx, tu)
+	if anchor != nil {
+		if left := rollbackTimeout(tu) - r.clock().Sub(anchor.Time); left > 0 {
+			return left
+		}
 	}
-	if time.Since(tu.Status.WatchingSince.Time) >= rollbackTimeout(tu) {
-		return 0, r.rollbackWithStatus(ctx, tu)
+	return defaultInterval // slow recovery backstop; informer events drive progress
+}
+
+func (r *TagUpdaterReconciler) blockedWatch(ctx context.Context, tu *v1alpha1.TagUpdater, reason, message string) (time.Duration, error) {
+	condition := metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: reason, Message: message}
+	if meta.SetStatusCondition(&tu.Status.Conditions, condition) {
+		r.suppressed(ctx, tu, reason, message)
+		if err := r.Status().Update(ctx, tu); err != nil {
+			return 0, err
+		}
 	}
-	return 15 * time.Second, nil
+	return defaultInterval, nil
 }
 
 // rollbackTimeout is the configured health timeout, and doubles as the deadline
@@ -384,7 +552,7 @@ func (r *TagUpdaterReconciler) observationDeadlineExceeded(tu *v1alpha1.TagUpdat
 	if tu.Status.WatchingArmedAt == nil {
 		return false
 	}
-	return time.Since(tu.Status.WatchingArmedAt.Time) >= rollbackTimeout(tu)
+	return r.clock().Sub(tu.Status.WatchingArmedAt.Time) >= rollbackTimeout(tu)
 }
 
 // refreshAfterWriteBack asks ArgoCD to read the commit just pushed, instead of it finding the
@@ -409,31 +577,6 @@ func (r *TagUpdaterReconciler) refreshAfterWriteBack(ctx context.Context, tu *v1
 	if _, err := r.Dynamic.Resource(gvr).Namespace(namespace).Patch(ctx, ref.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 		log.FromContext(ctx).Info("could not ask ArgoCD to refresh; it will find the commit on its own", "application", ref.Name, "err", err)
 	}
-}
-
-// abandonWatch releases a watch ArgoCD never picked up, so tag updates resume.
-//
-// It deliberately does NOT roll back. Never being observed means the commit was
-// never deployed, so there is no failed rollout to revert — the fault is in the
-// delivery path (missing app, bad credentials, wrong branch), and rewriting git
-// would churn the manifest without addressing it. The tag therefore stays in
-// place and is NOT added to SkippedTags; it gets another chance once ArgoCD is
-// working again. The failure is surfaced loudly instead.
-func (r *TagUpdaterReconciler) abandonWatch(ctx context.Context, tu *v1alpha1.TagUpdater) error {
-	observer := revisionObserver(tu)
-	message := fmt.Sprintf(
-		"ArgoCD application %s did not report commit %s within %s; abandoning health watch for tag %s so tag updates resume (check the application exists, its repo credentials, and that it tracks branch %s)",
-		observer.Name, tu.Status.WatchingCommit, rollbackTimeout(tu), tu.Status.WatchingTag, tu.Spec.WriteBack.Branch)
-	tu.Status.WatchingTag = ""
-	tu.Status.WatchingCommit = ""
-	tu.Status.WatchingArmedAt = nil
-	tu.Status.WatchingSince = nil
-	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionFalse, Reason: "CommitNeverObserved", Message: message})
-	meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "CommitNeverObserved", Message: message})
-	if r.Recorder != nil {
-		r.Recorder.Event(tu, corev1.EventTypeWarning, "CommitNeverObserved", message)
-	}
-	return r.Status().Update(ctx, tu)
 }
 
 func revisionObserver(tu *v1alpha1.TagUpdater) *v1alpha1.ArgoCDAppRef {
@@ -467,8 +610,10 @@ type argoCDDeployment struct {
 }
 
 type argoCDState struct {
-	Revision  string
-	Revisions []string
+	Sync         string
+	ReconciledAt time.Time
+	Revision     string
+	Revisions    []string
 	// Deployments are the rollouts ArgoCD still retains, oldest first: its
 	// history plus the current operation once it has succeeded.
 	Deployments []argoCDDeployment
@@ -543,16 +688,46 @@ func (r *TagUpdaterReconciler) argoCDAppState(ctx context.Context, ref *v1alpha1
 		namespace = "argocd"
 	}
 	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
-	obj, err := r.Dynamic.Resource(gvr).Namespace(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+	obj, err := r.gateObject(ctx, gvr.GroupVersion().WithKind("Application"), "applications", types.NamespacedName{Namespace: namespace, Name: ref.Name})
 	if err != nil {
 		return argoCDState{}, fmt.Errorf("get application %s/%s: %w", namespace, ref.Name, err)
 	}
 	state := argoCDState{}
+	state.Sync, _, _ = unstructured.NestedString(obj.Object, "status", "sync", "status")
+	reconciled, _, _ := unstructured.NestedString(obj.Object, "status", "reconciledAt")
+	state.ReconciledAt = parseTimestamp(reconciled)
 	state.Revision, _, _ = unstructured.NestedString(obj.Object, "status", "sync", "revision")
 	state.Revisions, _, _ = unstructured.NestedStringSlice(obj.Object, "status", "sync", "revisions")
 	state.Health, _, _ = unstructured.NestedString(obj.Object, "status", "health", "status")
 	state.Operation, _, _ = unstructured.NestedString(obj.Object, "status", "operationState", "phase")
 	state.Deployments = deploymentsFrom(obj.Object)
+	// 2026-11-11: Argo CD considers ready OnDelete StatefulSets Healthy even
+	// while all pods still run the previous revision. Do not certify that release.
+	resources, _, _ := unstructured.NestedSlice(obj.Object, "status", "resources")
+	for _, resource := range resources {
+		item, ok := resource.(map[string]interface{})
+		if !ok || item["group"] != "apps" || item["kind"] != "StatefulSet" {
+			continue
+		}
+		name, _ := item["name"].(string)
+		ns, _ := item["namespace"].(string)
+		sts, err := r.gateObject(ctx, schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "StatefulSet"}, "statefulsets", types.NamespacedName{Namespace: ns, Name: name})
+		if err != nil {
+			return state, fmt.Errorf("read StatefulSet rollout %s/%s: %w", ns, name, err)
+		}
+		strategy, _, _ := unstructured.NestedString(sts.Object, "spec", "updateStrategy", "type")
+		if strategy != "OnDelete" {
+			continue
+		}
+		replicas, found, _ := unstructured.NestedInt64(sts.Object, "spec", "replicas")
+		if !found {
+			replicas = 1
+		}
+		updated, _, _ := unstructured.NestedInt64(sts.Object, "status", "updatedReplicas")
+		if updated < replicas && state.Health == "Healthy" {
+			state.Health = "Progressing"
+		}
+	}
 	return state, nil
 }
 
@@ -620,6 +795,13 @@ func parseTimestamp(raw string) time.Time {
 
 func (r *TagUpdaterReconciler) doRollback(ctx context.Context, tu *v1alpha1.TagUpdater) error {
 	badTag, previousTag := tu.Status.WatchingTag, tu.Status.PreviousTag
+	if len(tu.Status.RollbackFields) > 0 {
+		return r.restoreRelease(ctx, tu)
+	}
+	if !tu.Status.BaselineHealthy && tu.Spec.ArgoCDApp != nil {
+		return fmt.Errorf("rollback requires a recorded Healthy baseline and manifest snapshot")
+	}
+
 	if previousTag == "" || previousTag == badTag {
 		tu.Status.WatchingTag = ""
 		tu.Status.WatchingCommit = ""
@@ -1028,6 +1210,31 @@ func (r *TagUpdaterReconciler) resolveDockerAuth(ctx context.Context, namespace,
 func (r *TagUpdaterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.progress.multiplier = r.StaleMultiplier
 	r.progress.floor = r.StaleFloor
-	metrics.Registry.MustRegister(progressCollector{tracker: &r.progress})
-	return ctrl.NewControllerManagedBy(mgr).For(&v1alpha1.TagUpdater{}).Complete(r)
+	metrics.Registry.MustRegister(progressCollector{tracker: &r.progress}, rollbackCount, suppressedCount, ambiguousGate)
+	return r.controllerBuilder(mgr)
+}
+
+func (r *TagUpdaterReconciler) releaseHealth(ctx context.Context, tu *v1alpha1.TagUpdater) (argoCDState, error) {
+	aggregate := argoCDState{Health: "Healthy", Sync: "Synced"}
+	for _, ref := range healthApps(tu) {
+		state, err := r.argoCDAppState(ctx, &ref)
+		if err != nil {
+			return argoCDState{}, err
+		}
+		if aggregate.ReconciledAt.IsZero() || state.ReconciledAt.Before(aggregate.ReconciledAt) {
+			aggregate.ReconciledAt = state.ReconciledAt
+		}
+		if state.Health != "Healthy" {
+			if aggregate.Health != "Degraded" {
+				aggregate.Health = state.Health
+			}
+		}
+		if state.Sync != "Synced" {
+			aggregate.Sync = state.Sync
+		}
+		if state.syncInFlight() {
+			aggregate.Operation = "Running"
+		}
+	}
+	return aggregate, nil
 }

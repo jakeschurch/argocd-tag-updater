@@ -8,7 +8,7 @@ rules:
   # Own CRD — watch instances, read/write status.
   - apiGroups: ["updater.argocd.io"]
     resources: ["tagupdaters"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["updater.argocd.io"]
     resources: ["tagupdaters/status"]
     verbs: ["get", "update", "patch"]
@@ -18,10 +18,20 @@ rules:
     resources: ["secrets"]
     verbs: ["get"]
 
-  # Rollback health observation, and the refresh annotation after a write-back.
+  # Gate observers receive read-only access only to exact allowlisted kinds.
+  {{- range .Values.gateKinds }}
+  - apiGroups: [{{ (ternary (first (splitList "/" .apiVersion)) "" (contains "/" .apiVersion)) | quote }}]
+    resources: [{{ .resource | quote }}]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+  # Refresh remains the sole optional write to a watched Application.
+  {{- range .Values.gateKinds }}
+  {{- if and (eq .apiVersion "argoproj.io/v1alpha1") (eq .kind "Application") }}
   - apiGroups: ["argoproj.io"]
     resources: ["applications"]
-    verbs: ["get", "patch"]
+    verbs: ["patch"]
+  {{- end }}
+  {{- end }}
 
   # Leader election lease.
   - apiGroups: ["coordination.k8s.io"]

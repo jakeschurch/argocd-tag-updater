@@ -29,6 +29,10 @@ type LocalObjectReference struct {
 }
 
 type SourceSpec struct {
+	// RevisionRepo resolves the same release tag in Git when an OCI source is
+	// part of a release unit. It supplies the full source revision; short tag
+	// captures alone are insufficient proof of a common commit.
+	RevisionRepo string `json:"revisionRepo,omitempty"`
 	// DigestAuthRealm explicitly trusts a cross-origin HTTPS Bearer token endpoint.
 	DigestAuthRealm string `json:"digestAuthRealm,omitempty"`
 	// ResolveDigest enables exact-tag OCI manifest digest lookup for a git release source.
@@ -86,6 +90,8 @@ type PatchSpec struct {
 }
 
 type TargetSpec struct {
+	// Source selects a named releaseSources entry; empty uses spec.source.
+	Source string `json:"source,omitempty"`
 	// Path is the repository-relative path, inside writeBack.repo, of the YAML
 	// manifest holding this target. Set it on every target, and leave
 	// writeBack.path empty, to update several files from one tag: all files
@@ -111,12 +117,43 @@ type ArgoCDAppRef struct {
 	Namespace string `json:"namespace,omitempty"` // defaults to "argocd"
 }
 
+// GateSpec selects a read-only health source. Custom sources require all three
+// boolean CEL expressions; object and tag are the available variables.
+// +kubebuilder:validation:XValidation:rule="has(self.name) != has(self.selector)",message="exactly one of name or selector is required"
+// +kubebuilder:validation:XValidation:rule="has(self.preset) ? !(has(self.apiVersion) || has(self.kind) || has(self.deployed) || has(self.healthy) || has(self.failed)) : (has(self.apiVersion) && has(self.kind) && has(self.deployed) && has(self.healthy) && has(self.failed))",message="use a preset or a complete custom CEL source"
+// +kubebuilder:validation:XValidation:rule="has(self.preset) || (has(self.apiVersion) && has(self.kind) && ((self.apiVersion == 'argoproj.io/v1alpha1' && self.kind in ['Application', 'Rollout', 'AnalysisRun']) || (self.apiVersion == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet']) || (self.apiVersion == 'kargo.akuity.io/v1alpha1' && self.kind == 'Promotion')))",message="gate GVK must be allowlisted"
+type GateSpec struct {
+	// +kubebuilder:validation:Enum=argocd-application;argo-rollout;analysisrun;deployment;statefulset;kargo-promotion
+	Preset     string `json:"preset,omitempty"`
+	APIVersion string `json:"apiVersion,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	Namespace string                `json:"namespace"`
+	Selector  *metav1.LabelSelector `json:"selector,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	Deployed string `json:"deployed,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	Healthy string `json:"healthy,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	Failed string `json:"failed,omitempty"`
+}
+
+type Gate struct {
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	Sources []GateSpec `json:"sources"`
+}
+
 // RollbackSpec configures a git write-back rollback when a deployed tag is unhealthy.
 type RollbackSpec struct {
 	Enabled bool `json:"enabled,omitempty"`
-	// Timeout is how long to wait for the workload to become Healthy after ArgoCD
-	// observes the pushed manifest commit. It does not include repository polling
-	// latency. Defaults to 20m.
+	// Timeout bounds deployment acknowledgement after Git observation. Once
+	// deployed, only explicit source failure triggers rollback. Defaults to 20m.
 	Timeout metav1.Duration `json:"timeout,omitempty"`
 }
 
@@ -172,6 +209,10 @@ type TagUpdater struct {
 
 type TagUpdaterSpec struct {
 	Source SourceSpec `json:"source"`
+	Gate   *Gate      `json:"gate,omitempty"`
+	// ReleaseSources are additional components of one release. All selected tags
+	// must resolve to the same full rev, branch and non-empty pipeline capture n.
+	ReleaseSources map[string]SourceSpec `json:"releaseSources,omitempty"`
 	// Targets identifies manifest documents and fields to update when a new tag matches.
 	Targets []TargetSpec `json:"targets"`
 	// Interval between tag polls. Defaults to 2m.
@@ -193,7 +234,31 @@ type TagUpdaterSpec struct {
 	Rollback *RollbackSpec `json:"rollback,omitempty"`
 }
 
+// RollbackField records exact manifest scalars before and after one release.
+// Nil means absent. Restoring compares After first to protect external edits.
+type RollbackField struct {
+	Path       string  `json:"path"`
+	APIVersion string  `json:"apiVersion"`
+	Kind       string  `json:"kind"`
+	Name       string  `json:"name"`
+	Namespace  string  `json:"namespace,omitempty"`
+	Field      string  `json:"field"`
+	Before     *string `json:"before,omitempty"`
+	After      *string `json:"after,omitempty"`
+}
+
 type TagUpdaterStatus struct {
+	// WatchingGate freezes the gate definition across spec edits during a release.
+	WatchingGate *Gate `json:"watchingGate,omitempty"`
+	// WatchingDeployed is sticky: timeout cannot blame a release after deployment.
+	WatchingDeployed bool `json:"watchingDeployed,omitempty"`
+	// BaselineHealthy is captured before push, never inferred from later health.
+	BaselineHealthy bool `json:"baselineHealthy,omitempty"`
+	// RollbackFields is durable before push and restores the whole release unit.
+	RollbackFields []RollbackField `json:"rollbackFields,omitempty"`
+	// WatchingRollback holds the app lease until the reverted set is Healthy.
+	WatchingRollback bool `json:"watchingRollback,omitempty"`
+
 	// LastImageDigest and PreviousImageDigest preserve immutable release identities.
 	LastImageDigest     string `json:"lastImageDigest,omitempty"`
 	PreviousImageDigest string `json:"previousImageDigest,omitempty"`
@@ -207,8 +272,8 @@ type TagUpdaterStatus struct {
 	LastWriteCommit string `json:"lastWriteCommit,omitempty"`
 	// PreviousTag is the tag applied before LastTag.
 	PreviousTag string `json:"previousTag,omitempty"`
-	// SkippedTags contains failed tags excluded from Latest() until a newer tag
-	// deploys successfully.
+	// SkippedTags contains failed release tags excluded from selection.
+	// They remain excluded when a newer release succeeds.
 	SkippedTags []string `json:"skippedTags,omitempty"`
 	// LastSignedDigest and PreviousSignedDigest are the digests verified by
 	// spec.source.requireSigned for LastTag and PreviousTag. Rollback renders
