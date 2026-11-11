@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,8 +46,8 @@ type TagUpdaterReconciler struct {
 	Dynamic   dynamic.Interface
 	Gates     *gate.Registry
 
-	firstRevAttempt atomic.Int64
-	lastRevSuccess  atomic.Int64
+	revFailingSince atomic.Int64
+	revPending      sync.Map // per-call start times; completed calls never age while idle
 	progress        progressTracker
 	fastRetry       fastRetryTracker
 	signed          signedDigests
@@ -1088,17 +1089,21 @@ func (r *TagUpdaterReconciler) addRev(ctx context.Context, src intsource.Source,
 	if !ok {
 		return nil
 	}
-	r.firstRevAttempt.CompareAndSwap(0, time.Now().UnixNano())
+	started := r.clock()
+	r.revPending.Store(&started, started)
+	defer r.revPending.Delete(&started)
 	revs, err := resolver.TagRevs(ctx)
 	if err != nil {
+		r.revFailingSince.CompareAndSwap(0, r.clock().UnixNano())
 		return fmt.Errorf("resolve tag %q to commit sha: %w", tag, err)
 	}
 	sha := revs[tag]
 	if sha == "" {
+		r.revFailingSince.CompareAndSwap(0, r.clock().UnixNano())
 		return fmt.Errorf("tag %q resolved to no commit sha; refusing impure tag-only flakeRef", tag)
 	}
 	data["rev"] = sha
-	r.lastRevSuccess.Store(time.Now().UnixNano())
+	r.revFailingSince.Store(0)
 	return nil
 }
 
@@ -1109,17 +1114,22 @@ func (r *TagUpdaterReconciler) RevResolutionHealthz() healthz.Checker {
 }
 
 func (r *TagUpdaterReconciler) revResolutionHealth(now time.Time) error {
-	last := r.lastRevSuccess.Load()
-	anchor := "last success"
-	if last == 0 {
-		last = r.firstRevAttempt.Load()
-		anchor = "first attempt"
-	}
+	// 2026-11-11: idle git streams can poll less often than the watchdog.
+	// Only sustained resolution failures start its deadline; success clears it.
+	last := r.revFailingSince.Load()
+	anchor := "failing"
+	r.revPending.Range(func(_, value any) bool {
+		if started := value.(time.Time).UnixNano(); last == 0 || started < last {
+			last = started
+			anchor = "pending"
+		}
+		return true
+	})
 	if last == 0 {
 		return nil
 	}
 	if age := now.Sub(time.Unix(0, last)); age > revStaleAfter {
-		return fmt.Errorf("git tag->rev resolution stale: %s %s ago (>%s)", anchor, age.Round(time.Second), revStaleAfter)
+		return fmt.Errorf("git tag->rev resolution %s for %s (>%s)", anchor, age.Round(time.Second), revStaleAfter)
 	}
 	return nil
 }

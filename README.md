@@ -393,7 +393,9 @@ Two layers detect this:
    pod restarts and leadership migrates. A single stale updater (one broken
    repo) never restarts the shared controller; use layer 1 to alert on it.
    The `tag-resolution` healthz check similarly restarts the pod when git
-   tag→rev resolution has been failing past its staleness window. Both checks
+   tag→rev resolution has been failing for five minutes since its first error.
+   A success clears that deadline; idle streams remain healthy between polls.
+   In-flight resolutions retain their own five-minute deadline to catch stuck calls. Both checks
    read in-process state. The chart sets a 24h reconcile floor to let a newly
    elected leader heal old records. Readiness (`/readyz`) checks cache sync and
    shutdown only, so a git outage cannot consume the PDB's healthy-pod budget.
