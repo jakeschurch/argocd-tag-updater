@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "gateKinds": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["apiVersion", "kind", "resource"],
+        "properties": {
+          "apiVersion": {"type": "string", "pattern": "^([a-z0-9][a-z0-9.-]*/)?v[0-9][a-z0-9]*$"},
+          "kind": {"type": "string", "pattern": "^[A-Z][A-Za-z0-9]*$"},
+          "resource": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"}
+        }
+      }
+    }
+  }
+}

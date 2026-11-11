@@ -27,8 +27,8 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
-  argoCDApp:
-    name: {{ .Values.selfUpdate.argoCDAppName | default (include "argocd-tag-updater.fullname" .) }}
+  # 2026-11-11: replacing the observer can interrupt its own health recovery.
+  # Keep the self-update outside app leases/rollback; managingApp only refreshes.
   interval: {{ .Values.selfUpdate.interval }}
   {{- with .Values.selfUpdate.managingApp }}
   managingApp:

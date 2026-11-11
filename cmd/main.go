@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -19,6 +20,7 @@ import (
 
 	v1alpha1 "github.com/jakeschurch/argocd-tag-updater/api/v1alpha1"
 	"github.com/jakeschurch/argocd-tag-updater/internal/controller"
+	"github.com/jakeschurch/argocd-tag-updater/internal/gate"
 	"github.com/jakeschurch/argocd-tag-updater/internal/writeback"
 )
 
@@ -83,10 +85,22 @@ func main() {
 	if err != nil {
 		fail("dynamic client: %v", err)
 	}
+	allowed := gate.Defaults
+	if value, present := os.LookupEnv("GATE_KINDS"); present {
+		if err := json.Unmarshal([]byte(value), &allowed); err != nil {
+			fail("parse GATE_KINDS: %v", err)
+		}
+	}
+	gateRegistry, err := gate.NewRegistry(dynClient, allowed)
+	if err != nil {
+		fail("gate registry: %v", err)
+	}
 
 	reconciler := &controller.TagUpdaterReconciler{
 		Client:          mgr.GetClient(),
+		APIReader:       mgr.GetAPIReader(),
 		Dynamic:         dynClient,
+		Gates:           gateRegistry,
 		Recorder:        mgr.GetEventRecorderFor("argocd-tag-updater"), //nolint:staticcheck // controller currently uses the typed core/v1 recorder API
 		StaleMultiplier: staleMultiplier,
 		StaleFloor:      staleFloor,
@@ -108,6 +122,9 @@ func main() {
 	// of restarting the shared controller.
 	_ = mgr.AddHealthzCheck("reconcile-progress", reconciler.ReconcileProgressHealthz())
 	_ = mgr.AddReadyzCheck("readyz", healthz.Ping)
+	// 2026-11-11: deployment preflights probe each ready pod, so a CRD/chart
+	// update cannot be mistaken for a running checkpoint-capable controller.
+	_ = mgr.AddReadyzCheck("gated-promotion-v2", healthz.Ping)
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		fail("start manager: %v", err)

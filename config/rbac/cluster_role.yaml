@@ -13,10 +13,19 @@ rules:
     resources: ["secrets"]
     verbs: ["get"]
 
-  # Rollback health observation (read-only)
+  # Default gate allowlist (read-only)
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications", "rollouts", "analysisruns"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kargo.akuity.io"]
+    resources: ["promotions"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["argoproj.io"]
     resources: ["applications"]
-    verbs: ["get"]
+    verbs: ["patch"]
 
   # Reconcile and write-back outcome events
   - apiGroups: [""]

@@ -50,6 +50,17 @@ serviceAccount:
 crd:
   install: true
 
+# 2026-11-11: one exact allowlist drives informer validation, CRD admission and
+# read-only RBAC. Remove unused kinds to reduce permissions. No wildcards.
+gateKinds:
+  - {apiVersion: argoproj.io/v1alpha1, kind: Application, resource: applications}
+  - {apiVersion: argoproj.io/v1alpha1, kind: Rollout, resource: rollouts}
+  - {apiVersion: argoproj.io/v1alpha1, kind: AnalysisRun, resource: analysisruns}
+  - {apiVersion: apps/v1, kind: Deployment, resource: deployments}
+  - {apiVersion: apps/v1, kind: StatefulSet, resource: statefulsets}
+  - {apiVersion: apps/v1, kind: DaemonSet, resource: daemonsets}
+  - {apiVersion: kargo.akuity.io/v1alpha1, kind: Promotion, resource: promotions}
+
 # The controller's own TagUpdater — watches this repo's tags and repins
 # nixMount.flakeRef on the Application that runs it. Off by default so a
 # standalone `helm install` does not create a CR pointing at an Application

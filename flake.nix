@@ -33,6 +33,7 @@
           ./go.mod
           ./go.sum
           ./vendor
+          ./config/crd
           (lib.fileset.fileFilter (file: file.hasExt "go") ./api)
           (lib.fileset.fileFilter (file: file.hasExt "go") ./cmd)
           (lib.fileset.fileFilter (file: file.hasExt "go") ./internal)

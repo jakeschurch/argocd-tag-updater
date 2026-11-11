@@ -210,8 +210,8 @@ spec:
   file, as with a single path.
 - Rollback rewrites every file in one commit. `status.lastWriteCommit` is that
   single commit.
-- `argoCDApp` still observes one Application. For health gating and rollback,
-  pick the Application that is slowest or riskiest to roll out.
+- Every named Application target participates in health observation and locking;
+  `argoCDApp` identifies the primary app, and `managingApp` observes the Git commit.
 
 Existing TagUpdaters that set only `writeBack.path` are unaffected.
 
@@ -223,19 +223,127 @@ one, so ArgoCD reads the commit now and not when its cached branch heads expire.
 That is its only write to an Application: it never syncs one or touches its
 operation, and a failed patch costs only the wait.
 
-When `rollback.enabled` is set, `argoCDApp` is a health reference. For
-app-of-apps deployments, optional `managingApp` is the revision observer;
-otherwise `argoCDApp` serves both roles. After pushing a tag update, the controller
-records the manifest commit SHA and waits for the revision observer's
-`status.sync.revision` (or an entry in `status.sync.revisions`) to equal it.
-Only then does the health timeout start. The timeout defaults to 20m
-and measures workload convergence after ArgoCD has observed the commit; git
-polling latency is excluded.
+`argoCDApp` and `managingApp` remain backward compatible. Updaters without
+`rollback.enabled: true` or an explicit gate select fixes forward without a
+watch, lease, or health block. For opted-in updaters, the controller waits
+for the manifest commit to appear in Argo CD's compared revisions or deployment
+history, including later fast-forward deployments carrying the change. Child
+health must come from a fresh comparison. Running/Terminating syncs cannot
+trigger a Degraded rollback. An unobserved commit retains the lease and raises
+`CommitNeverObserved`; it never excludes a tag merely because delivery stalled.
 
-A terminal Degraded result, or expiry of that timeout, writes the previous
-tag's values back through a new surgical commit. A Degraded result is ignored
-while `status.operationState.phase` is Running or Terminating. Failed tags are
-kept in `status.skippedTags` so they are not immediately selected again.
+Before pushing, the controller checkpoints its prior status and records a snapshot of **every changed scalar**
+and whether all health sources were Healthy. Rollback restores that exact set
+in one Git commit, with compare-before-restore guards against external edits
+(including scalar types such as unquoted numeric tags). A prepared watch becomes
+real only after its commit is reachable on the configured remote branch. A
+rejected forward or rollback push restores the pre-arm status and releases its
+leases; rollback skips and previous tags are not changed by a failed push. A
+lost push response or controller restart is settled by remote ancestry before
+health observation. A remote read failure keeps the checkpoint for retry.
+A preexisting unhealthy baseline suppresses rollback (condition, Event, log,
+and `tagupdater_rollback_suppressed_total`) and holds the lease until recovery.
+
+2026-11-11 timeout policy: `rollback.timeout` (default 20m) bounds deployment
+acknowledgement after Git observation. If deployment never happens, a Healthy
+baseline permits restoring the snapshot on timeout. **Once deployed, timeout
+does not roll back**: only explicit failure does. This preserves long pod drains
+and low-traffic canary analysis. An unhealthy deployed rollback retains its lease for operator
+recovery. A deployed release still waiting beyond its window raises
+`RollbackReady=False/PendingTooLong` and `tagupdater_gate_pending_too_long=1`;
+this alert does not attribute failure or force pod rotation. Successful rollbacks emit `tagupdater_rollbacks_total`, a `RolledBack`
+Event, and a log; only the failed release unit enters `status.skippedTags`.
+
+### Observer gate sources
+
+`spec.gate.sources` adds read-only sources. All selected objects must deploy and
+be healthy; any deployed failure triggers rollback. An empty selector result,
+missing object, stale generation, CEL error, or unsynchronized cache cannot pass.
+Presets: `argocd-application`, `argo-rollout`, `analysisrun`, `deployment`,
+`statefulset`, `daemonset`, `kargo-promotion`. Deployment/StatefulSet/Rollout presets require
+the tag in the desired spec and current observed generation. A Rollout with
+`workloadRef` also requires `status.workloadObservedGeneration` to match the
+referenced Deployment before an abort can blame its tag. Analysis infrastructure
+`Error` remains pending, while an explicit analysis `Failed` can blame the release.
+RollingUpdate StatefulSets and DaemonSets acknowledge deployment only when the
+whole desired rollout is updated and ready (and available for DaemonSets), so
+stalled rollouts remain subject to the deployment deadline.
+
+2026-11-11 OnDelete policy: pod rotation is excluded from automatic revision
+validation. A matching desired template, observed generation and nonempty
+`updateRevision` acknowledge deployment; ready pod counts supply health. This
+accepts deployment intent, not proof the new binary ran. Rotate farm ordinals
+using the workload runbook before treating a new image as operationally verified.
+
+```yaml
+argoCDApp: {name: web, namespace: argocd}
+managingApp: {name: cluster-apps, namespace: argocd}
+gate:
+  sources:
+    - preset: argo-rollout
+      namespace: web
+      name: web
+rollback: {enabled: true, timeout: 20m}
+```
+
+A custom source uses `apiVersion`, `kind`, namespace, and exactly one of `name`
+or `selector`, plus boolean `deployed`, `healthy`, and `failed` CEL expressions.
+Variables are `object` (unstructured resource) and `tag` (the pending release tag).
+For example: `deployed: object.status.observedGeneration == object.metadata.generation && object.spec.tag == tag`.
+Expressions compile on subscription changes, have a runtime cost limit, and
+fail closed. `healthy` alone is also evaluated with an empty tag before writing
+to assess baseline health. Author it independently of the proposed tag.
+
+The chart's exact `gateKinds` GVK/resource allowlist drives CRD admission,
+controller validation (`GATE_KINDS`), and read-only get/list/watch RBAC. The
+standalone CRD/RBAC use the seven defaults. Add custom kinds through the chart;
+do not grant wildcard permissions. Argo CD refresh is a separate patch permission.
+One shared dynamic informer starts per subscribed kind and stops after the last
+unsubscribe. Indexed handlers only enqueue; reconcile evaluates cache snapshots.
+Spec changes replace subscriptions, a finalizer detaches deleted updaters, and
+30-minute informer resync plus health deadlines provide a recovery backstop.
+
+### Release units, ownership, and operator recovery
+
+Use `releaseSources` for components built from one commit, and `targets[].source`
+to select a named component. Selection requires matching branch/pipeline `n`
+and the same full 40-character source revision for every component. Git sources
+resolve tags directly; OCI components require `revisionRepo` naming the Git
+repository publishing those same tags. A short SHA capture is insufficient.
+Use this only when CI actually publishes every component for every release.
+Path-gated independent image streams must keep separate updaters and share
+app leases; a common repository does not establish a release-unit contract.
+One complete set produces one multi-target commit and one snapshot; a partially
+published set is withheld. Each component keeps its digest/signature checks.
+
+Different-source updaters share non-expiring Kubernetes app Leases (CAS through
+uncached reads). Waiters wake on Lease or peer-status changes, with a slow retry
+backstop. A release holds all app leases until Healthy, including after rollback.
+Without an Application identity, explicit gates conservatively serialize their
+namespace/kind, covering overlapping selectors. Multiple pending changes raise
+`RollbackAmbiguous` and `tagupdater_rollback_ambiguous=1`: no writes, rollback,
+or skipped tags occur under ambiguous blame.
+
+Set `updater.argocd.io/hold: "true"` to pause selection; pending health observation
+continues. Git non-fast-forward conflicts reclone/replay the surgical edit up to
+three times without force-pushing; ref permission/lock errors are not conflicts.
+Deletion releases every app Lease owned by the updater UID before removing its
+finalizer. Spec/target changes drain the old watch and release leases by holder,
+including Applications removed from the spec. The new spec is reconciled next.
+Legacy watches without a field snapshot drain with `WatchDrained` rather than
+silently losing rollback capability behind an indefinite health block.
+
+Merge/deploy order for fleet changes: deploy this CRD **and running controller
+binary** first; a chart sync alone is insufficient because self-update is
+asynchronous. Set hold on affected updaters, wait for a Healthy remote pin and
+empty watch, then change/delete target definitions. Verify the former UID has
+no held app leases before activating replacements. Remove the committed hold
+annotations only in a separate reviewed activation after runtime verification.
+Do not prune or consolidate updaters while an old controller is running.
+
+Exclude the controller's own `argocd-tag-updater` self-update from health gating:
+its replacement can interrupt the observer responsible for its own recovery.
+Keep that pin independently recoverable by the operator.
 
 ## Tag format convention
 

@@ -247,6 +247,7 @@ func TestRollbackRendersRecordedSignedDigest(t *testing.T) {
 			updater := signatureUpdater(server.URL+"/foundry/app", remote, v1.SignatureModeMarker, newTag, initial)
 			updater.Spec.ArgoCDApp = &v1.ArgoCDAppRef{Name: "app"}
 			updater.Spec.Rollback = &v1.RollbackSpec{Enabled: true}
+			updater.Status.BaselineHealthy = true
 			updater.Status.PreviousTag = oldTag
 			updater.Status.WatchingTag = newTag
 			updater.Status.LastSignedDigest = digestNew

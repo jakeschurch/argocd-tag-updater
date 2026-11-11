@@ -15,6 +15,7 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/storer"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
@@ -35,15 +36,21 @@ type Credentials struct {
 }
 
 type Writer struct {
-	Spec        v1alpha1.WriteBackSpec
-	Credentials Credentials
-	Targets     []v1alpha1.TargetSpec
-	Data        map[string]string
+	Spec            v1alpha1.WriteBackSpec
+	Credentials     Credentials
+	Targets         []v1alpha1.TargetSpec
+	Data            map[string]string
+	TargetData      map[string]map[string]string
+	CaptureRollback bool
+	Restore         []v1alpha1.RollbackField
+	// BeforePush persists the health watch and snapshot before Git can change.
+	BeforePush func(Result) error
 }
 
 type Result struct {
-	Committed bool
-	CommitSHA string
+	Committed      bool
+	CommitSHA      string
+	RollbackFields []v1alpha1.RollbackField
 }
 
 // Apply returns the verified branch commit, with Committed true only when it
@@ -58,7 +65,7 @@ func (w Writer) Apply(ctx context.Context) (Result, error) {
 	defer cleanup()
 	for attempt := 0; attempt < 3; attempt++ {
 		result, err := w.applyOnce(ctx, auth, repoURL)
-		if !errors.Is(err, git.ErrNonFastForwardUpdate) {
+		if !retryablePushConflict(err) {
 			return result, err
 		}
 	}
@@ -83,6 +90,56 @@ func (w Writer) RemoteHead(ctx context.Context) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("branch %s not found in %s", w.Spec.Branch, repoURL)
+}
+
+// ContainsCommit verifies ancestry on the configured remote branch, including
+// when another writer has already advanced its tip past our commit.
+func (w Writer) ContainsCommit(ctx context.Context, commit string) (bool, error) {
+	headSHA, err := w.RemoteHead(ctx)
+	if err != nil {
+		return false, err
+	}
+	if headSHA == commit {
+		return true, nil
+	}
+	auth, repoURL, cleanup, err := w.auth()
+	if err != nil {
+		return false, err
+	}
+	defer cleanup()
+	// 2026-11-11: the common case needs only ls-remote. Rare descendant
+	// recovery uses disk-backed history so large manifest repos do not retain
+	// their entire object packs in controller memory.
+	directory, err := newCloneDirectory()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = os.RemoveAll(directory) }()
+	repo, err := git.PlainCloneContext(ctx, directory, true, &git.CloneOptions{
+		URL: repoURL, Auth: auth, ReferenceName: plumbing.NewBranchReferenceName(w.Spec.Branch),
+		SingleBranch: true, NoCheckout: true, Tags: git.NoTags,
+	})
+	if err != nil {
+		return false, fmt.Errorf("read manifest branch: %w", err)
+	}
+	head, err := repo.Head()
+	if err != nil {
+		return false, err
+	}
+	iter, err := repo.Log(&git.LogOptions{From: head.Hash()})
+	if err != nil {
+		return false, err
+	}
+	defer iter.Close()
+	found := false
+	err = iter.ForEach(func(c *object.Commit) error {
+		if c.Hash.String() == commit {
+			found = true
+			return storer.ErrStop
+		}
+		return nil
+	})
+	return found, err
 }
 
 func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoURL string) (Result, error) {
@@ -111,6 +168,7 @@ func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoUR
 		output          []byte
 	}
 	var edits []fileEdit
+	var snapshot []v1alpha1.RollbackField
 	for _, file := range files {
 		manifestPath, _, err := safeManifestPath(cloneDirectoryPath, file.path)
 		if err != nil {
@@ -120,7 +178,18 @@ func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoUR
 		if err != nil {
 			return Result{}, fmt.Errorf("read manifest %s: %w", file.path, err)
 		}
-		output, changed, err := UpdateManifest(input, file.targets, w.Data)
+		var output []byte
+		var changed bool
+		if w.Restore != nil {
+			output, changed, err = restoreManifest(input, file.path, w.Restore)
+		} else {
+			output, changed, err = updateManifestWithSources(input, file.targets, w.Data, w.TargetData)
+		}
+		if err == nil && w.CaptureRollback {
+			var fields []v1alpha1.RollbackField
+			fields, err = snapshotManifest(input, output, file.path, file.targets)
+			snapshot = append(snapshot, fields...)
+		}
 		if err != nil {
 			return Result{}, fmt.Errorf("edit manifest %s: %w", file.path, err)
 		}
@@ -133,7 +202,13 @@ func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoUR
 		if headErr != nil {
 			return Result{}, fmt.Errorf("resolve manifest branch head: %w", headErr)
 		}
-		return Result{CommitSHA: head.Hash().String()}, nil
+		result := Result{CommitSHA: head.Hash().String(), RollbackFields: snapshot}
+		if w.BeforePush != nil {
+			if err := w.BeforePush(result); err != nil {
+				return Result{}, err
+			}
+		}
+		return result, nil
 	}
 	for _, edit := range edits {
 		if err := os.WriteFile(edit.absolute, edit.output, 0o600); err != nil {
@@ -149,15 +224,27 @@ func (w Writer) applyOnce(ctx context.Context, auth transport.AuthMethod, repoUR
 		if headErr != nil {
 			return Result{}, fmt.Errorf("resolve manifest branch head after empty commit: %w", headErr)
 		}
-		return Result{CommitSHA: head.Hash().String()}, nil
+		result := Result{CommitSHA: head.Hash().String(), RollbackFields: snapshot}
+		if w.BeforePush != nil {
+			if err := w.BeforePush(result); err != nil {
+				return Result{}, err
+			}
+		}
+		return result, nil
 	}
 	if err != nil {
 		return Result{}, fmt.Errorf("commit manifest %s: %w", strings.Join(cleanPaths, ", "), err)
 	}
+	result := Result{Committed: true, CommitSHA: commitHash.String(), RollbackFields: snapshot}
+	if w.BeforePush != nil {
+		if err := w.BeforePush(result); err != nil {
+			return Result{}, err
+		}
+	}
 	if err := repo.PushContext(ctx, &git.PushOptions{Auth: auth}); err != nil {
 		return Result{}, err
 	}
-	return Result{Committed: true, CommitSHA: commitHash.String()}, nil
+	return result, nil
 }
 
 // manifestFile is one manifest in the write-back repository and every target
@@ -437,4 +524,10 @@ func toHTTPS(repo string) string {
 	default:
 		return repo
 	}
+}
+
+// 2026-11-11: go-git also formats non-fast-forward rejection as a plain
+// error (remote.go checkFastForwardUpdate), rather than its exported sentinel.
+func retryablePushConflict(err error) bool {
+	return err != nil && (errors.Is(err, git.ErrNonFastForwardUpdate) || strings.Contains(err.Error(), "non-fast-forward"))
 }

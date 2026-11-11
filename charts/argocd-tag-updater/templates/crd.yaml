@@ -61,6 +61,114 @@ spec:
                 required:
                 - name
                 type: object
+              gate:
+                properties:
+                  sources:
+                    items:
+                      description: |-
+                        GateSpec selects a read-only health source. Custom sources require all three
+                        boolean CEL expressions; object and tag are the available variables.
+                      properties:
+                        apiVersion:
+                          type: string
+                        deployed:
+                          maxLength: 2048
+                          minLength: 1
+                          type: string
+                        failed:
+                          maxLength: 2048
+                          minLength: 1
+                          type: string
+                        healthy:
+                          maxLength: 2048
+                          minLength: 1
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                        namespace:
+                          minLength: 1
+                          type: string
+                        preset:
+                          enum:
+                          - argocd-application
+                          - argo-rollout
+                          - analysisrun
+                          - deployment
+                          - statefulset
+                          - daemonset
+                          - kargo-promotion
+                          type: string
+                        selector:
+                          description: |-
+                            A label selector is a label query over a set of resources. The result of matchLabels and
+                            matchExpressions are ANDed. An empty label selector matches all objects. A null
+                            label selector matches no objects.
+                          properties:
+                            matchExpressions:
+                              description: matchExpressions is a list of label selector
+                                requirements. The requirements are ANDed.
+                              items:
+                                description: |-
+                                  A label selector requirement is a selector that contains values, a key, and an operator that
+                                  relates the key and values.
+                                properties:
+                                  key:
+                                    description: key is the label key that the selector
+                                      applies to.
+                                    type: string
+                                  operator:
+                                    description: |-
+                                      operator represents a key's relationship to a set of values.
+                                      Valid operators are In, NotIn, Exists and DoesNotExist.
+                                    type: string
+                                  values:
+                                    description: |-
+                                      values is an array of string values. If the operator is In or NotIn,
+                                      the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                      the values array must be empty. This array is replaced during a strategic
+                                      merge patch.
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - key
+                                - operator
+                                type: object
+                              type: array
+                              x-kubernetes-list-type: atomic
+                            matchLabels:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                operator is "In", and the values array contains only "value". The requirements are ANDed.
+                              type: object
+                          type: object
+                          x-kubernetes-map-type: atomic
+                      required:
+                      - namespace
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of name or selector is required
+                        rule: has(self.name) != has(self.selector)
+                      - message: use a preset or a complete custom CEL source
+                        rule: 'has(self.preset) ? !(has(self.apiVersion) || has(self.kind)
+                          || has(self.deployed) || has(self.healthy) || has(self.failed))
+                          : (has(self.apiVersion) && has(self.kind) && has(self.deployed)
+                          && has(self.healthy) && has(self.failed))'
+                      - message: gate GVK must be allowlisted
+                        rule: {{ include "argocd-tag-updater.gateAllowlistRule" . | quote }}
+                    maxItems: 16
+                    minItems: 1
+                    type: array
+                required:
+                - sources
+                type: object
               interval:
                 description: Interval between tag polls. Defaults to 2m.
                 type: string
@@ -77,6 +185,76 @@ spec:
                 required:
                 - name
                 type: object
+              releaseSources:
+                additionalProperties:
+                  properties:
+                    digestAuthRealm:
+                      description: DigestAuthRealm explicitly trusts a cross-origin
+                        HTTPS Bearer token endpoint.
+                      type: string
+                    digestRepo:
+                      description: |-
+                        DigestRepo is the OCI repository whose exact git release tag is resolved.
+                        It is also the repository RequireSigned checks for a git source.
+                      type: string
+                    imagePullSecretRef:
+                      description: |-
+                        ImagePullSecretRef names a kubernetes.io/dockerconfigjson Secret in the same
+                        namespace as the TagUpdater. For OCI sources or opted-in digest resolution, it reads
+                        the secret and uses its credentials to authenticate against the registry.
+                      properties:
+                        name:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    repo:
+                      description: |-
+                        Repo is a git remote URL (git source), OCI repository reference (oci source),
+                        or nix cache tag namespace "<host>/<name>" (nix source).
+                      type: string
+                    requireSigned:
+                      description: |-
+                        RequireSigned withholds a new tag until its image is signed. With "marker",
+                        the newest matching tag is resolved to its manifest digest and written only
+                        when the repository also holds the tag <digest with ':' replaced by '-'>.signed.
+                        Until then nothing is written, the SignatureVerified condition is False with
+                        reason AwaitingSignature, and the tag is checked again every interval, so it
+                        deploys once signed. A registry error writes nothing. The repository is
+                        source.repo for an OCI source and source.digestRepo for a git source; nix
+                        sources are rejected. The verified digest is available to templates as
+                        "signed_digest". Unset keeps tag-only behavior.
+                      enum:
+                      - marker
+                      type: string
+                    resolveDigest:
+                      default: false
+                      description: ResolveDigest enables exact-tag OCI manifest digest
+                        lookup for a git release source.
+                      type: boolean
+                    revisionRepo:
+                      description: |-
+                        RevisionRepo resolves the same release tag in Git when an OCI source is
+                        part of a release unit. It supplies the full source revision; short tag
+                        captures alone are insufficient proof of a common commit.
+                      type: string
+                    tagPattern:
+                      description: |-
+                        TagPattern is a named-group regex. Captures are available in Patch templates.
+                        The capture named "n" is used as the sort key to select the latest tag.
+                        e.g.: platform\.(?P<branch>[^.]+)\.build-(?P<n>\d+)\.(?P<sha>[0-9a-f]{6,})
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - repo
+                  - tagPattern
+                  - type
+                  type: object
+                description: |-
+                  ReleaseSources are additional components of one release. All selected tags
+                  must resolve to the same full rev, branch and non-empty pipeline capture n.
+                type: object
               rollback:
                 description: |-
                   Rollback commits the previous tag's rendered values when ArgoCD reports a
@@ -86,9 +264,8 @@ spec:
                     type: boolean
                   timeout:
                     description: |-
-                      Timeout is how long to wait for the workload to become Healthy after ArgoCD
-                      observes the pushed manifest commit. It does not include repository polling
-                      latency. Defaults to 20m.
+                      Timeout bounds deployment acknowledgement after Git observation. Once
+                      deployed, only explicit source failure triggers rollback. Defaults to 20m.
                     type: string
                 type: object
               source:
@@ -137,6 +314,12 @@ spec:
                     description: ResolveDigest enables exact-tag OCI manifest digest
                       lookup for a git release source.
                     type: boolean
+                  revisionRepo:
+                    description: |-
+                      RevisionRepo resolves the same release tag in Git when an OCI source is
+                      part of a release unit. It supplies the full source revision; short tag
+                      captures alone are insufficient proof of a common commit.
+                    type: string
                   tagPattern:
                     description: |-
                       TagPattern is a named-group regex. Captures are available in Patch templates.
@@ -196,7 +379,7 @@ spec:
                               repo-derived fields (owner, repo, host, repoURL), "tag" (full tag string),
                               and — for the git source — "rev", the matched tag's immutable full commit
                               sha, enabling an immutable flake ref like
-                              "github:{{ "{{" }} .owner {{ "}}" }}/{{ "{{" }} .repo {{ "}}" }}/{{ "{{" }} .tag {{ "}}" }}?rev={{ "{{" }} .rev {{ "}}" }}#attr".
+                              "github:{{ .owner }}/{{ .repo }}/{{ .tag }}?rev={{ .rev }}#attr".
                               An absent key renders empty and the whole field is skipped (never blanked).
                             type: string
                         required:
@@ -268,6 +451,10 @@ spec:
                           type: object
                       type: object
                       x-kubernetes-map-type: atomic
+                    source:
+                      description: Source selects a named releaseSources entry; empty
+                        uses spec.source.
+                      type: string
                   required:
                   - apiVersion
                   - kind
@@ -341,6 +528,10 @@ spec:
                   AwaitingSignatureTag is the newest matching tag held back by
                   spec.source.requireSigned because its image carries no signature yet.
                 type: string
+              baselineHealthy:
+                description: BaselineHealthy is captured before push, never inferred
+                  from later health.
+                type: boolean
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -429,10 +620,48 @@ spec:
               previousTag:
                 description: PreviousTag is the tag applied before LastTag.
                 type: string
+              rollbackFields:
+                description: RollbackFields is durable before push and restores the
+                  whole release unit.
+                items:
+                  description: |-
+                    RollbackField records exact manifest scalars before and after one release.
+                    Nil means absent. Restoring compares After first to protect external edits.
+                  properties:
+                    after:
+                      type: string
+                    apiVersion:
+                      type: string
+                    beforeType:
+                      type: string
+                      enum: ["", "!!int", "!!float", "!!bool", "!!null"]
+                    afterType:
+                      type: string
+                      enum: ["", "!!int", "!!float", "!!bool", "!!null"]
+                    before:
+                      type: string
+                    field:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    path:
+                      type: string
+                  required:
+                  - apiVersion
+                  - field
+                  - kind
+                  - name
+                  - path
+                  type: object
+                type: array
               skippedTags:
                 description: |-
-                  SkippedTags contains failed tags excluded from Latest() until a newer tag
-                  deploys successfully.
+                  SkippedTags contains failed release tags excluded from selection.
+                  They remain excluded when a newer release succeeds.
                 items:
                   type: string
                 type: array
@@ -454,6 +683,128 @@ spec:
                   WatchingCommit is the pushed manifest commit ArgoCD must observe before the
                   health timeout clock starts.
                 type: string
+              watchingDeployed:
+                description: 'WatchingDeployed is sticky: timeout cannot blame a release
+                  after deployment.'
+                type: boolean
+              pendingWriteStatus:
+                type: string
+              watchingSpecHash:
+                type: string
+              watchingGate:
+                description: WatchingGate freezes the gate definition across spec
+                  edits during a release.
+                properties:
+                  sources:
+                    items:
+                      description: |-
+                        GateSpec selects a read-only health source. Custom sources require all three
+                        boolean CEL expressions; object and tag are the available variables.
+                      properties:
+                        apiVersion:
+                          type: string
+                        deployed:
+                          maxLength: 2048
+                          minLength: 1
+                          type: string
+                        failed:
+                          maxLength: 2048
+                          minLength: 1
+                          type: string
+                        healthy:
+                          maxLength: 2048
+                          minLength: 1
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                        namespace:
+                          minLength: 1
+                          type: string
+                        preset:
+                          enum:
+                          - argocd-application
+                          - argo-rollout
+                          - analysisrun
+                          - deployment
+                          - statefulset
+                          - daemonset
+                          - kargo-promotion
+                          type: string
+                        selector:
+                          description: |-
+                            A label selector is a label query over a set of resources. The result of matchLabels and
+                            matchExpressions are ANDed. An empty label selector matches all objects. A null
+                            label selector matches no objects.
+                          properties:
+                            matchExpressions:
+                              description: matchExpressions is a list of label selector
+                                requirements. The requirements are ANDed.
+                              items:
+                                description: |-
+                                  A label selector requirement is a selector that contains values, a key, and an operator that
+                                  relates the key and values.
+                                properties:
+                                  key:
+                                    description: key is the label key that the selector
+                                      applies to.
+                                    type: string
+                                  operator:
+                                    description: |-
+                                      operator represents a key's relationship to a set of values.
+                                      Valid operators are In, NotIn, Exists and DoesNotExist.
+                                    type: string
+                                  values:
+                                    description: |-
+                                      values is an array of string values. If the operator is In or NotIn,
+                                      the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                      the values array must be empty. This array is replaced during a strategic
+                                      merge patch.
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - key
+                                - operator
+                                type: object
+                              type: array
+                              x-kubernetes-list-type: atomic
+                            matchLabels:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                operator is "In", and the values array contains only "value". The requirements are ANDed.
+                              type: object
+                          type: object
+                          x-kubernetes-map-type: atomic
+                      required:
+                      - namespace
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of name or selector is required
+                        rule: has(self.name) != has(self.selector)
+                      - message: use a preset or a complete custom CEL source
+                        rule: 'has(self.preset) ? !(has(self.apiVersion) || has(self.kind)
+                          || has(self.deployed) || has(self.healthy) || has(self.failed))
+                          : (has(self.apiVersion) && has(self.kind) && has(self.deployed)
+                          && has(self.healthy) && has(self.failed))'
+                      - message: gate GVK must be allowlisted
+                        rule: {{ include "argocd-tag-updater.gateAllowlistRule" . | quote }}
+                    maxItems: 16
+                    minItems: 1
+                    type: array
+                required:
+                - sources
+                type: object
+              watchingRollback:
+                description: WatchingRollback holds the app lease until the reverted
+                  set is Healthy.
+                type: boolean
               watchingSince:
                 description: WatchingSince is set when ArgoCD status.sync.revision
                   equals WatchingCommit.

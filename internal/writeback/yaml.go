@@ -18,6 +18,14 @@ import (
 // UpdateManifest renders and applies only configured target fields to matching
 // YAML documents. yaml.Node retains comments, mapping order, anchors, and style.
 func UpdateManifest(input []byte, targets []v1alpha1.TargetSpec, data map[string]string) ([]byte, bool, error) {
+	return updateManifestWithSources(input, targets, data, nil)
+}
+
+func updateManifestWithSources(input []byte, targets []v1alpha1.TargetSpec, data map[string]string, sources map[string]map[string]string) ([]byte, bool, error) {
+	return updateManifest(input, targets, data, sources, false)
+}
+
+func updateManifest(input []byte, targets []v1alpha1.TargetSpec, data map[string]string, sources map[string]map[string]string, allowEmpty bool) ([]byte, bool, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(input))
 	var docs []*yaml.Node
 	for {
@@ -37,6 +45,14 @@ func UpdateManifest(input []byte, targets []v1alpha1.TargetSpec, data map[string
 	insertions := map[*yaml.Node][]*yaml.Node{}
 	removals := map[*yaml.Node]*yaml.Node{}
 	for _, target := range targets {
+		targetData := data
+		if target.Source != "" {
+			var ok bool
+			targetData, ok = sources[target.Source]
+			if !ok {
+				return nil, false, fmt.Errorf("unknown target source %q", target.Source)
+			}
+		}
 		matched := 0
 		for _, doc := range docs {
 			root, err := documentMap(doc)
@@ -75,11 +91,11 @@ func UpdateManifest(input []byte, targets []v1alpha1.TargetSpec, data map[string
 				default:
 					return nil, false, fmt.Errorf("field %q: unsupported operation %q", p.Field, p.Operation)
 				}
-				value, err := renderTemplate(p.Template, data)
+				value, err := renderTemplate(p.Template, targetData)
 				if err != nil {
 					return nil, false, fmt.Errorf("render template for field %q: %w", p.Field, err)
 				}
-				if strings.TrimSpace(value) == "" {
+				if strings.TrimSpace(value) == "" && !allowEmpty {
 					continue
 				}
 				node, fieldChanged, err := setScalar(root, strings.Split(p.Field, "."), value, insertions)
@@ -300,6 +316,10 @@ func applyYAMLEdits(input []byte, values map[*yaml.Node]string, insertions map[*
 			return nil, err
 		}
 		rendered, err := renderScalar(value, node.Style)
+		if node.Tag != "!!str" {
+			encoded, encodeErr := yaml.Marshal(&yaml.Node{Kind: yaml.ScalarNode, Tag: node.Tag, Value: value})
+			rendered, err = strings.TrimSpace(string(encoded)), encodeErr
+		}
 		if err != nil {
 			return nil, err
 		}
