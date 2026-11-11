@@ -124,12 +124,19 @@ type ArgoCDAppRef struct {
 // +kubebuilder:validation:XValidation:rule="has(self.preset) || (has(self.apiVersion) && has(self.kind) && ((self.apiVersion == 'argoproj.io/v1alpha1' && self.kind in ['Application', 'Rollout', 'AnalysisRun']) || (self.apiVersion == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet', 'DaemonSet']) || (self.apiVersion == 'kargo.akuity.io/v1alpha1' && self.kind == 'Promotion')))",message="gate GVK must be allowlisted"
 type GateSpec struct {
 	// +kubebuilder:validation:Enum=argocd-application;argo-rollout;analysisrun;deployment;statefulset;daemonset;kargo-promotion
-	Preset     string `json:"preset,omitempty"`
+	Preset string `json:"preset,omitempty"`
+	// Length bounds keep the CEL cost estimate of the GVK allowlist rule
+	// within the apiserver budget (unbounded strings are costed at the
+	// maximum request size, which rejected the CRD on 2026-11-11).
+	// +kubebuilder:validation:MaxLength=253
 	APIVersion string `json:"apiVersion,omitempty"`
-	Kind       string `json:"kind,omitempty"`
+	// +kubebuilder:validation:MaxLength=63
+	Kind string `json:"kind,omitempty"`
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	Name string `json:"name,omitempty"`
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	Namespace string                `json:"namespace"`
 	Selector  *metav1.LabelSelector `json:"selector,omitempty"`
 	// +kubebuilder:validation:MinLength=1

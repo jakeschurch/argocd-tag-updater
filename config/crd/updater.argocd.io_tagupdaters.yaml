@@ -69,6 +69,11 @@ spec:
                         boolean CEL expressions; object and tag are the available variables.
                       properties:
                         apiVersion:
+                          description: |-
+                            Length bounds keep the CEL cost estimate of the GVK allowlist rule
+                            within the apiserver budget (unbounded strings are costed at the
+                            maximum request size, which rejected the CRD on 2026-11-11).
+                          maxLength: 253
                           type: string
                         deployed:
                           maxLength: 2048
@@ -83,11 +88,14 @@ spec:
                           minLength: 1
                           type: string
                         kind:
+                          maxLength: 63
                           type: string
                         name:
+                          maxLength: 253
                           minLength: 1
                           type: string
                         namespace:
+                          maxLength: 63
                           minLength: 1
                           type: string
                         preset:
@@ -164,9 +172,9 @@ spec:
                         rule: has(self.preset) || (has(self.apiVersion) && has(self.kind)
                           && ((self.apiVersion == 'argoproj.io/v1alpha1' && self.kind
                           in ['Application', 'Rollout', 'AnalysisRun']) || (self.apiVersion
-                          == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet', 'DaemonSet'])
-                          || (self.apiVersion == 'kargo.akuity.io/v1alpha1' && self.kind
-                          == 'Promotion')))
+                          == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet',
+                          'DaemonSet']) || (self.apiVersion == 'kargo.akuity.io/v1alpha1'
+                          && self.kind == 'Promotion')))
                     maxItems: 16
                     minItems: 1
                     type: array
@@ -617,6 +625,11 @@ spec:
                   configuration changes.
                 format: int64
                 type: integer
+              pendingWriteStatus:
+                description: |-
+                  PendingWriteStatus is the pre-push status checkpoint. A prepared watch is
+                  confirmed only after its commit is reachable on the manifest branch.
+                type: string
               previousImageDigest:
                 type: string
               previousSignedDigest:
@@ -634,15 +647,13 @@ spec:
                   properties:
                     after:
                       type: string
-                    apiVersion:
-                      type: string
-                    beforeType:
-                      type: string
-                      enum: ["", "!!int", "!!float", "!!bool", "!!null"]
                     afterType:
                       type: string
-                      enum: ["", "!!int", "!!float", "!!bool", "!!null"]
+                    apiVersion:
+                      type: string
                     before:
+                      type: string
+                    beforeType:
                       type: string
                     field:
                       type: string
@@ -691,10 +702,6 @@ spec:
                 description: 'WatchingDeployed is sticky: timeout cannot blame a release
                   after deployment.'
                 type: boolean
-              pendingWriteStatus:
-                type: string
-              watchingSpecHash:
-                type: string
               watchingGate:
                 description: WatchingGate freezes the gate definition across spec
                   edits during a release.
@@ -706,6 +713,11 @@ spec:
                         boolean CEL expressions; object and tag are the available variables.
                       properties:
                         apiVersion:
+                          description: |-
+                            Length bounds keep the CEL cost estimate of the GVK allowlist rule
+                            within the apiserver budget (unbounded strings are costed at the
+                            maximum request size, which rejected the CRD on 2026-11-11).
+                          maxLength: 253
                           type: string
                         deployed:
                           maxLength: 2048
@@ -720,11 +732,14 @@ spec:
                           minLength: 1
                           type: string
                         kind:
+                          maxLength: 63
                           type: string
                         name:
+                          maxLength: 253
                           minLength: 1
                           type: string
                         namespace:
+                          maxLength: 63
                           minLength: 1
                           type: string
                         preset:
@@ -801,9 +816,9 @@ spec:
                         rule: has(self.preset) || (has(self.apiVersion) && has(self.kind)
                           && ((self.apiVersion == 'argoproj.io/v1alpha1' && self.kind
                           in ['Application', 'Rollout', 'AnalysisRun']) || (self.apiVersion
-                          == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet', 'DaemonSet'])
-                          || (self.apiVersion == 'kargo.akuity.io/v1alpha1' && self.kind
-                          == 'Promotion')))
+                          == 'apps/v1' && self.kind in ['Deployment', 'StatefulSet',
+                          'DaemonSet']) || (self.apiVersion == 'kargo.akuity.io/v1alpha1'
+                          && self.kind == 'Promotion')))
                     maxItems: 16
                     minItems: 1
                     type: array
@@ -818,6 +833,10 @@ spec:
                 description: WatchingSince is set when ArgoCD status.sync.revision
                   equals WatchingCommit.
                 format: date-time
+                type: string
+              watchingSpecHash:
+                description: WatchingSpecHash detects spec changes that must drain
+                  old lease ownership.
                 type: string
               watchingTag:
                 description: WatchingTag is the deployed tag currently under health
