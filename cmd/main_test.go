@@ -55,7 +55,7 @@ func TestRegisterProbesKeepsWatchdogsOnLiveness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(registrar.health) != 3 || len(registrar.ready) != 1 {
+	if len(registrar.health) != 3 || len(registrar.ready) != 2 {
 		t.Fatalf("probe mapping: health=%v ready=%v", registrar.health, registrar.ready)
 	}
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -69,6 +69,13 @@ func TestRegisterProbesKeepsWatchdogsOnLiveness(t *testing.T) {
 		if err := check(request); !errors.Is(err, want) {
 			t.Errorf("healthz %s = %v; want %v", name, err, want)
 		}
+	}
+	capability, ok := registrar.ready["gated-promotion-v2"]
+	if !ok {
+		t.Fatal("missing gated-promotion-v2 check")
+	}
+	if err := capability(request); err != nil {
+		t.Fatalf("gated-promotion-v2 check: %v", err)
 	}
 	check, ok := registrar.ready["readyz"]
 	if !ok {
@@ -129,7 +136,7 @@ func TestRegisteredReadiness(t *testing.T) {
 
 func TestRegisterProbesReportsRegistrationErrors(t *testing.T) {
 	want := errors.New("registration failed")
-	for _, name := range []string{"healthz", "tag-resolution", "reconcile-progress", "readyz"} {
+	for _, name := range []string{"healthz", "tag-resolution", "reconcile-progress", "gated-promotion-v2", "readyz"} {
 		t.Run(name, func(t *testing.T) {
 			registrar := &fakeProbeRegistrar{failName: name, err: want}
 			cache := fakeCacheSyncer(func(context.Context) bool { return true })

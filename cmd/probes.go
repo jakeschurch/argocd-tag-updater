@@ -35,6 +35,10 @@ func registerProbes(ctx context.Context, registrar probeRegistrar, cache cacheSy
 			return fmt.Errorf("register healthz %s: %w", check.name, err)
 		}
 	}
+	// 2026-11-11: expose the gated-promotion capability to activation checks.
+	if err := registrar.AddReadyzCheck("gated-promotion-v2", healthz.Ping); err != nil {
+		return fmt.Errorf("register readyz gated-promotion-v2: %w", err)
+	}
 	return registrar.AddReadyzCheck("readyz", func(request *http.Request) error {
 		if err := ctx.Err(); err != nil {
 			return err
