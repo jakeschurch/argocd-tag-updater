@@ -67,6 +67,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, req.NamespacedName, &tu); err != nil {
 		if apierrors.IsNotFound(err) {
 			pendingTooLong.DeleteLabelValues(req.Namespace, req.Name)
+			releaseDegraded.DeleteLabelValues(req.Namespace, req.Name)
 			if r.Gates != nil {
 				r.Gates.Unsubscribe(req.NamespacedName)
 			}
@@ -77,6 +78,7 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	if !tu.DeletionTimestamp.IsZero() {
 		pendingTooLong.DeleteLabelValues(tu.Namespace, tu.Name)
+		releaseDegraded.DeleteLabelValues(tu.Namespace, tu.Name)
 		if r.Gates != nil {
 			r.Gates.Unsubscribe(req.NamespacedName)
 		}
@@ -176,6 +178,9 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{RequeueAfter: requeue}, nil
 		}
 		return ctrl.Result{RequeueAfter: interval}, nil
+	}
+	if err := r.observeSettledRelease(ctx, &tu); err != nil {
+		return ctrl.Result{}, err
 	}
 	if strings.EqualFold(tu.Annotations[holdAnnotation], "true") {
 		condition := metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "Held", Message: "selection paused by " + holdAnnotation}
@@ -384,6 +389,8 @@ func (r *TagUpdaterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				tu.Status.WatchingGate = tu.Spec.Gate.DeepCopy()
 				tu.Status.WatchingSpecHash = specHash(&tu)
 				tu.Status.WatchingDeployed = false
+				// The previous release's verdict must not stand for this one.
+				meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionUnknown, Reason: "AwaitingHealth", Message: fmt.Sprintf("awaiting ArgoCD to deploy tag %s and report it Synced and Healthy", latest.Tag)})
 				baseline := r.baselineHealthy(ctx, &tu)
 				tu.Status.BaselineHealthy = baseline
 				tu.Status.RollbackFields = result.RollbackFields
@@ -456,6 +463,14 @@ func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, 
 	if ambiguous {
 		return 0, nil
 	}
+	// A pending watch has no health verdict yet, including one armed by an
+	// older build that left the previous release's DeploymentHealthy behind.
+	if ready := meta.FindStatusCondition(tu.Status.Conditions, "RollbackReady"); ready != nil && ready.Status == metav1.ConditionTrue && ready.Reason == "DeploymentHealthy" {
+		meta.SetStatusCondition(&tu.Status.Conditions, metav1.Condition{Type: "RollbackReady", Status: metav1.ConditionUnknown, Reason: "AwaitingHealth", Message: fmt.Sprintf("awaiting ArgoCD to deploy tag %s and report it Synced and Healthy", tu.Status.WatchingTag)})
+		if err := r.Status().Update(ctx, tu); err != nil {
+			return 0, err
+		}
+	}
 	if tu.Status.WatchingSince == nil {
 		observes := revisionObserver(tu) == nil
 		if revisionObserver(tu) != nil {
@@ -481,11 +496,22 @@ func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, 
 	if err != nil {
 		return r.blockedWatch(ctx, tu, "HealthReadFailed", err.Error())
 	}
-	if state.Sync == "Unknown" {
+	// Failed operations that predate the write cannot describe this release.
+	operationsSince := time.Time{}
+	if tu.Status.WatchingArmedAt != nil {
+		operationsSince = tu.Status.WatchingArmedAt.Time
+	}
+	problem := state.problem(operationsSince)
+	if setDegraded(tu, problem) {
+		if err := r.Status().Update(ctx, tu); err != nil {
+			return 0, err
+		}
+	}
+	if state.Sync == "Unknown" || state.ComparisonFailed {
 		if r.clock().Sub(tu.Status.WatchingSince.Time) >= rollbackTimeout(tu) {
 			pendingTooLong.WithLabelValues(tu.Namespace, tu.Name).Set(1)
 		}
-		return r.blockedWatch(ctx, tu, "ComparisonUnavailable", "Argo comparison is unavailable; this is not evidence of a release failure")
+		return r.blockedWatch(ctx, tu, "ComparisonUnavailable", "Argo comparison is unavailable ("+problem.Message+"); this is not evidence of a release failure")
 	}
 	// An app-of-apps can acknowledge the pin before the child has compared its
 	// new spec. Require a fresh child comparison before accepting its health.
@@ -497,7 +523,7 @@ func (r *TagUpdaterReconciler) checkHealthAndMaybeRollback(ctx context.Context, 
 		fresh = true
 	}
 	deployed := fresh && state.Sync == "Synced" && r.applicationPinsApplied(ctx, tu)
-	healthy := deployed && state.Health == "Healthy" && !state.syncInFlight()
+	healthy := deployed && state.Health == "Healthy" && !state.syncInFlight() && problem == nil
 	failed := deployed && state.Health == "Degraded" && !state.syncInFlight()
 	analysisUnavailable := false
 	if explicit := activeGate(tu); explicit != nil {
@@ -680,6 +706,14 @@ type argoCDState struct {
 	Deployments []argoCDDeployment
 	Health      string
 	Operation   string
+	// Errors are the Application's *Error conditions, such as ComparisonError;
+	// ComparisonFailed is set when one of them prevents comparing the spec.
+	Errors           []string
+	ComparisonFailed bool
+	// FailedOperation describes the last sync operation when it Failed or
+	// Errored; FailedOperationAt is when that operation started.
+	FailedOperation   string
+	FailedOperationAt time.Time
 }
 
 // observes reports whether ArgoCD has caught up to commit, which was pushed to
@@ -762,6 +796,13 @@ func (r *TagUpdaterReconciler) argoCDAppState(ctx context.Context, ref *v1alpha1
 	state.Health, _, _ = unstructured.NestedString(obj.Object, "status", "health", "status")
 	state.Operation, _, _ = unstructured.NestedString(obj.Object, "status", "operationState", "phase")
 	state.Deployments = deploymentsFrom(obj.Object)
+	state.Errors, state.ComparisonFailed = errorConditions(obj.Object)
+	if operationFailed(state.Operation) {
+		message, _, _ := unstructured.NestedString(obj.Object, "status", "operationState", "message")
+		started, _, _ := unstructured.NestedString(obj.Object, "status", "operationState", "startedAt")
+		state.FailedOperation = strings.TrimSpace(fmt.Sprintf("sync operation %s: %s", state.Operation, message))
+		state.FailedOperationAt = parseTimestamp(started)
+	}
 	// 2026-11-11: OnDelete pod rotation is operator-owned. Exclude its revision
 	// convergence from Application gating; Argo health still checks ready pods.
 	resources, _, _ := unstructured.NestedSlice(obj.Object, "status", "resources")
@@ -1273,7 +1314,7 @@ func (r *TagUpdaterReconciler) resolveDockerAuth(ctx context.Context, namespace,
 func (r *TagUpdaterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.progress.multiplier = r.StaleMultiplier
 	r.progress.floor = r.StaleFloor
-	metrics.Registry.MustRegister(progressCollector{tracker: &r.progress}, rollbackCount, suppressedCount, ambiguousGate, pendingTooLong)
+	metrics.Registry.MustRegister(progressCollector{tracker: &r.progress}, rollbackCount, suppressedCount, ambiguousGate, pendingTooLong, releaseDegraded)
 	return r.controllerBuilder(mgr)
 }
 
@@ -1297,6 +1338,15 @@ func (r *TagUpdaterReconciler) releaseHealth(ctx context.Context, tu *v1alpha1.T
 		}
 		if state.syncInFlight() {
 			aggregate.Operation = "Running"
+		}
+		app := ref.Namespace + "/" + ref.Name
+		for _, message := range state.Errors {
+			aggregate.Errors = append(aggregate.Errors, app+": "+message)
+		}
+		aggregate.ComparisonFailed = aggregate.ComparisonFailed || state.ComparisonFailed
+		if state.FailedOperation != "" && (aggregate.FailedOperation == "" || state.FailedOperationAt.After(aggregate.FailedOperationAt)) {
+			aggregate.FailedOperation = app + ": " + state.FailedOperation
+			aggregate.FailedOperationAt = state.FailedOperationAt
 		}
 	}
 	return aggregate, nil

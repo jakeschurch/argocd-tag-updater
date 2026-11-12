@@ -232,6 +232,18 @@ health must come from a fresh comparison. Running/Terminating syncs cannot
 trigger a Degraded rollback. An unobserved commit retains the lease and raises
 `CommitNeverObserved`; it never excludes a tag merely because delivery stalled.
 
+2026-11-12 health evidence: a pin under `spec.source`, `spec.sources` or
+`spec.destination` counts as deployed only once Argo CD's
+`status.sync.comparedTo` carries it; a Synced/Healthy verdict for the previous
+comparison never certifies the new release. Sync `Unknown`, an Application
+`*Error` condition (for example `ComparisonError`) or a sync operation that
+`Failed`/`Error`ed after the write is never Healthy. These states set
+`Degraded=True` with the Argo message and `tagupdater_release_degraded=1`
+immediately, without blaming the release. Arming a watch sets
+`RollbackReady=Unknown/AwaitingHealth`, and after a watch closes a later
+comparison or sync failure turns `RollbackReady=True/DeploymentHealthy` into
+`False/ReleaseDegraded` until Argo CD reports Synced and Healthy again.
+
 Before pushing, the controller checkpoints its prior status and records a snapshot of **every changed scalar**
 and whether all health sources were Healthy. Rollback restores that exact set
 in one Git commit, with compare-before-restore guards against external edits
