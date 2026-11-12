@@ -238,8 +238,13 @@ trigger a Degraded rollback. An unobserved commit retains the lease and raises
 comparison never certifies the new release. Sync `Unknown`, an Application
 `*Error` condition (for example `ComparisonError`) or a sync operation that
 `Failed`/`Error`ed after the write is never Healthy. These states set
-`Degraded=True` with the Argo message and `tagupdater_release_degraded=1`
-immediately, without blaming the release. Arming a watch sets
+`Degraded=True` with the Argo message (truncated to 1 KiB) and
+`tagupdater_release_degraded=1` immediately, without blaming the release,
+including while the watch still waits for Argo CD to observe the pin commit.
+A deleted Application reads as `Degraded=True/ApplicationMissing`; a
+TagUpdater that stops naming an Application drops `Degraded` and the gauge.
+`RollbackReady` keeps a constant message, so changing Argo text does not
+re-fire the suppressed-rollback event. Arming a watch sets
 `RollbackReady=Unknown/AwaitingHealth`, and after a watch closes a later
 comparison or sync failure turns `RollbackReady=True/DeploymentHealthy` into
 `False/ReleaseDegraded` until Argo CD reports Synced and Healthy again.

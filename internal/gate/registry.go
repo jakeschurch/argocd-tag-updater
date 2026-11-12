@@ -9,6 +9,7 @@ import (
 	"time"
 
 	v1 "github.com/jakeschurch/argocd-tag-updater/api/v1alpha1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -268,7 +269,10 @@ func (r *Registry) Object(gvk schema.GroupVersionKind, key types.NamespacedName)
 		return nil, err
 	}
 	if !found {
-		return nil, fmt.Errorf("gate object %s %s is absent", gvk, key)
+		// A synchronized cache without the key is authoritative: report it
+		// as NotFound, like a direct read, so callers can tell absence from
+		// an unreadable cache.
+		return nil, apierrors.NewNotFound(schema.GroupResource{Group: gvk.Group, Resource: gvk.Kind}, key.String())
 	}
 	return obj.(*unstructured.Unstructured).DeepCopy(), nil
 }
