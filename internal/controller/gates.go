@@ -112,7 +112,8 @@ func (r *TagUpdaterReconciler) baselineHealthy(ctx context.Context, tu *v1.TagUp
 
 // A fresh comparison of an old child spec is still stale for this release.
 // Before trusting legacy Application health, prove every changed Application
-// scalar is present in the live desired spec (Before during rollback).
+// scalar is present in the live desired spec (Before during rollback) and, for
+// source and destination pins, in the spec ArgoCD last compared.
 func (r *TagUpdaterReconciler) applicationPinsApplied(ctx context.Context, tu *v1.TagUpdater) bool {
 	for _, field := range tu.Status.RollbackFields {
 		if field.APIVersion != "argoproj.io/v1alpha1" || field.Kind != "Application" {
@@ -126,34 +127,36 @@ func (r *TagUpdaterReconciler) applicationPinsApplied(ctx context.Context, tu *v
 		if err != nil {
 			return false
 		}
-		var current interface{} = obj.Object
-		for _, part := range strings.Split(field.Field, ".") {
-			switch value := current.(type) {
-			case map[string]interface{}:
-				current = value[part]
-			case []interface{}:
-				index, err := strconv.Atoi(part)
-				if err != nil || index < 0 || index >= len(value) {
-					return false
-				}
-				current = value[index]
-			default:
-				current = nil
-			}
-		}
 		expected := field.After
 		if tu.Status.WatchingRollback {
 			expected = field.Before
 		}
-		if expected == nil {
-			if current != nil {
-				return false
-			}
-		} else if current == nil || fmt.Sprint(current) != *expected {
+		if current, ok := lookupField(obj.Object, field.Field); !ok || !valueMatches(current, expected) || !comparedPinApplied(obj.Object, field.Field, expected) {
 			return false
 		}
 	}
 	return true
+}
+
+// lookupField walks a dotted path through maps and list indexes. A missing map
+// key yields nil; an invalid or out-of-range list index is not walkable.
+func lookupField(obj map[string]interface{}, path string) (interface{}, bool) {
+	var current interface{} = obj
+	for _, part := range strings.Split(path, ".") {
+		switch value := current.(type) {
+		case map[string]interface{}:
+			current = value[part]
+		case []interface{}:
+			index, err := strconv.Atoi(part)
+			if err != nil || index < 0 || index >= len(value) {
+				return nil, false
+			}
+			current = value[index]
+		default:
+			current = nil
+		}
+	}
+	return current, true
 }
 
 func (r *TagUpdaterReconciler) gateObject(ctx context.Context, gvk schema.GroupVersionKind, resource string, key types.NamespacedName) (*unstructured.Unstructured, error) {
