@@ -254,9 +254,12 @@ and whether all health sources were Healthy. Rollback restores that exact set
 in one Git commit, with compare-before-restore guards against external edits
 (including scalar types such as unquoted numeric tags). A prepared watch becomes
 real only after its commit is reachable on the configured remote branch. A
-rejected forward or rollback push restores the pre-arm status and releases its
-leases; rollback skips and previous tags are not changed by a failed push. A
-lost push response or controller restart is settled by remote ancestry before
+rejected push restores the exact pre-arm status, and the leases follow that
+status. A rejected forward push had no watch before it, so it releases the
+leases it took. A rejected rollback push restores the active watch of the release
+being rolled back, which still owns its app leases, so they are **kept** and the
+rollback is retried. Rollback skips and previous tags are not changed by a failed
+push. A lost push response or controller restart is settled by remote ancestry before
 health observation. A remote read failure keeps the checkpoint for retry.
 A preexisting unhealthy baseline suppresses rollback (condition, Event, log,
 and `tagupdater_rollback_suppressed_total`) and holds the lease until recovery.
@@ -361,6 +364,30 @@ Do not prune or consolidate updaters while an old controller is running.
 Exclude the controller's own `argocd-tag-updater` self-update from health gating:
 its replacement can interrupt the observer responsible for its own recovery.
 Keep that pin independently recoverable by the operator.
+
+### Metrics
+
+The controller serves Prometheus metrics on `ports.metrics` (default 8080, container
+port `metrics`). The chart renders no Service, so scrape the pods (a PodMonitor).
+Only the elected leader exports the `tagupdater_*` series; a standby serves the
+leader-election gauge alone and a change of leader leaves a short gap. Aggregate
+away `pod` and `instance` in alert rules. The series carry their own `namespace`
+label (the TagUpdater's), so scrape with `honorLabels: true` or Prometheus renames
+it to `exported_namespace`.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `tagupdater_reconcile_stale` | `updater` (`namespace/name`) | 1 when no reconcile has succeeded within `max(multiplier*interval, floor)`. Computed at scrape, so present on every leader. |
+| `tagupdater_gate_pending_too_long` | `namespace`, `name` | 1 while a deployed release has exceeded its health window without a terminal failure. |
+| `tagupdater_release_degraded` | `namespace`, `name` | 1 while Argo CD reports the release's Application with sync Unknown, an error condition or a failed sync operation. |
+| `tagupdater_rollback_ambiguous` | `namespace`, `name` | 1 while several pending changes make rollback blame ambiguous. |
+| `tagupdater_rollbacks_total` | `namespace`, `name` | Whole-release rollback writes. |
+| `tagupdater_rollback_suppressed_total` | `namespace`, `name`, `reason` | Rollback suppression transitions. |
+
+The three gauges that mean "look at this" are `tagupdater_reconcile_stale`,
+`tagupdater_gate_pending_too_long` and `tagupdater_release_degraded`; alert on each
+being 1, and on `absent(tagupdater_reconcile_stale)` so a broken scrape or a missing
+leader cannot silence the other three.
 
 ## Tag format convention
 
