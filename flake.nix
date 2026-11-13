@@ -15,30 +15,58 @@
       # self-update). vendor/ is checked in, so the build needs nothing else.
       goFiles = lib.fileset.fileFilter
         (file: file.hasExt "go" && !(lib.hasSuffix "_test.go" file.name));
-      buildSrc = lib.fileset.toSource {
-        root = ./.;
-        fileset = lib.fileset.unions [
-          ./go.mod
-          ./go.sum
-          ./vendor
-          (goFiles ./api)
-          (goFiles ./cmd)
-          (goFiles ./internal)
-        ];
+      mkSrcs = keep: {
+        build = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.intersection keep (lib.fileset.unions [
+            ./go.mod
+            ./go.sum
+            ./vendor
+            (goFiles ./api)
+            (goFiles ./cmd)
+            (goFiles ./internal)
+          ]);
+        };
+        # The verification derivation additionally needs the tests.
+        tests = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.intersection keep (lib.fileset.unions [
+            ./go.mod
+            ./go.sum
+            ./vendor
+            ./config/crd
+            (lib.fileset.fileFilter (file: file.hasExt "go") ./api)
+            (lib.fileset.fileFilter (file: file.hasExt "go") ./cmd)
+            (lib.fileset.fileFilter (file: file.hasExt "go") ./internal)
+          ]);
+        };
       };
-      # The verification derivation additionally needs the tests.
-      testSrc = lib.fileset.toSource {
-        root = ./.;
-        fileset = lib.fileset.unions [
-          ./go.mod
-          ./go.sum
-          ./vendor
-          ./config/crd
-          (lib.fileset.fileFilter (file: file.hasExt "go") ./api)
-          (lib.fileset.fileFilter (file: file.hasExt "go") ./cmd)
-          (lib.fileset.fileFilter (file: file.hasExt "go") ./internal)
-        ];
-      };
+      srcs = mkSrcs ./.;
+      buildSrc = srcs.build;
+      testSrc = srcs.tests;
+
+      # 2026-11-12: keep narrows inputs for the doc-edit and Go-edit proofs.
+      # Remove documentation/metadata to model its strongest edit.
+      fs = lib.fileset;
+      docFiles = fs.difference
+        (fs.fileFilter (file:
+          file.hasExt "md" || lib.hasPrefix "README" file.name
+          || lib.hasPrefix "CHANGELOG" file.name
+          || builtins.elem file.name [ "AGENTS.md" "CLAUDE.md" "Makefile" "flake.nix" "flake.lock" "Dockerfile" "mkdocs.yml" ]) ./.)
+        (fs.unions [ ./vendor ./config/crd ]);
+      docOnly = fs.unions ([ docFiles
+        (fs.difference (fs.maybeMissing ./config) (fs.maybeMissing ./config/crd))
+      ] ++ map fs.maybeMissing [
+        ./docs ./documentation ./.forgejo ./.github ./.beads ./charts ./deploy ./ci
+      ]);
+      without = remove: mkSrcs (fs.difference ./. remove);
+      srcStability =
+        # vendor/ is a checked-in dependency input, including its metadata.
+        assert (without docOnly).build.outPath == buildSrc.outPath;
+        assert (without docOnly).tests.outPath == testSrc.outPath;
+        assert (without ./go.mod).build.outPath != buildSrc.outPath;
+        assert (without ./go.mod).tests.outPath != testSrc.outPath;
+        pkgs.runCommand "argocd-tag-updater-src-stability" { } "touch $out";
 
       # Vet and tests, recorded as data. This derivation never fails the build:
       # go.json and vet.log are preserved either way and the consumer (the
@@ -141,6 +169,7 @@
       };
 
       checks.${system} = {
+        src-stability = srcStability;
         chart = pkgs.runCommand "argocd-tag-updater-chart"
           {
             nativeBuildInputs = [ pkgs.kubernetes-helm (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
