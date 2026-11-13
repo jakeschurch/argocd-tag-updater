@@ -61,13 +61,13 @@ func main() {
 	}
 
 	watchNamespace := os.Getenv("WATCH_NAMESPACE")
-	mgrOptions := ctrl.Options{
+	mgrOptions := leaderElectionOptions(ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
 		LeaderElectionID:       "argocd-tag-updater.updater.argocd.io",
-	}
+	})
 	if watchNamespace != "" {
 		// Credentials are always namespace-local to a TagUpdater. Restrict the
 		// Secret informer accordingly so the controller never needs to list
@@ -121,4 +121,23 @@ func main() {
 func fail(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "argocd-tag-updater: "+format+"\n", args...)
 	os.Exit(1)
+}
+
+// 2026-11-13 (margo-0u0.3): the default 2s retry causes 29 Lease PUTs/min
+// per operator. Use 10s retries to reduce API writes; crash failover increasing
+// from 15s to 60s is accepted.
+const (
+	leaderElectionLeaseDuration = 60 * time.Second
+	leaderElectionRenewDeadline = 40 * time.Second
+	leaderElectionRetryPeriod   = 10 * time.Second
+)
+
+func leaderElectionOptions(options ctrl.Options) ctrl.Options {
+	leaseDuration := leaderElectionLeaseDuration
+	renewDeadline := leaderElectionRenewDeadline
+	retryPeriod := leaderElectionRetryPeriod
+	options.LeaseDuration = &leaseDuration
+	options.RenewDeadline = &renewDeadline
+	options.RetryPeriod = &retryPeriod
+	return options
 }
