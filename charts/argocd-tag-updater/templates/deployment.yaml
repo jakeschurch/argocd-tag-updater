@@ -37,6 +37,12 @@ spec:
             secretName: {{ .Values.git.sshKey.secretName }}
             defaultMode: 384
         {{- end }}
+        {{- with .Values.nixCache.tokenVolume }}
+        # The nix-cache credential for type: nix sources, mounted so the file
+        # is <mountPath>/token (see values.yaml nixCache).
+        - name: nix-cache-token
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
       containers:
         - name: controller
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -67,6 +73,10 @@ spec:
               value: {{ .Values.git.sshKey.keyFile | quote }}
             - name: GIT_KNOWN_HOSTS_FILE
               value: {{ .Values.git.sshKey.knownHostsFile | quote }}
+            {{- end }}
+            {{- if .Values.nixCache.tokenVolume }}
+            - name: NIX_CACHE_TOKEN_FILE
+              value: {{ printf "%s/token" .Values.nixCache.mountPath | quote }}
             {{- end }}
             {{- if .Values.git.token.enabled }}
             # A single classic PAT (repo scope) reads every targeted repo over
@@ -105,6 +115,11 @@ spec:
             {{- if .Values.git.sshKey.enabled }}
             - name: github-deploy-key
               mountPath: {{ .Values.git.sshKey.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.nixCache.tokenVolume }}
+            - name: nix-cache-token
+              mountPath: {{ .Values.nixCache.mountPath }}
               readOnly: true
             {{- end }}
           resources:

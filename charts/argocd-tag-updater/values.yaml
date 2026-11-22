@@ -35,6 +35,23 @@ git:
     secretName: argocd-tag-updater-git-token
     secretKey: token
 
+# The nix-cache credential for `type: nix` sources: a volume whose file
+# `token` the controller reads on every request (NIX_CACHE_TOKEN_FILE). A
+# missing or empty file fails that source's reconcile; it never falls back to
+# an anonymous request. Empty (the default) reads nix-cache anonymously, which
+# a public cache serves. Give a volume source with a `token` item, e.g. the
+# Secret today:
+#   tokenVolume:
+#     secret: {secretName: nix-cache-reader, items: [{key: token, path: token}]}
+# or a projected service-account token once nix-cache accepts them:
+#   tokenVolume:
+#     projected:
+#       sources:
+#         - serviceAccountToken: {audience: nix-cache, expirationSeconds: 3600, path: token}
+nixCache:
+  tokenVolume: {}
+  mountPath: /var/run/secrets/nix-cache
+
 # CA bundle path inside the nix bundle (for HTTPS git/registry calls).
 sslCertFile: /nix-dynamic/argocd-tag-updater/bundle/etc/ssl/certs/ca-bundle.crt
 

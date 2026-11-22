@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -19,12 +20,34 @@ var httpClient = &http.Client{Timeout: 30 * time.Second}
 // (GET /v1/tags/<name>/list). Repo is "<host>[/prefix]/<name>" where the
 // last path segment is the tag namespace, e.g.
 // "nix-cache.example.com/platform". An http:// prefix forces plaintext;
-// otherwise https is used. Token is an optional cache JWT sent as a
-// Bearer header — public caches serve reads without one, tenant caches
-// require a tenant-scoped key.
+// otherwise https is used.
+//
+// TokenFile, when set, names the nix-cache credential: a file read on every
+// request (a projected service-account token is rewritten in place before it
+// expires) and sent as a Bearer header. A file that cannot be read or is
+// empty fails the request before anything is sent, never an anonymous
+// request in its place. With no TokenFile the cache is read anonymously,
+// which a public cache serves.
 type Nix struct {
-	Repo  string
-	Token string
+	Repo      string
+	TokenFile string
+}
+
+// authorize sets the Bearer header from TokenFile, read now.
+func (n *Nix) authorize(req *http.Request) error {
+	if n.TokenFile == "" {
+		return nil
+	}
+	contents, err := os.ReadFile(n.TokenFile)
+	if err != nil {
+		return fmt.Errorf("read nix-cache credential: %w", err)
+	}
+	token := strings.TrimSpace(string(contents))
+	if token == "" {
+		return fmt.Errorf("read nix-cache credential: %s is empty", n.TokenFile)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	return nil
 }
 
 type nixTagsList struct {
@@ -56,8 +79,8 @@ func (n *Nix) Tags(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nix tags request: %w", err)
 	}
-	if n.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+n.Token)
+	if err := n.authorize(req); err != nil {
+		return nil, err
 	}
 
 	resp, err := httpClient.Do(req)
@@ -115,8 +138,8 @@ func (n *Nix) Resolve(ctx context.Context, tag string) (map[string]string, error
 	if err != nil {
 		return nil, fmt.Errorf("nix resolve request: %w", err)
 	}
-	if n.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+n.Token)
+	if err := n.authorize(req); err != nil {
+		return nil, err
 	}
 
 	// Same bounded client as Tags: http.DefaultClient has no timeout, so a

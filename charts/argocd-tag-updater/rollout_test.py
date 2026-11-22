@@ -31,3 +31,22 @@ for replicas in (1, 2, 3):
         assert budgets[0]["spec"]["maxUnavailable"] == 1
         assert budgets[0]["spec"]["unhealthyPodEvictionPolicy"] == "AlwaysAllow"
 print("tag updater chart rollout assertions passed (replicas 1, 2, 3)")
+
+# The nix-cache credential: nothing by default (anonymous reads); a volume
+# source mounts the file the controller reads per request.
+def deployment(*args):
+    objects = yaml.safe_load_all(subprocess.check_output(["helm", "template", "hygiene", str(chart), *args], text=True))
+    return next(o for o in objects if o and o["kind"] == "Deployment")["spec"]["template"]["spec"]
+
+
+pod = deployment()
+assert "nix-cache-token" not in [v["name"] for v in pod["volumes"]]
+assert "NIX_CACHE_TOKEN_FILE" not in [e["name"] for e in pod["containers"][0]["env"]]
+pod = deployment("--set", "nixCache.tokenVolume.secret.secretName=nix-cache-reader")
+volume = next(v for v in pod["volumes"] if v["name"] == "nix-cache-token")
+assert volume == {"name": "nix-cache-token", "secret": {"secretName": "nix-cache-reader"}}
+container = pod["containers"][0]
+assert {"name": "nix-cache-token", "mountPath": "/var/run/secrets/nix-cache", "readOnly": True} in container["volumeMounts"]
+assert {"name": "NIX_CACHE_TOKEN_FILE", "value": "/var/run/secrets/nix-cache/token"} in container["env"]
+assert not [e for e in container["env"] if e["name"] == "NIX_CACHE_TOKEN"]
+print("tag updater chart nix-cache credential assertions passed")

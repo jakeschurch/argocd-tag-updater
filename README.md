@@ -405,6 +405,14 @@ Push this tag from CI after a successful build. The controller matches it, extra
 |------|--------|-------|
 | `git` | Implemented | Uses `git ls-remote --tags` |
 | `oci` | Stub | Implement with `distribution/v3` or `google/go-containerregistry` |
+| `nix` | Implemented | nix-cache tags API (`GET /v1/tags/<name>/list`, `/v1/tags/<name>/<tag>`) |
+
+A `nix` source's credential is a file, `NIX_CACHE_TOKEN_FILE`, read on every request so a projected
+service-account token that the kubelet rotates in place is always current. A file that is missing or
+empty fails the reconcile before any request is sent; it never turns into an anonymous request. With
+no file configured the cache is read anonymously (a public cache). The chart mounts it from
+`nixCache.tokenVolume` (a Secret or a projected `serviceAccountToken` with `path: token`); there is no
+literal-token variable.
 
 ## Architecture
 
