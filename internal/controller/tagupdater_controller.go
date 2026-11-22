@@ -1304,7 +1304,9 @@ func sourceFor(spec v1alpha1.SourceSpec, ociBasicAuth string) (intsource.Source,
 	case v1alpha1.SourceTypeOCI:
 		return &intsource.OCI{Repo: spec.Repo, BasicAuth: ociBasicAuth}, nil
 	case v1alpha1.SourceTypeNix:
-		return &intsource.Nix{Repo: spec.Repo, Token: os.Getenv("NIX_CACHE_TOKEN")}, nil
+		// The credential is a file (NIX_CACHE_TOKEN_FILE), reread per request;
+		// unset reads the cache anonymously.
+		return &intsource.Nix{Repo: spec.Repo, TokenFile: os.Getenv("NIX_CACHE_TOKEN_FILE")}, nil
 	default:
 		return nil, fmt.Errorf("unknown source type %q", spec.Type)
 	}
