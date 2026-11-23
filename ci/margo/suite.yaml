@@ -27,6 +27,7 @@ spec:
     - name: gofmt
       paths:
         - "**/*.go"
+        - "**/.gitattributes"
         - flake.nix
         - flake.lock
         - "**/*.nix"
@@ -42,6 +43,8 @@ spec:
     - name: vendor:drift
       paths:
         - "**/*.go"
+        - "**/.gitattributes"
+        - .gitignore
         - go.mod
         - go.sum
         - vendor/**
@@ -68,6 +71,7 @@ spec:
         - flake.nix
         - flake.lock
         - "**/*.nix"
+        - "**/.gitattributes"
         - ci/margo/**
         - .tool-versions
         - .mise.toml

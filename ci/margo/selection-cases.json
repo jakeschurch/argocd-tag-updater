@@ -3,12 +3,17 @@
   "suite": "suite.yaml",
   "shared": [
     "ci/margo/suite.yaml",
-    "ci/margo/templates/new.yaml",
+    "ci/margo/templates/gofmt-check.yaml",
+    "ci/margo/templates/generate-drift.yaml",
+    "ci/margo/templates/nix-build.yaml",
     "ci/margo/check.sh",
+    "ci/margo/scripts/check.sh",
     "ci/margo/rendered/ci.json",
     "flake.lock",
     "flake.nix",
     "nix/toolchain.nix",
+    ".gitattributes",
+    "internal/source/.gitattributes",
     ".tool-versions"
   ],
   "cases": [
@@ -40,6 +45,36 @@
         "gofmt",
         "vendor:drift",
         "nix:bundle"
+      ]
+    },
+    {
+      "name": "generated-crd",
+      "changed": [
+        "config/crd/updater.argocd.io_tagupdaters.yaml"
+      ],
+      "selected": [
+        "go:test"
+      ]
+    },
+    {
+      "name": "vendor-metadata",
+      "changed": [
+        "vendor/modules.txt"
+      ],
+      "selected": [
+        "go:test",
+        "vendor:drift",
+        "nix:bundle"
+      ]
+    },
+    {
+      "name": "vendor-ignore",
+      "changed": [
+        ".gitignore"
+      ],
+      "selected": [
+        "go:test",
+        "vendor:drift"
       ]
     },
     {
