@@ -1,3 +1,7 @@
+# Path selection uses OR; every filtered check includes its own CI definitions.
+# # go:test stays unconditional as the repository regression backstop: controller/source
+# tests read CRDs and repository fixtures. Unknown paths must not produce an empty green
+# plan.
 # Native checks qualified before queue activation; every selected check blocks landing.
 apiVersion: ci.foundrybox.dev/v1alpha1
 kind: CheckSuite
@@ -21,12 +25,55 @@ spec:
       params:
         attr: .#testReport
     - name: gofmt
+      paths:
+        - "**/*.go"
+        - flake.nix
+        - flake.lock
+        - "**/*.nix"
+        - ci/margo/**
+        - .tool-versions
+        - .mise.toml
+        - mise.toml
+        - go.mod
+        - go.sum
+        - go.work
+        - go.work.sum
       template: gofmt-check
     - name: vendor:drift
+      paths:
+        - "**/*.go"
+        - go.mod
+        - go.sum
+        - vendor/**
+        - flake.nix
+        - flake.lock
+        - "**/*.nix"
+        - ci/margo/**
+        - .tool-versions
+        - .mise.toml
+        - mise.toml
+        - go.work
+        - go.work.sum
       template: generate-drift
       params:
         command: go mod vendor
     - name: nix:bundle
+      paths:
+        - api/**
+        - cmd/**
+        - internal/**
+        - go.mod
+        - go.sum
+        - vendor/**
+        - flake.nix
+        - flake.lock
+        - "**/*.nix"
+        - ci/margo/**
+        - .tool-versions
+        - .mise.toml
+        - mise.toml
+        - go.work
+        - go.work.sum
       template: nix-build
       required: true
       params:

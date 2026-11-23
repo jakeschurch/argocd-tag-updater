@@ -1,0 +1,91 @@
+{
+  "repository": "argocd-tag-updater",
+  "suite": "suite.yaml",
+  "shared": [
+    "ci/margo/suite.yaml",
+    "ci/margo/templates/new.yaml",
+    "ci/margo/check.sh",
+    "ci/margo/rendered/ci.json",
+    "flake.lock",
+    "flake.nix",
+    "nix/toolchain.nix",
+    ".tool-versions"
+  ],
+  "cases": [
+    {
+      "name": "docs",
+      "changed": [
+        "docs/new.md"
+      ],
+      "selected": [
+        "go:test"
+      ]
+    },
+    {
+      "name": "app",
+      "changed": [
+        "charts/argocd-tag-updater/templates/deployment.yaml"
+      ],
+      "selected": [
+        "go:test"
+      ]
+    },
+    {
+      "name": "go",
+      "changed": [
+        "internal/source/nix.go"
+      ],
+      "selected": [
+        "go:test",
+        "gofmt",
+        "vendor:drift",
+        "nix:bundle"
+      ]
+    },
+    {
+      "name": "unknown",
+      "changed": [
+        "future/data.bin"
+      ],
+      "selected": [
+        "go:test"
+      ]
+    },
+    {
+      "name": "rendered-ci",
+      "changed": [
+        "ci/margo/rendered/checks.json"
+      ],
+      "selected": [
+        "go:test",
+        "gofmt",
+        "vendor:drift",
+        "nix:bundle"
+      ]
+    },
+    {
+      "name": "flake-lock",
+      "changed": [
+        "flake.lock"
+      ],
+      "selected": [
+        "go:test",
+        "gofmt",
+        "vendor:drift",
+        "nix:bundle"
+      ]
+    },
+    {
+      "name": "check-script",
+      "changed": [
+        "ci/margo/check.sh"
+      ],
+      "selected": [
+        "go:test",
+        "gofmt",
+        "vendor:drift",
+        "nix:bundle"
+      ]
+    }
+  ]
+}
