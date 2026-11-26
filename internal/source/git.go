@@ -30,7 +30,7 @@ type Git struct {
 // so tagRevsFromRefs prefers it over the tag-object sha regardless of the
 // order ls-remote lists them in.
 func (g *Git) TagRevs(ctx context.Context) (map[string]string, error) {
-	refs, err := g.listRefs(ctx)
+	refs, err := g.listRefs(ctx, git.AppendPeeled)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +62,7 @@ func tagRevsFromRefs(refs []*plumbing.Reference) map[string]string {
 }
 
 func (g *Git) Tags(ctx context.Context) ([]string, error) {
-	refs, err := g.listRefs(ctx)
+	refs, err := g.listRefs(ctx, git.IgnorePeeled)
 	if err != nil {
 		return nil, err
 	}
@@ -75,8 +75,8 @@ func (g *Git) Tags(ctx context.Context) ([]string, error) {
 	return tags, nil
 }
 
-func (g *Git) listRefs(ctx context.Context) ([]*plumbing.Reference, error) {
-	opts := &git.ListOptions{}
+func (g *Git) listRefs(ctx context.Context, peeling git.PeelingOption) ([]*plumbing.Reference, error) {
+	opts := &git.ListOptions{PeelingOption: peeling}
 	repo := g.Repo
 
 	switch {

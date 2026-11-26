@@ -1,9 +1,13 @@
 package source
 
 import (
+	"maps"
+	"slices"
 	"testing"
 
+	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 func TestTagRevsFromRefs_PrefersPeeledCommit(t *testing.T) {
@@ -48,4 +52,44 @@ func TestTagRevsFromRefs_PrefersPeeledCommit(t *testing.T) {
 
 func TestGitImplementsTagRevResolver(t *testing.T) {
 	var _ TagRevResolver = (*Git)(nil)
+}
+
+func TestGitTagRevsReadsPeeledRemoteRefs(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	author := &object.Signature{Name: "Tag test", Email: "tag-test@example.invalid"}
+	commit, err := worktree.Commit("release source", &git.CommitOptions{Author: author, AllowEmptyCommits: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateTag("annotated", commit, &git.CreateTagOptions{Tagger: author, Message: "release"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateTag("lightweight", commit, nil); err != nil {
+		t.Fatal(err)
+	}
+	source := &Git{Repo: dir}
+	got, err := source.TagRevs(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"annotated": commit.String(), "lightweight": commit.String()}
+	if !maps.Equal(got, want) {
+		t.Fatalf("tag revisions %v, want %v", got, want)
+	}
+	tags, err := source.Tags(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(tags)
+	if !slices.Equal(tags, []string{"annotated", "lightweight"}) {
+		t.Fatalf("tag names %v contain unexpected refs", tags)
+	}
 }
