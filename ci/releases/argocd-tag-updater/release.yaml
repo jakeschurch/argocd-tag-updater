@@ -1,0 +1,10 @@
+apiVersion: ci.foundrybox.dev/v1alpha1
+kind: Release
+metadata:
+  name: argocd-tag-updater
+  namespace: argo
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    ci.foundrybox.dev/cutover-revision: dd3dc384cabe9e1124fce3c8e10e714eb9594471
+spec:
+  queue: argocd-tag-updater
